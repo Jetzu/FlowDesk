@@ -1,0 +1,794 @@
+"""Interactive plot: draws a population and lets the user create and edit gates."""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QCursor, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QPolygonF
+from PySide6.QtWidgets import QMessageBox, QWidget
+
+from ..core.gates import EllipseGate, PolygonGate, RectangleGate, gate_from_dict, make_quadrant_gates
+from ..core.model import Group, Population, Sample
+from .dialogs import GateNameDialog
+from .renderer import GateShape, RenderOptions, RenderResult, draw_gates, render_plot
+
+TOOLS = ("pointer", "rect", "polygon", "ellipse", "quadrant", "range", "bisector", "freehand", "zoom")
+HANDLE = 4.0
+HIT = 6.0
+
+
+def _dist(a: QPointF, b: QPointF) -> float:
+    return math.hypot(a.x() - b.x(), a.y() - b.y())
+
+
+def _dist_to_segment(p: QPointF, a: QPointF, b: QPointF) -> float:
+    ax, ay, bx, by, px, py = a.x(), a.y(), b.x(), b.y(), p.x(), p.y()
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def simplify_path(points: list[QPointF], tolerance: float) -> list[QPointF]:
+    """Ramer-Douglas-Peucker simplification."""
+    if len(points) < 3:
+        return points
+
+    def rdp(pts):
+        if len(pts) < 3:
+            return pts
+        a, b = pts[0], pts[-1]
+        idx, dmax = 0, 0.0
+        for i in range(1, len(pts) - 1):
+            d = _dist_to_segment(pts[i], a, b)
+            if d > dmax:
+                idx, dmax = i, d
+        if dmax > tolerance:
+            left = rdp(pts[: idx + 1])
+            right = rdp(pts[idx:])
+            return left[:-1] + right
+        return [a, b]
+
+    return rdp(points)
+
+
+class PlotWidget(QWidget):
+    selectionChanged = Signal(object)  # Population | None
+    populationActivated = Signal(object)  # Population (double-clicked gate)
+    graphChanged = Signal()  # axes / plot type changed
+    statusText = Signal(str)
+    toolDone = Signal()  # a creation tool finished (window may switch back to pointer)
+    contextMenuRequested = Signal(object, object)  # Population | None, QPoint (global)
+    zoomChanged = Signal()
+
+    def __init__(self, controller, sample: Sample, population: Population, parent=None):
+        super().__init__(parent)
+        self.controller = controller
+        self.sample = sample
+        self.population = population
+        self.group: Group | None = None  # when set, the widget shows a *group* graph
+        self.graph = population.graph
+        self._ensure_axes()
+        self.tool = "pointer"
+        self.selected: Population | None = None
+        self.overlays: list[tuple[Sample, Population]] = []
+        self.view = (0.0, 1.0, 0.0, 1.0)
+        self._base: QImage | None = None
+        self._result: RenderResult | None = None
+        self._dirty = True
+        self._drag: dict | None = None
+        self._poly: list[QPointF] = []
+        self._free: list[QPointF] = []
+        self._rubber: QRectF | None = None
+        self._mouse = QPointF()
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMinimumSize(240, 240)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        c = controller
+        c.gatingChanged.connect(self._on_data_changed)
+        c.scalesChanged.connect(self._on_data_changed)
+        c.compensationChanged.connect(self._on_data_changed)
+        c.preferencesChanged.connect(lambda: self.invalidate())
+
+    # ---------------------------------------------------------------- state
+    def _ensure_axes(self):
+        names = self.sample.parameter_names()
+        if not names:
+            return
+        if not self.graph.x or self.graph.x not in names:
+            x, y = self.sample.default_axes()
+            self.graph.x = x
+            if self.graph.y is None and self.graph.plot_type != "histogram":
+                self.graph.y = y
+        if self.graph.y is not None and self.graph.y not in names:
+            self.graph.y = None if self.graph.plot_type == "histogram" else self.sample.default_axes()[1]
+        if self.graph.plot_type == "histogram":
+            self.graph.y = None
+        elif self.graph.y is None:
+            self.graph.plot_type = "histogram"
+
+    def set_population(self, population: Population):
+        self.population = population
+        self.graph = population.graph
+        self.selected = None
+        self.view = (0.0, 1.0, 0.0, 1.0)
+        self._ensure_axes()
+        self._cancel_creation()
+        self.invalidate()
+        self.selectionChanged.emit(None)
+
+    def set_axes(self, x: str | None = None, y: str | None = "keep", plot_type: str | None = None):
+        if x is not None:
+            self.graph.x = x
+        if y != "keep":
+            self.graph.y = y
+        if plot_type is not None:
+            self.graph.plot_type = plot_type
+            if plot_type == "histogram":
+                self.graph.y = None
+            elif self.graph.y is None:
+                self.graph.y = self.sample.default_axes()[1] or self.graph.x
+        elif self.graph.y is None:
+            self.graph.plot_type = "histogram"
+        elif self.graph.plot_type == "histogram":
+            self.graph.plot_type = self.controller.preferences.get("plot_type") or "pseudocolor"
+        self.view = (0.0, 1.0, 0.0, 1.0)
+        self.controller.mark_modified()
+        self.invalidate()
+        self.graphChanged.emit()
+
+    def set_tool(self, tool: str):
+        if tool not in TOOLS:
+            tool = "pointer"
+        self._cancel_creation()
+        self.tool = tool
+        self.setCursor(Qt.CursorShape.ArrowCursor if tool == "pointer" else Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def set_selected(self, pop: Population | None):
+        if pop is not self.selected:
+            self.selected = pop
+            self.update()
+            self.selectionChanged.emit(pop)
+
+    def set_overlays(self, overlays: list[tuple[Sample, Population]]):
+        self.overlays = list(overlays)
+        self.invalidate()
+
+    def reset_zoom(self):
+        self.view = (0.0, 1.0, 0.0, 1.0)
+        self.invalidate()
+        self.zoomChanged.emit()
+
+    def options(self) -> RenderOptions:
+        return RenderOptions.from_prefs(self.controller.preferences, self.graph, view=self.view)
+
+    def invalidate(self):
+        self._dirty = True
+        self.update()
+
+    def _on_data_changed(self, sample_id=None):
+        if sample_id is None or sample_id == self.sample.id:
+            if self.selected is not None and self.selected.parent is not self.population:
+                # the selected population may have been replaced by a group copy
+                replacement = self.population.child_by_name(self.selected.name) if self.population is not None else None
+                self.selected = replacement
+                self.selectionChanged.emit(self.selected)
+            self.invalidate()
+
+    # ------------------------------------------------------------- painting
+    def result(self) -> RenderResult | None:
+        return self._result
+
+    def _render(self):
+        dpr = self.devicePixelRatioF()
+        self._ensure_axes()
+        opts = self.options()
+        opts.show_gates = False
+        self._result = render_plot(self.sample, self.population, self.graph, self.width(), self.height(), opts, overlays=self.overlays, dpr=dpr)
+        self._base = self._result.image
+        self._dirty = False
+
+    def paintEvent(self, event):
+        if self._dirty or self._base is None or self._base.deviceIndependentSize().toSize() != self.size():
+            self._render()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.drawImage(0, 0, self._base)
+        res = self._result
+        if res is not None and res.error is None:
+            opts = self.options()
+            draw_gates(painter, res, self.population, self.sample, opts, self.selected)
+            self._draw_handles(painter, res)
+            self._draw_creation(painter)
+        painter.end()
+
+    def _shape_for(self, pop: Population) -> GateShape | None:
+        if self._result is None:
+            return None
+        for s in self._result.gates:
+            if s.population is pop:
+                return s
+        return None
+
+    def _handles(self, shape: GateShape) -> list[QPointF]:
+        if shape.kind == "rect":
+            b = shape.bbox
+            return [b.topLeft(), b.topRight(), b.bottomRight(), b.bottomLeft()]
+        if shape.kind == "polygon":
+            return [QPointF(x, y) for x, y in shape.points]
+        if shape.kind == "ellipse":
+            c, a, b = (QPointF(*p) for p in shape.points)
+            return [a, b, QPointF(2 * c.x() - a.x(), 2 * c.y() - a.y()), QPointF(2 * c.x() - b.x(), 2 * c.y() - b.y())]
+        if shape.kind == "range":
+            (x0, y0), (x1, y1) = shape.points
+            return [QPointF(x0, y0), QPointF(x1, y1)]
+        if shape.kind == "quadrant":
+            cx, cy = shape.extra["centre"]
+            return [QPointF(cx, cy)]
+        return []
+
+    def _draw_handles(self, painter: QPainter, res: RenderResult):
+        if self.selected is None:
+            return
+        shape = self._shape_for(self.selected)
+        if shape is None:
+            return
+        painter.setPen(QPen(QColor(self.controller.preferences.get("selected_gate_color")), 1.0))
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        for h in self._handles(shape):
+            painter.drawRect(QRectF(h.x() - HANDLE, h.y() - HANDLE, 2 * HANDLE, 2 * HANDLE))
+
+    def _draw_creation(self, painter: QPainter):
+        pen = QPen(QColor("#d81b1b"), 1.2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self._rubber is not None:
+            if self.tool == "ellipse":
+                painter.drawEllipse(self._rubber)
+            elif self.tool == "range" and self._result is not None:
+                r = self._result.plot_rect
+                painter.drawLine(QPointF(self._rubber.left(), r.top()), QPointF(self._rubber.left(), r.bottom()))
+                painter.drawLine(QPointF(self._rubber.right(), r.top()), QPointF(self._rubber.right(), r.bottom()))
+            else:
+                if self.tool == "zoom":
+                    painter.setPen(QPen(QColor("#2f6fd6"), 1.0, Qt.PenStyle.DashLine))
+                painter.drawRect(self._rubber)
+        if self._poly:
+            pts = list(self._poly) + [self._mouse]
+            painter.drawPolyline(QPolygonF(pts))
+            painter.setBrush(QBrush(QColor("#ffffff")))
+            for p in self._poly:
+                painter.drawRect(QRectF(p.x() - 3, p.y() - 3, 6, 6))
+        if self._free:
+            painter.drawPolyline(QPolygonF(self._free))
+        if self.tool in ("quadrant", "bisector") and self._result is not None and self._result.plot_rect.contains(self._mouse):
+            r = self._result.plot_rect
+            painter.setPen(QPen(QColor("#d81b1b"), 1.0, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(self._mouse.x(), r.top()), QPointF(self._mouse.x(), r.bottom()))
+            if self.tool == "quadrant":
+                painter.drawLine(QPointF(r.left(), self._mouse.y()), QPointF(r.right(), self._mouse.y()))
+
+    # ------------------------------------------------------- coordinate maths
+    def _frac(self, pos: QPointF) -> tuple[float, float]:
+        return self._result.to_fraction(pos.x(), pos.y())
+
+    def _clamp_frac(self, f: float) -> float:
+        return min(max(f, 0.0), 1.0)
+
+    def _data_x(self, fx: float) -> float:
+        return float(self._result.x_scale.inverse_scalar(self._clamp_frac(fx)))
+
+    def _data_y(self, fy: float) -> float:
+        return float(self._result.y_scale.inverse_scalar(self._clamp_frac(fy)))
+
+    def _data_from_pos(self, pos: QPointF) -> tuple[float, float | None]:
+        fx, fy = self._frac(pos)
+        return self._data_x(fx), (self._data_y(fy) if self._result.y_scale is not None else None)
+
+    def _frac_x_of(self, value: float) -> float:
+        return float(self._result.x_scale.forward_scalar(value))
+
+    def _frac_y_of(self, value: float) -> float:
+        return float(self._result.y_scale.forward_scalar(value))
+
+    # ---------------------------------------------------------- hit testing
+    def _hit(self, pos: QPointF) -> tuple[GateShape, str] | None:
+        res = self._result
+        if res is None:
+            return None
+        for shape in reversed(res.gates):
+            if shape.label and shape.label_rect.contains(pos):
+                return shape, "label"
+        if self.selected is not None:
+            shape = self._shape_for(self.selected)
+            if shape is not None:
+                for i, h in enumerate(self._handles(shape)):
+                    if _dist(h, pos) <= HIT + 1:
+                        return shape, f"handle:{i}"
+        candidates = sorted(res.gates, key=lambda s: s.bbox.width() * s.bbox.height())
+        for shape in candidates:
+            if shape.kind == "quadrant":
+                cx, cy = shape.extra["centre"]
+                r = res.plot_rect
+                if (abs(pos.x() - cx) <= HIT and r.top() <= pos.y() <= r.bottom()) or (abs(pos.y() - cy) <= HIT and r.left() <= pos.x() <= r.right()):
+                    return shape, "quad"
+                continue
+            if shape.kind == "rect":
+                if shape.bbox.adjusted(-HIT, -HIT, HIT, HIT).contains(pos):
+                    return shape, "body"
+            elif shape.kind == "polygon":
+                poly = QPolygonF([QPointF(x, y) for x, y in shape.points])
+                if poly.containsPoint(pos, Qt.FillRule.OddEvenFill):
+                    return shape, "body"
+                for i in range(len(shape.points)):
+                    a = QPointF(*shape.points[i])
+                    b = QPointF(*shape.points[(i + 1) % len(shape.points)])
+                    if _dist_to_segment(pos, a, b) <= HIT:
+                        return shape, "body"
+            elif shape.kind == "ellipse":
+                poly = QPolygonF([QPointF(x, y) for x, y in shape.extra["outline"]])
+                if poly.containsPoint(pos, Qt.FillRule.OddEvenFill):
+                    return shape, "body"
+                for i in range(len(shape.extra["outline"])):
+                    a = QPointF(*shape.extra["outline"][i])
+                    b = QPointF(*shape.extra["outline"][(i + 1) % len(shape.extra["outline"])])
+                    if _dist_to_segment(pos, a, b) <= HIT:
+                        return shape, "body"
+            elif shape.kind == "range":
+                (x0, y0), (x1, y1) = shape.points
+                if not shape.transposed:
+                    if abs(pos.x() - x0) <= HIT or abs(pos.x() - x1) <= HIT or (min(x0, x1) <= pos.x() <= max(x0, x1) and abs(pos.y() - y0) <= HIT + 4):
+                        return shape, "body"
+                else:
+                    if abs(pos.y() - y0) <= HIT or abs(pos.y() - y1) <= HIT or (min(y0, y1) <= pos.y() <= max(y0, y1) and abs(pos.x() - x0) <= HIT + 4):
+                        return shape, "body"
+        return None
+
+    # --------------------------------------------------------------- mouse
+    def mousePressEvent(self, event: QMouseEvent):
+        self.setFocus()
+        pos = event.position()
+        self._mouse = pos
+        if self._result is None or self._result.error:
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            hit = self._hit(pos) if self.tool == "pointer" else None
+            pop = hit[0].population if hit else None
+            if pop is not None:
+                self.set_selected(pop)
+            self.contextMenuRequested.emit(pop, event.globalPosition().toPoint())
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        inside = self._result.plot_rect.contains(pos)
+        if self.tool == "pointer":
+            hit = self._hit(pos)
+            if hit is None:
+                self.set_selected(None)
+                return
+            shape, part = hit
+            self.set_selected(shape.population)
+            gate = shape.population.gate
+            self._drag = {"part": part, "start": pos, "last": pos, "orig": gate.to_dict(), "shape": shape, "moved": False, "siblings": self._quadrant_siblings(shape.population)}
+            return
+        if not inside:
+            return
+        if self.tool in ("rect", "ellipse", "zoom", "range"):
+            self._rubber = QRectF(pos, pos)
+        elif self.tool == "polygon":
+            if self._poly and _dist(pos, self._poly[0]) <= HIT and len(self._poly) >= 3:
+                self._finish_polygon()
+            else:
+                self._poly.append(pos)
+                self.update()
+        elif self.tool == "freehand":
+            self._free = [pos]
+        elif self.tool == "quadrant":
+            self._create_quadrants(pos)
+        elif self.tool == "bisector":
+            self._create_bisector(pos)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        pos = event.position()
+        self._mouse = pos
+        res = self._result
+        if res is None or res.error:
+            return
+        if self._drag is not None:
+            if not self._drag["moved"]:
+                if _dist(pos, self._drag["start"]) < 2:
+                    return
+                self._drag["moved"] = True
+                self.controller.begin_change("edit gate")
+            self._apply_drag(pos)
+            self._drag["last"] = pos
+            self.update()
+            return
+        if self._rubber is not None:
+            self._rubber = QRectF(self._rubber.topLeft(), pos).normalized()
+            self.update()
+        elif self._free:
+            if _dist(pos, self._free[-1]) >= 3:
+                self._free.append(pos)
+                self.update()
+        elif self._poly or self.tool in ("quadrant", "bisector"):
+            self.update()
+        # status
+        if res.plot_rect.contains(pos):
+            xv, yv = self._data_from_pos(pos)
+            text = f"{res.x} = {xv:,.1f}"
+            if yv is not None and res.y:
+                text += f"    {res.y} = {yv:,.1f}"
+            self.statusText.emit(text)
+        if self.tool == "pointer":
+            hit = self._hit(pos)
+            if hit is None:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            elif hit[1].startswith("handle") or hit[1] == "quad":
+                self.setCursor(Qt.CursorShape.SizeAllCursor if hit[1] == "quad" else Qt.CursorShape.CrossCursor)
+            else:
+                self.setCursor(Qt.CursorShape.OpenHandCursor if hit[1] == "body" else Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.position()
+        if self._drag is not None:
+            drag = self._drag
+            self._drag = None
+            if drag["moved"]:
+                pop = drag["shape"].population
+                self.controller.gate_changed(pop)
+                for sib in drag["siblings"]:
+                    sib.invalidate()
+            self.update()
+            return
+        if self._rubber is not None:
+            rect = self._rubber.normalized()
+            self._rubber = None
+            if self.tool == "zoom":
+                if rect.width() > 4 and rect.height() > 4:
+                    fx0, fy0 = self._frac(rect.bottomLeft())
+                    fx1, fy1 = self._frac(rect.topRight())
+                    self.view = (max(0.0, fx0), min(1.0, fx1), max(0.0, fy0), min(1.0, fy1))
+                    self.invalidate()
+                    self.zoomChanged.emit()
+            elif self.tool == "rect" and rect.width() > 3 and rect.height() > 3:
+                self._create_rect(rect)
+            elif self.tool == "ellipse" and rect.width() > 3 and rect.height() > 3:
+                self._create_ellipse(rect)
+            elif self.tool == "range" and rect.width() > 2:
+                self._create_range(rect)
+            self.update()
+            return
+        if self._free:
+            pts = simplify_path(self._free, 2.0)
+            self._free = []
+            if len(pts) >= 3:
+                self._create_polygon(pts)
+            self.update()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        pos = event.position()
+        if self.tool == "polygon":
+            if len(self._poly) >= 3:
+                self._finish_polygon()
+            return
+        if self.tool == "zoom":
+            self.reset_zoom()
+            return
+        if self.tool != "pointer" or self._result is None:
+            return
+        hit = self._hit(pos)
+        if hit is not None and hit[1] != "label":
+            self.populationActivated.emit(hit[0].population)
+
+    def leaveEvent(self, event):
+        self.statusText.emit("")
+        super().leaveEvent(event)
+
+    # ----------------------------------------------------------- keyboard
+    def keyPressEvent(self, event: QKeyEvent):
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            if self._poly or self._free or self._rubber is not None:
+                self._cancel_creation()
+            else:
+                self.set_selected(None)
+            return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self._poly:
+                self._poly.pop()
+                self.update()
+                return
+            if self.selected is not None:
+                self.delete_selected()
+                return
+        if event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
+            names = self.sample.parameter_names()
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Right) and names:
+                i = names.index(self.graph.x) if self.graph.x in names else 0
+                i = (i + (1 if key == Qt.Key.Key_Right else -1)) % len(names)
+                self.set_axes(x=names[i])
+                return
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down) and names and self.graph.y is not None:
+                i = names.index(self.graph.y) if self.graph.y in names else 0
+                i = (i + (1 if key == Qt.Key.Key_Up else -1)) % len(names)
+                self.set_axes(y=names[i])
+                return
+        super().keyPressEvent(event)
+
+    def _cancel_creation(self):
+        self._poly = []
+        self._free = []
+        self._rubber = None
+        self._drag = None
+        self.update()
+
+    # ------------------------------------------------------- gate editing
+    def _quadrant_siblings(self, pop: Population) -> list[Population]:
+        g = pop.gate
+        if g is None or getattr(g, "quadrant", None) is None or pop.parent is None:
+            return []
+        return [c for c in pop.parent.children if c is not pop and c.gate is not None and getattr(c.gate, "quadrant", None) and c.gate.quadrant[0] == g.quadrant[0]]
+
+    def _apply_drag(self, pos: QPointF):
+        drag = self._drag
+        shape: GateShape = drag["shape"]
+        pop = shape.population
+        res = self._result
+        gate = gate_from_dict(drag["orig"])
+        part = drag["part"]
+        dx = pos.x() - drag["start"].x()
+        dy = pos.y() - drag["start"].y()
+        dfx = dx / res.plot_rect.width() * (res.view[1] - res.view[0])
+        dfy = -dy / res.plot_rect.height() * (res.view[3] - res.view[2])
+        fx, fy = self._frac(pos)
+        if part == "label":
+            start_fx, start_fy = self._frac(QPointF(shape.label_rect.center()))
+            gate.label_pos = (start_fx + dfx, start_fy + dfy)
+            pop.gate = gate
+            return
+        if part == "quad":
+            xv = self._data_x(fx)
+            yv = self._data_y(fy)
+            for sib in [pop] + drag["siblings"]:
+                g = sib.gate
+                t = shape.transposed
+                ix, iy = (1, 0) if t else (0, 1)
+                if g.lo[ix] is not None:
+                    g.lo[ix] = xv
+                if g.hi[ix] is not None:
+                    g.hi[ix] = xv
+                if g.lo[iy] is not None:
+                    g.lo[iy] = yv
+                if g.hi[iy] is not None:
+                    g.hi[iy] = yv
+                sib.invalidate()
+            return
+        transposed = shape.transposed
+        if isinstance(gate, RectangleGate):
+            if len(gate.dims) == 1:
+                horizontal = not transposed
+                sc_fwd = self._frac_x_of if horizontal else self._frac_y_of
+                sc_inv = self._data_x if horizontal else self._data_y
+                delta = dfx if horizontal else dfy
+                lo = None if gate.lo[0] is None else sc_fwd(gate.lo[0])
+                hi = None if gate.hi[0] is None else sc_fwd(gate.hi[0])
+                if part == "body":
+                    lo = None if lo is None else lo + delta
+                    hi = None if hi is None else hi + delta
+                elif part == "handle:0":
+                    lo = fx if horizontal else fy
+                elif part == "handle:1":
+                    hi = fx if horizontal else fy
+                if lo is not None and hi is not None and lo > hi:
+                    lo, hi = hi, lo
+                gate.lo[0] = None if lo is None else sc_inv(lo)
+                gate.hi[0] = None if hi is None else sc_inv(hi)
+            else:
+                ix, iy = (1, 0) if transposed else (0, 1)
+                x0 = None if gate.lo[ix] is None else self._frac_x_of(gate.lo[ix])
+                x1 = None if gate.hi[ix] is None else self._frac_x_of(gate.hi[ix])
+                y0 = None if gate.lo[iy] is None else self._frac_y_of(gate.lo[iy])
+                y1 = None if gate.hi[iy] is None else self._frac_y_of(gate.hi[iy])
+                if part == "body":
+                    x0 = None if x0 is None else x0 + dfx
+                    x1 = None if x1 is None else x1 + dfx
+                    y0 = None if y0 is None else y0 + dfy
+                    y1 = None if y1 is None else y1 + dfy
+                elif part.startswith("handle:"):
+                    h = int(part.split(":")[1])
+                    if h == 0:  # top-left
+                        x0, y1 = fx, fy
+                    elif h == 1:  # top-right
+                        x1, y1 = fx, fy
+                    elif h == 2:  # bottom-right
+                        x1, y0 = fx, fy
+                    else:  # bottom-left
+                        x0, y0 = fx, fy
+                if x0 is not None and x1 is not None and x0 > x1:
+                    x0, x1 = x1, x0
+                if y0 is not None and y1 is not None and y0 > y1:
+                    y0, y1 = y1, y0
+                gate.lo[ix] = None if x0 is None else self._data_x(x0)
+                gate.hi[ix] = None if x1 is None else self._data_x(x1)
+                gate.lo[iy] = None if y0 is None else self._data_y(y0)
+                gate.hi[iy] = None if y1 is None else self._data_y(y1)
+        elif isinstance(gate, PolygonGate):
+            verts = []
+            for i, (vx, vy) in enumerate(gate.vertices):
+                if transposed:
+                    vx, vy = vy, vx
+                fvx, fvy = self._frac_x_of(vx), self._frac_y_of(vy)
+                if part == "body":
+                    fvx, fvy = fvx + dfx, fvy + dfy
+                elif part == f"handle:{i}":
+                    fvx, fvy = fx, fy
+                nx, ny = self._data_x(fvx), self._data_y(fvy)
+                verts.append((ny, nx) if transposed else (nx, ny))
+            gate.vertices = verts
+        elif isinstance(gate, EllipseGate):
+            c, pa, pb = (QPointF(*p) for p in shape.points)  # pixel coords of the original
+            if part == "body":
+                c, pa, pb = (QPointF(p.x() + dx, p.y() + dy) for p in (c, pa, pb))
+            elif part.startswith("handle:"):
+                h = int(part.split(":")[1])
+                if h in (0, 2):
+                    new_a = pos if h == 0 else QPointF(2 * c.x() - pos.x(), 2 * c.y() - pos.y())
+                    ux, uy = new_a.x() - c.x(), new_a.y() - c.y()
+                    blen = _dist(pb, c)
+                    norm = math.hypot(ux, uy) or 1.0
+                    pa = new_a
+                    pb = QPointF(c.x() - uy / norm * blen, c.y() + ux / norm * blen)
+                else:
+                    new_b = pos if h == 1 else QPointF(2 * c.x() - pos.x(), 2 * c.y() - pos.y())
+                    vx, vy = new_b.x() - c.x(), new_b.y() - c.y()
+                    alen = _dist(pa, c)
+                    norm = math.hypot(vx, vy) or 1.0
+                    pb = new_b
+                    pa = QPointF(c.x() + vy / norm * alen, c.y() - vx / norm * alen)
+            pts = []
+            for p in (c, pa, pb):
+                f_x, f_y = self._frac(p)
+                xv, yv = self._data_x(f_x), self._data_y(f_y)
+                pts.append((yv, xv) if transposed else (xv, yv))
+            gate.center, gate.a_end, gate.b_end = pts
+        pop.gate = gate
+        pop.invalidate()
+
+    def delete_selected(self):
+        pop = self.selected
+        if pop is None or pop.parent is None:
+            return
+        n = sum(1 for _ in pop.walk(False))
+        if n and not _confirm(self, "Delete gate", f"“{pop.name}” has {n} sub-population(s). Delete them as well?"):
+            return
+        group = self._group_for_change()
+        pops = [pop]
+        if pop.gate is not None and getattr(pop.gate, "quadrant", None):
+            pops += self._quadrant_siblings(pop)
+        self.controller.delete_populations(pops, group)
+        self.set_selected(None)
+
+    def _group_for_change(self) -> Group | None:
+        return self.group
+
+    # ------------------------------------------------------- gate creation
+    def _default_name(self, two_d: bool) -> str:
+        xs = self.sample.param_stain(self.graph.x)
+        if two_d and self.graph.y:
+            ys = self.sample.param_stain(self.graph.y)
+            return f"{xs}, {ys} subset"
+        return f"{xs} subset"
+
+    def _finish_gate(self, gate, default_name: str, ask: bool = True):
+        apply_default = bool(self.controller.preferences.get("apply_to_group_default")) or self.group is not None
+        group = self.group or self.controller.current_group
+        if ask:
+            dlg = GateNameDialog(default_name, group, apply_default, self)
+            if not dlg.exec():
+                self.toolDone.emit()
+                return None
+            name, apply = dlg.values()
+            name = name or default_name
+        else:
+            name, apply = default_name, apply_default
+        pop = Population(name, gate)
+        new_pop = self.controller.add_population(self.population, pop, group if apply else None)
+        if new_pop.parent is not self.population:
+            new_pop = self.population.child_by_name(name) or new_pop
+        self.set_selected(new_pop)
+        self.toolDone.emit()
+        return new_pop
+
+    def _create_rect(self, rect: QRectF):
+        res = self._result
+        fx0, fy0 = self._frac(rect.bottomLeft())
+        fx1, fy1 = self._frac(rect.topRight())
+        if res.y_scale is None:
+            gate = RectangleGate([self.graph.x], [self._data_x(fx0)], [self._data_x(fx1)])
+            self._finish_gate(gate, self._default_name(False))
+            return
+        gate = RectangleGate([self.graph.x, self.graph.y], [self._data_x(fx0), self._data_y(fy0)], [self._data_x(fx1), self._data_y(fy1)])
+        self._finish_gate(gate, self._default_name(True))
+
+    def _create_range(self, rect: QRectF):
+        fx0, _ = self._frac(rect.bottomLeft())
+        fx1, _ = self._frac(rect.topRight())
+        gate = RectangleGate([self.graph.x], [self._data_x(fx0)], [self._data_x(fx1)])
+        self._finish_gate(gate, self._default_name(False))
+
+    def _create_ellipse(self, rect: QRectF):
+        if self._result.y_scale is None:
+            return
+        c = rect.center()
+        a = QPointF(rect.right(), c.y())
+        b = QPointF(c.x(), rect.top())
+        pts = []
+        for p in (c, a, b):
+            fx, fy = self._frac(p)
+            pts.append((self._data_x(fx), self._data_y(fy)))
+        gate = EllipseGate([self.graph.x, self.graph.y], pts[0], pts[1], pts[2])
+        self._finish_gate(gate, self._default_name(True))
+
+    def _create_polygon(self, pts: list[QPointF]):
+        if self._result.y_scale is None:
+            return
+        verts = []
+        for p in pts:
+            fx, fy = self._frac(p)
+            verts.append((self._data_x(fx), self._data_y(fy)))
+        gate = PolygonGate([self.graph.x, self.graph.y], verts)
+        self._finish_gate(gate, self._default_name(True))
+
+    def _finish_polygon(self):
+        pts = list(self._poly)
+        self._poly = []
+        self._create_polygon(pts)
+        self.update()
+
+    def _create_quadrants(self, pos: QPointF):
+        if self._result.y_scale is None:
+            return
+        fx, fy = self._frac(pos)
+        xv, yv = self._data_x(fx), self._data_y(fy)
+        group = self.group or self.controller.current_group
+        apply = bool(self.controller.preferences.get("apply_to_group_default")) or self.group is not None
+        self.controller.begin_change("create quadrants")
+        gates = make_quadrant_gates(self.graph.x, self.graph.y, xv, yv, self.sample.param_stain(self.graph.x), self.sample.param_stain(self.graph.y))
+        created = []
+        for name, gate in gates:
+            base = name
+            k = 2
+            while self.population.child_by_name(name) is not None:
+                name = f"{base} {k}"
+                k += 1
+            created.append(self.controller.add_population(self.population, Population(name, gate), group if apply else None))
+        if created:
+            self.set_selected(self.population.child_by_name(created[0].name) or created[0])
+        self.toolDone.emit()
+
+    def _create_bisector(self, pos: QPointF):
+        fx, _ = self._frac(pos)
+        xv = self._data_x(fx)
+        stain = self.sample.param_stain(self.graph.x)
+        group = self.group or self.controller.current_group
+        apply = bool(self.controller.preferences.get("apply_to_group_default")) or self.group is not None
+        self.controller.begin_change("create bisector")
+        for name, lo, hi in ((f"{stain}-", None, xv), (f"{stain}+", xv, None)):
+            base = name
+            k = 2
+            while self.population.child_by_name(name) is not None:
+                name = f"{base} {k}"
+                k += 1
+            self.controller.add_population(self.population, Population(name, RectangleGate([self.graph.x], [lo], [hi])), group if apply else None)
+        self.toolDone.emit()
+
+
+def _confirm(parent, title, text) -> bool:
+    return QMessageBox.question(parent, title, text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes) == QMessageBox.StandardButton.Yes
