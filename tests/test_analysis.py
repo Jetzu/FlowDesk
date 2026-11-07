@@ -5,7 +5,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from sklearn.metrics import adjusted_rand_score, silhouette_score
+
+pytest.importorskip("sklearn")  # scikit-learn is a dependency; skip cleanly if an environment lacks it
+from sklearn.metrics import adjusted_rand_score, silhouette_score  # noqa: E402
 
 from flowdesk.core import analysis as A
 from flowdesk.core.fcs import Channel, write_fcs
