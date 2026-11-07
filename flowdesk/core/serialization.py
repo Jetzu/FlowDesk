@@ -84,7 +84,10 @@ def sample_to_dict(sample: Sample, base_dir: Path | None, data_dir: Path | None 
 def sample_from_dict(d: dict, base_dir: Path | None, data_dir: Path | None = None) -> Sample:
     path = Path(d["path"])
     if not path.exists() and base_dir is not None and d.get("rel_path"):
-        candidate = (base_dir / d["rel_path"]).resolve()
+        # normpath, not resolve(): keep the spelling the user sees (resolve()
+        # expands Windows 8.3 short names and symlinks, which surprises nobody
+        # except path comparisons)
+        candidate = Path(os.path.normpath(base_dir / d["rel_path"]))
         if candidate.exists():
             path = candidate
     if not path.exists() and base_dir is not None:
