@@ -171,3 +171,48 @@ def real_tcell_panel() -> Path:
     if not REAL_TCELL_PANEL.exists():
         pytest.skip("real T-cell panel FCS file not available")
     return REAL_TCELL_PANEL
+
+
+# ---------------------------------------------------------------- Qt shutdown
+# Widgets that PySide believes Python owns (e.g. buttons added to a layout
+# before that layout had a parent widget, then re-parented by Qt) are freed
+# twice when the interpreter finalises after a UI test run, which aborts the
+# process with "shared QObject was deleted directly".  The running
+# application never gets there (its event loop closes everything first), so
+# the test process mirrors that: close, flush, report, then leave before
+# Python's finalisation touches Qt.
+_EXIT_STATUS = {"code": None}
+
+
+def pytest_sessionfinish(session, exitstatus):
+    try:
+        _EXIT_STATUS["code"] = int(exitstatus)
+    except (TypeError, ValueError):
+        _EXIT_STATUS["code"] = 1 if exitstatus else 0
+
+
+def pytest_unconfigure(config):
+    try:
+        from PySide6.QtCore import QEvent
+        from PySide6.QtWidgets import QApplication
+    except ImportError:  # core-only environment
+        return
+    app = QApplication.instance()
+    if app is None or _EXIT_STATUS["code"] is None:
+        return
+    import gc
+    import os
+    import sys
+
+    for widget in list(app.topLevelWidgets()):
+        try:
+            widget.close()
+        except RuntimeError:
+            pass
+    gc.collect()
+    for _ in range(3):
+        app.processEvents()
+        app.sendPostedEvents(None, int(QEvent.Type.DeferredDelete))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_EXIT_STATUS["code"])

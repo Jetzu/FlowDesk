@@ -299,18 +299,24 @@ def _pop_label(pop: Population) -> str:
 
 
 # =================================================================== threading
-class _Worker(QObject):
-    finished = Signal(object)
+class _Worker(QThread):
+    """Runs the computation in its own thread.
+
+    A QThread subclass owned by the dialog (not a parentless QObject moved to a
+    thread): Qt deletes it with the dialog, so nothing is torn down from the
+    wrong thread at interpreter shutdown.
+    """
+
+    done_result = Signal(object)
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, fn, kwargs):
-        super().__init__()
+    def __init__(self, fn, kwargs, parent=None):
+        super().__init__(parent)
         self.fn = fn
         self.kwargs = kwargs
         self.cancelled = False
 
-    @Slot()
     def run(self):
         try:
             result = self.fn(**self.kwargs, progress=self.progress.emit, should_cancel=lambda: self.cancelled)
@@ -319,7 +325,7 @@ class _Worker(QObject):
         except Exception as exc:  # noqa: BLE001 - reported to the user
             self.failed.emit(f"{type(exc).__name__}: {exc}")
         else:
-            self.finished.emit(result)
+            self.done_result.emit(result)
 
 
 # ===================================================================== dialogs
@@ -455,15 +461,11 @@ class _AnalysisDialog(QDialog):
         if not self._validate(kwargs):
             return
         self.run_button.setEnabled(False)
-        self._thread = QThread(self)
-        self._worker = _Worker(self.compute_fn(), kwargs)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._finished)
+        self._worker = _Worker(self.compute_fn(), kwargs, self)
+        self._thread = self._worker
+        self._worker.done_result.connect(self._finished)
         self._worker.failed.connect(self._failed)
         self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.failed.connect(self._thread.quit)
         self._progress = QProgressDialog("Starting…", "Cancel", 0, 0, self)
         self._progress.setWindowTitle(self.title)
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -488,7 +490,14 @@ class _AnalysisDialog(QDialog):
             self._progress.close()
             self._progress = None
 
+    def _settle_thread(self):
+        # the worker emits its result just before run() returns; make sure the
+        # thread has fully stopped before anything else happens
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.wait(10000)
+
     def _finished(self, result):
+        self._settle_thread()
         cancelled = self._worker is not None and self._worker.cancelled
         self._close_progress()
         self.run_button.setEnabled(True)
@@ -503,6 +512,7 @@ class _AnalysisDialog(QDialog):
         self.accept()
 
     def _failed(self, message: str):
+        self._settle_thread()
         self._close_progress()
         self.run_button.setEnabled(True)
         if message:
