@@ -1,5 +1,7 @@
 # FlowDesk
 
+[![tests](https://github.com/Jetzu/FlowDesk/actions/workflows/ci.yml/badge.svg)](https://github.com/Jetzu/FlowDesk/actions/workflows/ci.yml)
+
 FlowDesk is a desktop workspace for flow cytometry analysis. It follows the
 workflow experienced cytometrists already know: a **workspace** with sample
 **groups** and a gating tree, **graph windows** where gates are drawn on
