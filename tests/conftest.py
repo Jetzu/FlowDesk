@@ -215,4 +215,12 @@ def pytest_unconfigure(config):
         app.sendPostedEvents(None, int(QEvent.Type.DeferredDelete))
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(_EXIT_STATUS["code"])
+    code = _EXIT_STATUS["code"]
+    if sys.platform == "win32":
+        # os._exit() -> ExitProcess still unloads DLLs, and Qt's DLL teardown
+        # faults while the QApplication is alive; TerminateProcess skips that.
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+    os._exit(code)
