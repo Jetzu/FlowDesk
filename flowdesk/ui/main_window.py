@@ -879,7 +879,7 @@ class MainWindow(QMainWindow):
         self.controller.set_workspace(Workspace())
 
     def open_workspace(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Workspace", "", f"Workspaces (*{EXTENSION} *.wsp);;FlowDesk workspace (*{EXTENSION});;FlowJo workspace (*.wsp);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open Workspace", "", f"Workspaces and templates (*{EXTENSION} *.wsp *.fdwt *.wspt);;FlowDesk workspace (*{EXTENSION});;FlowJo workspace (*.wsp);;Templates (*.fdwt *.wspt);;All files (*)")
         if path:
             self._open_path(path)
 
@@ -887,6 +887,9 @@ class MainWindow(QMainWindow):
         p = Path(path)
         if p.suffix.lower() == ".wsp":
             self._import_wsp_path(p)
+            return
+        if p.suffix.lower() in (".fdwt", ".wspt"):
+            self._apply_template_path(p)
             return
         if not self.maybe_save():
             return
@@ -956,6 +959,34 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Imported {len(ws.samples)} samples, {report.populations if hasattr(report, 'populations') else ''} populations from {path.name}", 6000)
         if warnings:
             QMessageBox.information(self, "Import notes", "\n".join(warnings[:20]) + ("\n…" if len(warnings) > 20 else ""))
+
+    def _apply_template_path(self, path: Path):
+        """Apply a workspace template (.fdwt, or a FlowJo .wspt/.wsp used as one)
+        to the samples of the current workspace."""
+        from ..core.templates import apply_template, load_template
+
+        try:
+            template = load_template(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Template", f"Could not read {path.name}:\n{exc}")
+            return
+        ws = self.controller.workspace
+        if not ws.samples:
+            QMessageBox.information(self, "Template", "Add samples first, then apply the template to them.")
+            return
+        if not confirm(self, "Apply template", f"Apply the groups, gates, scales, layouts and tables of “{path.name}” to the {len(ws.samples)} sample(s) in this workspace?"):
+            return
+        c = self.controller
+        c.begin_change("apply template")
+        report = apply_template(ws, template)
+        c.mark_modified()
+        c.groupsChanged.emit()
+        c.gatingChanged.emit(None)
+        c.scalesChanged.emit(None)
+        c.compensationChanged.emit(None)
+        c.layoutsChanged.emit()
+        c.tablesChanged.emit()
+        self.statusBar().showMessage(f"Template applied: {report['groups']} groups, {report['samples']} sample(s) gated, {report['layouts']} layouts, {report['tables']} tables", 6000)
 
     def _relocate_samples(self, samples: list[Sample], folder: Path):
         found = 0
@@ -1041,7 +1072,7 @@ class MainWindow(QMainWindow):
     def _files_dropped(self, paths: list[str]):
         fcs = [p for p in paths if p.lower().endswith(".fcs")]
         folders = [p for p in paths if Path(p).is_dir()]
-        others = [p for p in paths if p.lower().endswith((EXTENSION, ".wsp"))]
+        others = [p for p in paths if p.lower().endswith((EXTENSION, ".wsp", ".fdwt", ".wspt"))]
         if fcs:
             self.controller.add_samples(fcs)
         for f in folders:

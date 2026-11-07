@@ -264,6 +264,33 @@ def test_group_graph_window_applies_to_all_members(app, window):
     gw.close()
 
 
+def test_apply_template_through_window(app, window, tmp_path, monkeypatch):
+    from flowdesk.core.templates import save_template
+    from flowdesk.ui import main_window as mw
+
+    c = window.controller
+    ws = c.workspace
+    s0 = ws.samples[0]
+    c.add_population(s0.root, Population("Cells", RectangleGate(["FSC-A", "SSC-A"], [30000, 5000], [200000, 150000])), c.current_group)
+    tpl = tmp_path / "analysis.fdwt"
+    save_template(ws, tpl)
+    # a fresh workspace with the same files, then the template is applied via File > Open
+    from flowdesk.core.model import Workspace
+
+    ws2 = Workspace()
+    for p in FCS[:2]:
+        ws2.add_sample(p)
+    c.set_workspace(ws2)
+    assert ws2.samples[0].root.find("/Cells") is None
+    monkeypatch.setattr(mw, "confirm", lambda *a, **k: True)
+    window._open_path(str(tpl))
+    app.processEvents()
+    for s in ws2.samples:
+        assert s.root.find("/Cells") is not None and s.root.find("/Cells").count > 0
+    assert ws2.groups[0].root.find("/Cells") is not None
+    assert window.tree.topLevelItem(0).childCount() == 1
+
+
 def test_wsp_import_through_window(app, window):
     wsp = FOLDER / "19-Aug-2025.wsp"
     if not wsp.exists():
