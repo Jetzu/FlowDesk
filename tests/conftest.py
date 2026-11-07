@@ -220,7 +220,13 @@ def pytest_unconfigure(config):
         # os._exit() -> ExitProcess still unloads DLLs, and Qt's DLL teardown
         # faults while the QApplication is alive; TerminateProcess skips that.
         import ctypes
+        from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        # the pseudo-handle is (HANDLE)-1; declaring the types keeps all 64 bits
         kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
     os._exit(code)
