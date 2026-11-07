@@ -60,6 +60,8 @@ class Gate:
         self.line_width: float = 1.0
         self.negated: bool = False  # events *outside* the shape belong to the gate
         self.label_pos: tuple[float, float] | None = None  # manual label position (display fractions)
+        self.tint: float = 0.0  # translucent fill of the gate shape, 0 (none) .. 1 (opaque)
+        self.locked: bool = False  # locked gates cannot be moved or resized in a graph window
 
     def evaluate(self, acc: ParamAccess) -> np.ndarray:
         raise NotImplementedError
@@ -82,6 +84,10 @@ class Gate:
             d["negated"] = True
         if self.label_pos is not None:
             d["label_pos"] = [float(self.label_pos[0]), float(self.label_pos[1])]
+        if self.tint:
+            d["tint"] = float(self.tint)
+        if self.locked:
+            d["locked"] = True
         return d
 
     def _load_base(self, d: dict):
@@ -91,6 +97,11 @@ class Gate:
         self.negated = bool(d.get("negated", False))
         lp = d.get("label_pos")
         self.label_pos = (float(lp[0]), float(lp[1])) if lp else None
+        try:
+            self.tint = min(max(float(d.get("tint", 0.0) or 0.0), 0.0), 1.0)
+        except (TypeError, ValueError):
+            self.tint = 0.0
+        self.locked = bool(d.get("locked", False))
 
     def clone(self) -> "Gate":
         g = gate_from_dict(self.to_dict())

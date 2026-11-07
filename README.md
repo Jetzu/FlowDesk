@@ -15,11 +15,23 @@ trademark of its owner; FlowDesk is not affiliated with it.
 
 ## Running
 
+FlowDesk runs on **Windows, Linux and macOS** (Python 3.11+, 3.12 recommended).
+Ready-to-run apps for all three are attached to each
+[GitHub release](../../releases); see **[docs/INSTALL.md](docs/INSTALL.md)** for
+step-by-step instructions (including the Qt libraries needed on Linux).
+
+From a source checkout the launchers create the virtual environment on first run:
+
 ```bash
-cd FlowDesk
-uv venv --python 3.12 .venv            # or: python3.12 -m venv .venv
-uv pip install --python .venv/bin/python -e .   # or: .venv/bin/pip install -e .
-.venv/bin/python -m flowdesk           # or: ./flowdesk.sh
+./flowdesk.sh            # macOS / Linux  (macOS Finder: double-click FlowDesk.command)
+flowdesk.bat             # Windows        (double-click in Explorer)
+```
+
+or by hand:
+
+```bash
+python3.12 -m venv .venv && .venv/bin/python -m pip install -e .   # Windows: py -3.12 -m venv .venv
+.venv/bin/python -m flowdesk                                        # Windows: .venv\Scripts\python -m flowdesk
 ```
 
 Open an FCS file, a folder, a `.fdw` workspace or a FlowJo `.wsp` file by
@@ -36,9 +48,16 @@ passing it on the command line or by dropping it onto the workspace window.
 | **Layout Editor** | Drag populations from the workspace onto the page, arrange, overlay (drop onto an existing plot), export PNG/PDF/SVG, and create a batch PDF with one page per sample. |
 | **Table Editor** | Define columns (population × statistic, keyword columns), run them over a group, export CSV or copy to the clipboard. |
 | **Compensation** | The matrix stored in each FCS file is applied automatically (`Comp-` parameters). Edit matrices, apply to groups, or run the Compensation Wizard on the Compensation group's controls. |
+| **Experiment** (Workspace tab) | `Annotate Experiment…` (metadata and the stain panel), `Inspect Sample…`, `Add Keyword…` (one value, from a file-name pattern, or from a CSV), `Export Keywords`, `Sort Samples by Keyword…`, and the **Plate Editor** (96/384-well view coloured by any statistic, wells from `$WELLID`/the file name). |
+| **Templates** | `File ▸ Save as Template…` writes the analysis without the samples (`.fdwt`); `Apply Template…` (or opening a `.fdwt`/FlowJo `.wspt`) applies groups, gates, scales, matrices, layouts and tables to new samples. |
+| **Cytometer settings** | Default axis scales per cytometer (`$CYT`), applied to its samples. |
+| **Tools: analysis** | t-SNE, UMAP, PCA (results become parameters you can gate on), FlowSOM-style and k-means clustering (one population per cluster, with a median heat-map), population comparison (chi-squared T(x), KS). |
+| **Tools: biology** | Cell cycle (Dean-Jett-Fox-style fit), proliferation (dye-dilution generations, division/proliferation index), kinetics (statistic vs time), each with group batch tables and CSV export. |
 
 Workspaces are saved as `.fdw` (JSON). `File ▸ Export FlowJo Workspace…`
-writes a `.wsp`. Populations can be exported as new FCS files or CSV.
+writes a `.wsp`. Populations can be exported as new FCS files or CSV; samples
+can be concatenated. The feature-by-feature comparison with FlowJo is in
+[docs/PARITY.md](docs/PARITY.md).
 
 ## Coming from FlowJo
 
@@ -113,10 +132,16 @@ real FlowJo workspaces (identical for rectangle gates, within ~1 % for polygons)
 ```
 flowdesk/core      fcs.py (reader/writer), transforms.py (scales), gates.py, stats.py,
                    compensation.py, model.py (workspace/sample/population/group),
-                   layouts.py, serialization.py, wsp_import.py, wsp_export.py
+                   layouts.py, serialization.py, templates.py, wsp_import.py, wsp_export.py,
+                   analysis.py (PCA/t-SNE/UMAP, FlowSOM, k-means, comparison),
+                   biology.py (cell cycle, proliferation, kinetics)
 flowdesk/ui        main_window.py (ribbon, groups, sample tree), graph_window.py,
                    plot_widget.py (gate drawing/editing), renderer.py (plots),
                    layout_editor.py, table_editor.py, compensation.py, dialogs.py,
-                   icons.py (drawn icons), style.py, controller.py (signals/undo/prefs)
-tests              pytest suite (core + UI, run offscreen)
+                   icons.py (drawn icons), style.py, controller.py (signals/undo/prefs);
+                   extensions loaded through install(window): experiment.py,
+                   plate_editor.py, tools_analysis.py, tools_biology.py,
+                   graph_extras.py, cytometer.py
+packaging          PyInstaller spec, icons, Linux desktop entry (see docs/INSTALL.md)
+tests              pytest suite (core + UI, run offscreen on macOS, Windows and Linux in CI)
 ```

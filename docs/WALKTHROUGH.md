@@ -22,6 +22,22 @@ the right column is the same action in FlowDesk. Nothing here is a mock-up.
 | Layout Editor: drag populations onto the page | Same; arrange in a grid, overlays by dropping onto a plot, batch PDF per sample. | ![](walkthrough/14_layout_editor.png) |
 | Compensation | Matrix editor, apply to group, wizard from single-stain controls. | ![](walkthrough/15_compensation_window.png) |
 
+## The rest of the toolkit
+
+| FlowJo | FlowDesk | |
+|---|---|---|
+| Workspace tab: Experiment band (Annotate, Add Keyword, Plate Editor) | Same band, plus Inspect Sample, Export Keywords, Sort by Keyword, Cytometry | ![](walkthrough/16_workspace_tab_experiment_band.png) |
+| Tools tab | Compensation, derived parameters, concatenate, export, t-SNE / UMAP / PCA, FlowSOM / k-means / Compare, Cell Cycle / Proliferation / Kinetics | ![](walkthrough/17_tools_tab.png) |
+| Annotate Experiment | Metadata and the stain panel (stains written to `$PnS`) | ![](walkthrough/18_annotate_experiment.png) |
+| Sample inspector | File, cytometer, events, parameters, compensation | ![](walkthrough/19_inspect_sample.png) |
+| Plate Editor | 96/384 wells, colour by any statistic, click to select, create groups | ![](walkthrough/20_plate_editor.png) |
+| t-SNE / UMAP / PCA | Pick populations and parameters; results become gateable parameters | ![](walkthrough/21_tsne_dialog.png) |
+| FlowSOM / k-means | One population per cluster plus a median heat-map | ![](walkthrough/22_flowsom_dialog.png) |
+| Population comparison | Chi-squared T(x) and KS per parameter | ![](walkthrough/23_compare_dialog.png) |
+| Cell cycle | Dean-Jett-Fox-style fit with %G1/%S/%G2M | ![](walkthrough/24_cell_cycle.png) |
+| Proliferation | Generations, division and proliferation index | ![](walkthrough/25_proliferation.png) |
+| Kinetics | Statistic versus time | ![](walkthrough/26_kinetics.png) |
+
 ## Ten-minute acceptance check (for someone who knows FlowJo)
 
 1. `./flowdesk.sh`, then `File ▸ Open` one of your own `.wsp` files. Expect the

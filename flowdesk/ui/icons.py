@@ -19,6 +19,16 @@ PAPER = QColor("#ffffff")
 YELLOW = QColor("#f2c94c")
 
 
+def _icon_font(size: int, weight=QFont.Weight.Bold) -> QFont:
+    """Default UI family (no hard-coded "Helvetica", which Windows / Linux
+    substitute). The size is a pixel size so glyphs fill the icon identically on
+    every platform (a pixmap reports 72 dpi on macOS but 96 elsewhere)."""
+    font = QFont()
+    font.setPixelSize(max(1, int(size)))
+    font.setWeight(weight)
+    return font
+
+
 def _pen(color=INK, width=1.8):
     pen = QPen(color, width)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -211,7 +221,7 @@ def _draw(name: str, p: QPainter, s: float):
             p.drawEllipse(a)
             p.drawEllipse(b)
             p.setPen(_pen(INK, 1.0))
-            p.setFont(QFont("Helvetica", int(s * 0.3), QFont.Weight.Bold))
+            p.setFont(_icon_font(int(s * 0.3)))
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, "∧")
     elif name == "keyword":
         p.setPen(_pen(INK, 1.6))
@@ -422,14 +432,14 @@ def _draw(name: str, p: QPainter, s: float):
         path.cubicTo(cx - 2, r.bottom() - 2, cx + 1, r.top() + 2, r.right(), r.top() + 2)
         p.drawPath(path)
         p.setPen(_pen(INK, 1.0))
-        p.setFont(QFont("Helvetica", int(s * 0.32), QFont.Weight.Bold))
+        p.setFont(_icon_font(int(s * 0.32)))
         p.drawText(QRectF(r.left() + 2, r.top(), r.width() * 0.5, r.height() * 0.5), Qt.AlignmentFlag.AlignCenter, "T")
     elif name == "graph":
         _axes(p, r)
         _scatter(p, r, BLUE, n=18)
     elif name == "text":
         p.setPen(_pen(INK, 1.0))
-        p.setFont(QFont("Helvetica", int(s * 0.55), QFont.Weight.Bold))
+        p.setFont(_icon_font(int(s * 0.55)))
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, "A")
     elif name == "image":
         _page(p, r)
@@ -466,7 +476,7 @@ def _draw(name: str, p: QPainter, s: float):
         p.setBrush(PAPER)
         p.drawEllipse(QPointF(cx, cy), r.width() / 2, r.height() / 2)
         p.setPen(_pen(BLUE, 1.0))
-        p.setFont(QFont("Helvetica", int(s * 0.42), QFont.Weight.Bold))
+        p.setFont(_icon_font(int(s * 0.42)))
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, "?" if name == "help" else "i")
     elif name == "wizard":
         p.setPen(_pen(PURPLE, 2.0))
@@ -538,7 +548,7 @@ def _draw(name: str, p: QPainter, s: float):
         p.drawEllipse(QPointF(cx, cy), r.width() * 0.28, r.height() * 0.28)
     elif name == "derive":
         p.setPen(_pen(INK, 1.0))
-        p.setFont(QFont("Helvetica", int(s * 0.36), QFont.Weight.Bold))
+        p.setFont(_icon_font(int(s * 0.36)))
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, "ƒx")
     elif name == "app":
         p.setPen(Qt.PenStyle.NoPen)
@@ -552,6 +562,27 @@ def _draw(name: str, p: QPainter, s: float):
         p.setPen(_pen(YELLOW, s * 0.07))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(QPointF(inner.center().x() + 1, inner.center().y() - 1), inner.width() * 0.3, inner.height() * 0.24)
+    elif name == "cytometer":
+        # instrument body with a flow cell and a laser beam
+        p.setPen(_pen(INK, 1.5))
+        p.setBrush(QColor("#eef2f7"))
+        body = QRectF(r.left(), r.top() + r.height() * 0.3, r.width(), r.height() * 0.62)
+        p.drawRoundedRect(body, 2, 2)
+        _tube(p, cx - r.width() * 0.09, r.top(), r.width() * 0.18, r.height() * 0.42)
+        p.setPen(_pen(RED, 1.6))
+        p.drawLine(QPointF(body.left() + 2, body.top() + body.height() * 0.45), QPointF(cx, body.top() + body.height() * 0.45))
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, col in enumerate((GREEN, BLUE, ORANGE)):
+            p.setBrush(col)
+            p.drawEllipse(QPointF(cx + r.width() * (0.12 + 0.11 * i), body.bottom() - body.height() * 0.28), max(1.0, s * 0.04), max(1.0, s * 0.04))
+    elif name == "lock":
+        p.setPen(_pen(INK, max(1.2, s * 0.07)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(cx - r.width() * 0.22, r.top(), r.width() * 0.44, r.height() * 0.6), 0, 180 * 16)
+        p.drawLine(QPointF(cx - r.width() * 0.22, r.top() + r.height() * 0.3), QPointF(cx - r.width() * 0.22, cy))
+        p.drawLine(QPointF(cx + r.width() * 0.22, r.top() + r.height() * 0.3), QPointF(cx + r.width() * 0.22, cy))
+        p.setBrush(YELLOW)
+        p.drawRoundedRect(QRectF(r.left() + r.width() * 0.15, cy - 1, r.width() * 0.7, r.height() * 0.5), 2, 2)
     else:
         p.setPen(_pen(GREY, 1.4))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -572,7 +603,8 @@ def pixmap(name: str, size: int = 32) -> QPixmap:
 @lru_cache(maxsize=256)
 def icon(name: str) -> QIcon:
     ic = QIcon()
-    for size in (16, 24, 32, 48, 64):
+    # 18 / 20 / 22 px are drawn natively so tree, toolbar and menu icons stay crisp
+    for size in (16, 18, 20, 22, 24, 32, 48, 64):
         ic.addPixmap(pixmap(name, size))
     return ic
 

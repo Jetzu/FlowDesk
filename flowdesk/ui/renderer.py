@@ -79,12 +79,22 @@ class RenderOptions:
     histogram_fill: str = "#d7e3f4"
     histogram_line: str = "#000000"
     view: tuple = (0.0, 1.0, 0.0, 1.0)  # zoom window in display fractions (x0, x1, y0, y1)
+    show_gate_labels: bool = True
+    # Font sizes are given in points. They are converted to *pixel* sizes as if
+    # the target had `font_dpi` dots per inch, so a plot looks the same on every
+    # platform and in vector exports (a QImage reports 72 dpi on macOS but 96 on
+    # Windows / Linux, which made point-sized text a third larger there).
+    # 96 matches what the layout editor assumes; graph windows use 72 (1 pt = 1 px).
+    font_dpi: float = 96.0
+    show_legend: bool = True  # legend box when overlays are drawn
+    histogram_offset: bool = False  # stack overlaid histograms with a vertical offset
+    histogram_line_width: float = 1.2
 
     @classmethod
     def from_prefs(cls, prefs, graph: GraphSettings | None = None, **overrides) -> "RenderOptions":
         values = {}
         for f in cls.__dataclass_fields__:
-            if f in ("title", "overlay_colors", "view"):
+            if f in ("title", "overlay_colors", "view", "font_dpi"):
                 continue
             try:
                 v = prefs.get(f) if hasattr(prefs, "get") else None
@@ -137,6 +147,8 @@ class RenderResult:
     histogram: bool = False
     error: str | None = None
     view: tuple = (0.0, 1.0, 0.0, 1.0)
+    legend_rect: QRectF | None = None  # overlay legend box (image pixels), when drawn
+    legend_entries: list = field(default_factory=list)  # [(label, colour name)]
 
     # ---- coordinate helpers (image pixels <-> display fractions)
     def to_pixel(self, fx: float, fy: float) -> QPointF:
@@ -170,6 +182,14 @@ def format_freq(value: float, decimals: int = 1) -> str:
     if value is None or math.isnan(value):
         return ""
     return f"{value:.{decimals}f}"
+
+
+def plot_font(size_pt: float, options: "RenderOptions | None" = None) -> QFont:
+    """A QFont of `size_pt` points expressed as a pixel size (see RenderOptions.font_dpi)."""
+    dpi = float(getattr(options, "font_dpi", 96.0) or 96.0)
+    font = QFont()
+    font.setPixelSize(max(1, int(round(float(size_pt) * dpi / 72.0))))
+    return font
 
 
 def _subsample(idx: np.ndarray, limit: int) -> np.ndarray:
@@ -220,16 +240,36 @@ def render_plot(
     overlays: list[tuple[Sample, Population]] | None = None,
     selected: Population | None = None,
     dpr: float = 1.0,
+    painter: QPainter | None = None,
 ) -> RenderResult:
+    """Render a plot into a new QImage (default) or onto `painter` (any paint
+    device: SVG generator, PDF writer, printer), in a `width` x `height`
+    logical-pixel frame. `dpr` sets the resolution of the rasterised events."""
     width = max(int(width), 60)
     height = max(int(height), 60)
     dpr = max(float(dpr), 1.0)
-    image = QImage(int(width * dpr), int(height * dpr), QImage.Format.Format_RGB32)
-    image.setDevicePixelRatio(dpr)
-    image.fill(QColor(options.background))
-    painter = QPainter(image)
+    own = painter is None
+    if own:
+        image = QImage(int(width * dpr), int(height * dpr), QImage.Format.Format_RGB32)
+        image.setDevicePixelRatio(dpr)
+        image.fill(QColor(options.background))
+        painter = QPainter(image)
+    else:
+        image = QImage()
+        painter.save()
+        painter.fillRect(QRectF(0, 0, width, height), QColor(options.background))
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    try:
+        return _paint_plot(painter, image, sample, population, graph, width, height, options, overlays, selected, dpr)
+    finally:
+        if own:
+            painter.end()
+        else:
+            painter.restore()
+
+
+def _paint_plot(painter: QPainter, image: QImage, sample, population, graph, width: int, height: int, options: RenderOptions, overlays, selected, dpr: float) -> RenderResult:
 
     x = graph.x
     y = graph.y
@@ -237,10 +277,8 @@ def render_plot(
     if histogram:
         y = None
 
-    label_font = QFont()
-    label_font.setPointSize(options.label_font_size)
-    number_font = QFont()
-    number_font.setPointSize(options.number_font_size)
+    label_font = plot_font(options.label_font_size, options)
+    number_font = plot_font(options.number_font_size, options)
     fm_num = QFontMetricsF(number_font)
     fm_lab = QFontMetricsF(label_font)
 
@@ -268,7 +306,6 @@ def render_plot(
     if not sample.ensure_loaded():
         _draw_message(painter, plot_rect, f"File not found\n{sample.name}", label_font)
         result.error = sample.load_error or "file not found"
-        painter.end()
         return result
     if not x:
         x, y2 = sample.default_axes()
@@ -283,7 +320,6 @@ def render_plot(
     except KeyError as exc:
         _draw_message(painter, plot_rect, f"Parameter not found: {exc}", label_font)
         result.error = str(exc)
-        painter.end()
         return result
     result.x_scale, result.y_scale = x_scale, y_scale
 
@@ -356,8 +392,42 @@ def render_plot(
     # ---- gates
     if options.show_gates:
         draw_gates(painter, result, population, sample, options, selected)
-    painter.end()
+    # ---- overlay legend
+    if overlays and options.show_legend:
+        entries = [(f"{sample.name} / {population.display_name}", options.histogram_line if histogram else "#7a7f87")]
+        for k, (osample, opop) in enumerate(overlays):
+            entries.append((f"{osample.name} / {opop.display_name}", options.overlay_colors[k % len(options.overlay_colors)]))
+        result.legend_entries = entries
+        result.legend_rect = _draw_legend(painter, plot_rect, entries, number_font)
     return result
+
+
+def _draw_legend(painter: QPainter, plot: QRectF, entries: list[tuple[str, str]], font: QFont) -> QRectF:
+    """Colour swatch + label per series, boxed in the top-right plot corner."""
+    fm = QFontMetricsF(font)
+    sw = max(8.0, fm.height() * 0.7)
+    pad = 4.0
+    avail = max(40.0, plot.width() * 0.62 - sw - 3 * pad)
+    labels = [fm.elidedText(t, Qt.TextElideMode.ElideMiddle, avail) for t, _ in entries]
+    text_w = max((fm.horizontalAdvance(t) for t in labels), default=0.0)
+    row_h = fm.height()
+    w = pad * 3 + sw + text_w
+    h = pad * 2 + row_h * len(entries)
+    box = QRectF(plot.right() - w - 4, plot.top() + 4, w, h)
+    painter.save()
+    painter.setPen(QPen(QColor("#9aa0a6"), 0.8))
+    painter.setBrush(QColor(255, 255, 255, 225))
+    painter.drawRoundedRect(box, 2.5, 2.5)
+    painter.setFont(font)
+    for i, (label, (_, colour)) in enumerate(zip(labels, entries)):
+        y = box.top() + pad + i * row_h
+        painter.setPen(QPen(QColor(colour).darker(115), 0.8))
+        painter.setBrush(QColor(colour))
+        painter.drawRect(QRectF(box.left() + pad, y + (row_h - sw) / 2, sw, sw))
+        painter.setPen(QColor("#000000"))
+        painter.drawText(QRectF(box.left() + 2 * pad + sw, y, text_w + 2, row_h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+    painter.restore()
+    return box
 
 
 def _draw_message(painter: QPainter, rect: QRectF, text: str, font: QFont):
@@ -512,26 +582,34 @@ def _draw_histogram(painter: QPainter, rect: QRectF, xd: np.ndarray, options: Re
     result.extra_ymax = ymax  # type: ignore[attr-defined]
     result.extra_normalized = normalize  # type: ignore[attr-defined]
     pw, ph = rect.width(), rect.height()
-    for c, col, fill in series:
+    n = len(series)
+    offset = 0.0
+    if options.histogram_offset and n > 1:
+        offset = min(0.22, 0.6 / (n - 1))  # fraction of the plot height between baselines
+    height_frac = 1.0 - offset * (n - 1)
+    result.extra_offset = offset  # type: ignore[attr-defined]
+    result.extra_height_frac = height_frac  # type: ignore[attr-defined]
+    lw = max(0.3, float(options.histogram_line_width))
+    # back to front so the lower (earlier) curves stay visible when staggered
+    order = list(range(n))[::-1] if offset else list(range(n))
+    for k in order:
+        c, col, fill = series[k]
+        base = rect.bottom() - k * offset * ph
         path = QPainterPath()
-        path.moveTo(rect.left(), rect.bottom())
+        path.moveTo(rect.left(), base)
         for i, v in enumerate(c):
-            px = rect.left() + (i + 0.5) / bins * pw
-            py = rect.bottom() - (v / ymax) * ph
-            path.lineTo(px, py)
-        path.lineTo(rect.right(), rect.bottom())
-        if fill:
+            path.lineTo(rect.left() + (i + 0.5) / bins * pw, base - (v / ymax) * height_frac * ph)
+        path.lineTo(rect.right(), base)
+        if fill or offset:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(options.histogram_fill)))
+            fc = QColor(options.histogram_fill) if fill else QColor(col)
+            if not fill:
+                fc.setAlpha(40)
+            painter.setBrush(QBrush(fc))
             painter.drawPath(path)
-        painter.setPen(QPen(col, 1.2))
+        painter.setPen(QPen(col, lw))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        line = QPainterPath()
-        line.moveTo(rect.left(), rect.bottom())
-        for i, v in enumerate(c):
-            line.lineTo(rect.left() + (i + 0.5) / bins * pw, rect.bottom() - (v / ymax) * ph)
-        line.lineTo(rect.right(), rect.bottom())
-        painter.drawPath(line)
+        painter.drawPath(path)
 
 
 def _draw_axes(painter, rect: QRectF, x_scale, y_scale, sample, x, y, options, number_font, label_font, result: RenderResult):
@@ -570,9 +648,10 @@ def _draw_axes(painter, rect: QRectF, x_scale, y_scale, sample, x, y, options, n
         lin = LinearScale(0.0, ymax if ymax > 0 else 1.0)
         ticks = [t for t in lin.ticks() if t.pos <= 1.0]
         ytitle = "% of Max" if normalized else "Count"
+    hist_frac = float(getattr(result, "extra_height_frac", 1.0))
     last_top = 1e9
     for t in ticks:
-        py = result.to_pixel(0.0, t.pos).y() if y_scale is not None else rect.bottom() - t.pos * rect.height()
+        py = result.to_pixel(0.0, t.pos).y() if y_scale is not None else rect.bottom() - t.pos * hist_frac * rect.height()
         if py < rect.top() - 0.5 or py > rect.bottom() + 0.5:
             continue
         ln = major if t.major else minor
@@ -608,8 +687,7 @@ def draw_gates(painter: QPainter, result: RenderResult, population: Population, 
     if x is None or result.x_scale is None:
         return
     rect = result.plot_rect
-    label_font = QFont()
-    label_font.setPointSize(options.label_font_size)
+    label_font = plot_font(options.label_font_size, options)
     painter.setFont(label_font)
     fm = QFontMetricsF(label_font)
     result.gates = []
@@ -645,8 +723,16 @@ def draw_gates(painter: QPainter, result: RenderResult, population: Population, 
         if shape.kind == "quadrant":
             quadrant_groups.setdefault(gate.quadrant[0], []).append((child, shape))
             continue
+        tint = float(getattr(gate, "tint", 0.0) or 0.0)
+        if tint > 0:
+            _fill_shape(painter, shape, QColor(gate.color or options.gate_color), tint)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
         _draw_shape(painter, shape)
-        label = _gate_label(child, options)
+        if getattr(gate, "locked", False):
+            _draw_padlock(painter, QPointF(shape.bbox.right(), shape.bbox.top()), color)
+            painter.setPen(pen)
+        label = _gate_label(child, options) if options.show_gate_labels else ""
         shape.label = label
         shape.label_rect = _place_label(painter, fm, shape, label, rect, gate, result, placed_labels)
         if not shape.label_rect.isNull():
@@ -724,6 +810,43 @@ def _gate_shape(result: RenderResult, sample: Sample, pop: Population, transpose
         bbox = QRectF(QPointF(min(xsx), min(ysy)), QPointF(max(xsx), max(ysy)))
         return GateShape(pop, "ellipse", pts, bbox, QRectF(), "", transposed, {"outline": outline})
     return None
+
+
+def _shape_path(shape: GateShape) -> QPainterPath:
+    path = QPainterPath()
+    if shape.kind in ("rect", "range"):
+        path.addRect(shape.bbox)
+    elif shape.kind == "polygon":
+        path.addPolygon(QPolygonF([QPointF(a, b) for a, b in shape.points]))
+        path.closeSubpath()
+    elif shape.kind == "ellipse":
+        path.addPolygon(QPolygonF([QPointF(a, b) for a, b in shape.extra["outline"]]))
+        path.closeSubpath()
+    return path
+
+
+def _fill_shape(painter: QPainter, shape: GateShape, color: QColor, tint: float):
+    """Translucent fill under a gate outline (the gate's tint)."""
+    fill = QColor(color)
+    fill.setAlphaF(min(max(tint, 0.0), 1.0))
+    painter.save()
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(fill)
+    painter.drawPath(_shape_path(shape))
+    painter.restore()
+
+
+def _draw_padlock(painter: QPainter, anchor: QPointF, color: QColor):
+    """A small padlock glyph just above-right of `anchor` (locked gates)."""
+    painter.save()
+    w, h = 7.0, 5.5
+    x, y = anchor.x() + 2.0, anchor.y() - h - 2.0
+    painter.setPen(QPen(color, 1.1))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawArc(QRectF(x + 1.2, y - 3.6, w - 2.4, 6.0), 0, 180 * 16)
+    painter.setBrush(color)
+    painter.drawRoundedRect(QRectF(x, y, w, h), 1.0, 1.0)
+    painter.restore()
 
 
 def _draw_shape(painter: QPainter, shape: GateShape):
@@ -836,15 +959,17 @@ def _draw_quadrants(painter: QPainter, fm: QFontMetricsF, result: RenderResult, 
     painter.setPen(pen)
     painter.drawLine(QPointF(centre.x(), rect.top()), QPointF(centre.x(), rect.bottom()))
     painter.drawLine(QPointF(rect.left(), centre.y()), QPointF(rect.right(), centre.y()))
+    if any(getattr(pop.gate, "locked", False) for pop, _ in items):
+        _draw_padlock(painter, centre, pen.color())
     painter.setPen(QColor("#000000"))
     for pop, shape in items:
         q = pop.gate.quadrant[1]
-        label = _gate_label(pop, options)
+        label = _gate_label(pop, options) if options.show_gate_labels else ""
         lines = label.split("\n") if label else []
         w = max((fm.horizontalAdvance(l) for l in lines), default=0) + 4
         h = fm.height() * max(len(lines), 1)
         avail = (centre.x() - rect.left()) if q in (1, 4) else (rect.right() - centre.x())
-        if options.show_gate_names and w > avail - 6:
+        if label and options.show_gate_names and w > avail - 6:
             short = pop.name.split(":")[0].strip() if ":" in pop.name else pop.name[:6]
             lines = [short] + ([format_freq(pop.freq_of_parent, options.freq_decimals)] if options.show_gate_freqs else [])
             label = "\n".join(lines)

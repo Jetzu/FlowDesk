@@ -74,7 +74,7 @@ def preview_pixmap(sample: Sample, param: str, scale: Scale, width: int, height:
     sample.scales[param] = scale
     sample._display_cache.pop(param, None)
     try:
-        opts = RenderOptions(show_gates=False, number_font_size=8, label_font_size=9, smoothing=1, histogram_bins=200)
+        opts = RenderOptions(show_gates=False, number_font_size=8, label_font_size=9, smoothing=1, histogram_bins=200, font_dpi=72.0)
         result = render_plot(sample, sample.root, GraphSettings(param, None, "histogram"), width, height, opts)
         return QPixmap.fromImage(result.image)
     finally:

@@ -12,6 +12,7 @@ from ..core.gates import EllipseGate, PolygonGate, RectangleGate, gate_from_dict
 from ..core.model import Group, Population, Sample
 from .dialogs import GateNameDialog
 from .renderer import GateShape, RenderOptions, RenderResult, draw_gates, render_plot
+from .style import PLOT_FONT_DPI
 
 TOOLS = ("pointer", "rect", "polygon", "ellipse", "quadrant", "range", "bisector", "freehand", "zoom")
 HANDLE = 4.0
@@ -62,6 +63,7 @@ class PlotWidget(QWidget):
     toolDone = Signal()  # a creation tool finished (window may switch back to pointer)
     contextMenuRequested = Signal(object, object)  # Population | None, QPoint (global)
     zoomChanged = Signal()
+    renameRequested = Signal(object)  # Population (double-clicked gate label)
 
     def __init__(self, controller, sample: Sample, population: Population, parent=None):
         super().__init__(parent)
@@ -163,8 +165,29 @@ class PlotWidget(QWidget):
         self.invalidate()
         self.zoomChanged.emit()
 
+    def zoom_by(self, factor: float):
+        """Zoom around the centre of the current view (factor < 1 zooms in)."""
+        x0, x1, y0, y1 = self.view
+
+        def span(a, b):
+            c = (a + b) / 2
+            half = min(0.5, max(0.005, (b - a) * factor / 2))
+            lo, hi = c - half, c + half
+            if lo < 0:
+                lo, hi = 0.0, hi - lo
+            if hi > 1:
+                lo, hi = lo - (hi - 1), 1.0
+            return max(0.0, lo), min(1.0, hi)
+
+        nx0, nx1 = span(x0, x1)
+        histogram = self.graph.plot_type == "histogram" or self.graph.y is None
+        ny0, ny1 = (0.0, 1.0) if histogram else span(y0, y1)
+        self.view = (nx0, nx1, ny0, ny1)
+        self.invalidate()
+        self.zoomChanged.emit()
+
     def options(self) -> RenderOptions:
-        return RenderOptions.from_prefs(self.controller.preferences, self.graph, view=self.view)
+        return RenderOptions.from_prefs(self.controller.preferences, self.graph, view=self.view, font_dpi=PLOT_FONT_DPI)
 
     def invalidate(self):
         self._dirty = True
@@ -201,8 +224,11 @@ class PlotWidget(QWidget):
         res = self._result
         if res is not None and res.error is None:
             opts = self.options()
-            draw_gates(painter, res, self.population, self.sample, opts, self.selected)
-            self._draw_handles(painter, res)
+            if opts.show_gates:
+                draw_gates(painter, res, self.population, self.sample, opts, self.selected)
+                self._draw_handles(painter, res)
+            else:
+                res.gates = []
             self._draw_creation(painter)
         painter.end()
 
@@ -237,8 +263,14 @@ class PlotWidget(QWidget):
         shape = self._shape_for(self.selected)
         if shape is None:
             return
-        painter.setPen(QPen(QColor(self.controller.preferences.get("selected_gate_color")), 1.0))
-        painter.setBrush(QBrush(QColor("#ffffff")))
+        locked = bool(getattr(self.selected.gate, "locked", False))
+        pen = QPen(QColor(self.controller.preferences.get("selected_gate_color")), 1.0)
+        if locked:  # dashed, hollow handles: the gate cannot be edited
+            pen.setStyle(Qt.PenStyle.DotLine)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        else:
+            painter.setBrush(QBrush(QColor("#ffffff")))
+        painter.setPen(pen)
         for h in self._handles(shape):
             painter.drawRect(QRectF(h.x() - HANDLE, h.y() - HANDLE, 2 * HANDLE, 2 * HANDLE))
 
@@ -373,6 +405,9 @@ class PlotWidget(QWidget):
             shape, part = hit
             self.set_selected(shape.population)
             gate = shape.population.gate
+            if part != "label" and (getattr(gate, "locked", False) or any(getattr(s.gate, "locked", False) for s in self._quadrant_siblings(shape.population))):
+                self.statusText.emit(f"“{shape.population.name}” is locked")
+                return
             self._drag = {"part": part, "start": pos, "last": pos, "orig": gate.to_dict(), "shape": shape, "moved": False, "siblings": self._quadrant_siblings(shape.population)}
             return
         if not inside:
@@ -484,7 +519,12 @@ class PlotWidget(QWidget):
         if self.tool != "pointer" or self._result is None:
             return
         hit = self._hit(pos)
-        if hit is not None and hit[1] != "label":
+        if hit is None:
+            return
+        self._drag = None
+        if hit[1] == "label":
+            self.renameRequested.emit(hit[0].population)
+        else:
             self.populationActivated.emit(hit[0].population)
 
     def leaveEvent(self, event):
@@ -497,9 +537,21 @@ class PlotWidget(QWidget):
         if key == Qt.Key.Key_Escape:
             if self._poly or self._free or self._rubber is not None:
                 self._cancel_creation()
+            elif self.tool != "pointer":
+                self.toolDone.emit()  # the window switches back to the pointer
             else:
                 self.set_selected(None)
             return
+        if not (event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier | Qt.KeyboardModifier.AltModifier)):
+            if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+                self.zoom_by(0.8)
+                return
+            if key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+                self.zoom_by(1.25)
+                return
+            if key == Qt.Key.Key_0:
+                self.reset_zoom()
+                return
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             if self._poly:
                 self._poly.pop()

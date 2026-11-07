@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 
 from .compensation import SpilloverMatrix
 from .gates import gate_from_dict
@@ -53,8 +53,10 @@ def sample_to_dict(sample: Sample, base_dir: Path | None, data_dir: Path | None 
     rel = None
     if base_dir is not None:
         try:
-            rel = os.path.relpath(sample.path, base_dir)
-        except ValueError:
+            # stored in POSIX form so that a workspace written on Windows opens on
+            # macOS/Linux and vice versa
+            rel = PurePath(os.path.relpath(sample.path, base_dir)).as_posix()
+        except ValueError:  # different drives on Windows
             rel = None
     computed: dict[str, dict] = {}
     if sample.computed and data_dir is not None:
@@ -91,7 +93,9 @@ def sample_from_dict(d: dict, base_dir: Path | None, data_dir: Path | None = Non
         if candidate.exists():
             path = candidate
     if not path.exists() and base_dir is not None:
-        candidate = base_dir / path.name
+        # a path written on Windows has backslashes that POSIX does not split
+        name = PureWindowsPath(d["path"]).name if "\\" in d["path"] else path.name
+        candidate = base_dir / name
         if candidate.exists():
             path = candidate
     sample = Sample(path, int(d["id"]))

@@ -1,12 +1,16 @@
 """The graph window: one population, gate tools, axis selectors, ancestry."""
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFontMetrics, QIcon, QKeySequence, QPainter, QPixmap
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import QMarginsF, QPointF, QRect, QRectF, QSize, QSizeF, Qt, Signal
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFontMetrics, QIcon, QKeySequence, QPageSize, QPainter, QPdfWriter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDockWidget,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -31,6 +35,10 @@ from .dialogs import OverlayDialog, ScaleDialog, confirm
 from .icons import icon
 from .plot_widget import PlotWidget
 from .renderer import RenderOptions, render_plot
+from .style import PLOT_FONT_DPI, shortcut_text
+
+PLOT_FILE_FILTERS = "PNG image (*.png);;SVG vector graphic (*.svg);;PDF document (*.pdf)"
+TINT_CHOICES = [("None", 0.0), ("Light", 0.15), ("Medium", 0.3)]
 
 TOOL_ACTIONS = [
     ("pointer", "Select", "pointer", "Select and edit gates (double-click a gate to open it)"),
@@ -135,7 +143,7 @@ class AncestryBar(QWidget):
             graph.x, graph.y, graph.plot_type = child.gate.dims[0], None, "histogram"
         if not graph.x:
             graph.x, graph.y = sample.default_axes()
-        opts = RenderOptions.from_prefs(self.controller.preferences, graph, show_axes=False, show_gate_names=False, show_gate_freqs=False, dots_to_draw=6000, label_font_size=7, number_font_size=6)
+        opts = RenderOptions.from_prefs(self.controller.preferences, graph, show_axes=False, show_gate_names=False, show_gate_freqs=False, dots_to_draw=6000, label_font_size=7, number_font_size=6, font_dpi=PLOT_FONT_DPI)
         opts.plot_type = graph.plot_type if graph.plot_type != "histogram" or graph.y is None else "pseudocolor"
         res = render_plot(sample, node, graph, 56, 56, opts, selected=child, dpr=2.0)
         return QPixmap.fromImage(res.image)
@@ -166,6 +174,7 @@ class GraphWindow(QMainWindow):
         self.plot.toolDone.connect(lambda: self._select_tool("pointer"))
         self.plot.contextMenuRequested.connect(self._context_menu)
         self.plot.zoomChanged.connect(self._sync_axes_ui)
+        self.plot.renameRequested.connect(self._rename)
 
         self._build_toolbar()
         self._build_central()
@@ -227,6 +236,16 @@ class GraphWindow(QMainWindow):
         copy_img.setToolTip("Copy the plot to the clipboard")
         copy_img.triggered.connect(self._copy_image)
         tb.addAction(copy_img)
+        self.save_plot_action = QAction(icon("export"), "Save Plot As…", self)
+        self.save_plot_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.save_plot_action.setToolTip(f"Save the plot as PNG, SVG or PDF ({shortcut_text('S', shift=True)})")
+        self.save_plot_action.triggered.connect(self._save_plot_dialog)
+        tb.addAction(self.save_plot_action)
+        self.print_action = QAction(icon("print"), "Print…", self)
+        self.print_action.setShortcut(QKeySequence.StandardKey.Print)
+        self.print_action.setToolTip(f"Print the plot ({shortcut_text('P')})")
+        self.print_action.triggered.connect(self._print_dialog)
+        tb.addAction(self.print_action)
         tb.addSeparator()
         self.stats_action = QAction(icon("statistic"), "Statistics", self)
         self.stats_action.setCheckable(True)
@@ -260,16 +279,36 @@ class GraphWindow(QMainWindow):
         prefs = self.controller.preferences
         opts = self.population.graph.options
 
-        def toggle(key, label):
-            act = QAction(label, menu)
-            act.setCheckable(True)
-            act.setChecked(bool(opts.get(key, prefs.get(key))))
-            act.toggled.connect(lambda on, k=key: self._set_option(k, on))
-            menu.addAction(act)
+        self.option_actions: dict[str, QAction] = {}
 
+        def toggle(key, label, default=False, target=None):
+            target = target or menu
+            act = QAction(label, target)
+            act.setCheckable(True)
+            act.setChecked(bool(opts.get(key, prefs.get(key, default))))
+            act.toggled.connect(lambda on, k=key: self._set_option(k, on))
+            target.addAction(act)
+            self.option_actions[key] = act
+
+        toggle("show_gates", "Show gates", True)
+        toggle("show_gate_labels", "Show gate labels", True)
         toggle("show_gate_names", "Show gate names")
         toggle("show_gate_freqs", "Show gate frequencies")
         toggle("show_outliers", "Show outliers (contour plots)")
+        menu.addSeparator()
+        ov = menu.addMenu("Overlays")
+        toggle("show_legend", "Show legend", True, ov)
+        toggle("histogram_offset", "Offset (staggered) histograms", False, ov)
+        lw = ov.addMenu("Histogram line width")
+        grp = QActionGroup(lw)
+        current_lw = float(opts.get("histogram_line_width", 1.2))
+        for label, value in (("Thin (0.8)", 0.8), ("Normal (1.2)", 1.2), ("Medium (2)", 2.0), ("Thick (3)", 3.0)):
+            act = QAction(label, lw)
+            act.setCheckable(True)
+            act.setChecked(abs(current_lw - value) < 1e-6)
+            act.triggered.connect(lambda checked=False, v=value: self._set_option("histogram_line_width", v))
+            grp.addAction(act)
+            lw.addAction(act)
         menu.addSeparator()
         for title, key, choices in (
             ("Smoothing", "smoothing", [("None", 0), ("Low", 1), ("Medium", 2), ("High", 3)]),
@@ -289,6 +328,11 @@ class GraphWindow(QMainWindow):
                 act.triggered.connect(lambda checked=False, k=key, v=value: self._set_option(k, v))
                 grp.addAction(act)
                 sub.addAction(act)
+        menu.addSeparator()
+        for label, slot in (("Zoom In\t+", lambda: self.plot.zoom_by(0.8)), ("Zoom Out\t-", lambda: self.plot.zoom_by(1.25)), ("Reset Zoom\t0", self.plot.reset_zoom)):
+            act = QAction(label, menu)
+            act.triggered.connect(slot)
+            menu.addAction(act)
         menu.addSeparator()
         default = QAction("Use these settings for new plots", menu)
         default.triggered.connect(self._make_default)
@@ -310,6 +354,12 @@ class GraphWindow(QMainWindow):
     def _reset_options(self):
         self.population.graph.options.clear()
         self.plot.invalidate()
+        prefs = self.controller.preferences
+        defaults = {"show_gates": True, "show_gate_labels": True, "show_legend": True, "histogram_offset": False}
+        for key, act in getattr(self, "option_actions", {}).items():
+            act.blockSignals(True)
+            act.setChecked(bool(prefs.get(key, defaults.get(key, False))))
+            act.blockSignals(False)
 
     def _build_central(self):
         central = QWidget()
@@ -328,6 +378,7 @@ class GraphWindow(QMainWindow):
         ycol = QVBoxLayout()
         ycol.setSpacing(2)
         self.y_transform = QToolButton()
+        self.y_transform.setObjectName("transformButton")
         self.y_transform.setText("T")
         self.y_transform.setToolTip("Customize the y-axis scale")
         self.y_transform.clicked.connect(lambda: self._customize_axis("y"))
@@ -356,6 +407,7 @@ class GraphWindow(QMainWindow):
         xrow.addWidget(self.x_button)
         xrow.addStretch(1)
         self.x_transform = QToolButton()
+        self.x_transform.setObjectName("transformButton")
         self.x_transform.setText("T")
         self.x_transform.setToolTip("Customize the x-axis scale")
         self.x_transform.clicked.connect(lambda: self._customize_axis("x"))
@@ -368,15 +420,37 @@ class GraphWindow(QMainWindow):
     def _build_stats_dock(self):
         self.stats_dock = QDockWidget("Statistics", self)
         self.stats_dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(4, 2, 4, 2)
+        bar.addStretch(1)
+        self.stats_copy = QToolButton()
+        self.stats_copy.setText("Copy")
+        self.stats_copy.setIcon(icon("copy"))
+        self.stats_copy.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.stats_copy.setAutoRaise(True)
+        self.stats_copy.setToolTip("Copy the table (tab-separated) for a spreadsheet")
+        self.stats_copy.clicked.connect(self.copy_stats)
+        bar.addWidget(self.stats_copy)
+        lay.addLayout(bar)
         self.stats_table = QTableWidget(0, 4)
+        self.stats_table.setObjectName("statsTable")
         self.stats_table.setHorizontalHeaderLabels(["Population", "Events", "% of Parent", "% of Total"])
         self.stats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.stats_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.verticalHeader().setDefaultSectionSize(20)
+        self.stats_table.setAlternatingRowColors(True)
         self.stats_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.stats_dock.setWidget(self.stats_table)
+        lay.addWidget(self.stats_table, 1)
+        self.stats_dock.setWidget(panel)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.stats_dock)
         self.stats_dock.setVisible(False)
         self.stats_action.toggled.connect(self.stats_dock.setVisible)
+        self.stats_action.toggled.connect(lambda on: on and self._refresh_stats())
         self.stats_dock.visibilityChanged.connect(lambda v: self.stats_action.setChecked(v))
 
     # ------------------------------------------------------------- behaviour
@@ -399,6 +473,8 @@ class GraphWindow(QMainWindow):
         self.plot_type.blockSignals(False)
         self.y_transform.setEnabled(g.y is not None)
         self.statusBar().showMessage(self._event_summary(), 4000)
+        if getattr(self, "_stats_axes", None) != (g.x, g.y):
+            self._refresh_stats()
 
     def _event_summary(self) -> str:
         pop = self.population
@@ -502,14 +578,72 @@ class GraphWindow(QMainWindow):
         else:
             self._update_title()
 
+    def stats_rows(self) -> list[tuple[str, Sample, Population]]:
+        """The populations shown on this plot: the population, its gates and the overlays."""
+        rows = [(self.population.display_name, self.sample, self.population)]
+        rows += [(p.display_name, self.sample, p) for p in self.population.children]
+        for s, p in self.plot.overlays:
+            rows.append((f"{s.name} / {p.display_name}", s, p))
+        return rows
+
+    def stats_headers(self) -> list[str]:
+        g = self.plot.graph
+        headers = ["Population", "Events", "% of Parent", "% of Total"]
+        for param in (g.x, g.y):
+            if param:
+                stain = self.sample.param_stain(param)
+                label = f"{param} ({stain})" if stain and stain != param else param
+                headers += [f"Median {label}", f"Mean {label}"]
+        return headers
+
     def _refresh_stats(self):
-        rows = [self.population] + list(self.population.children)
+        g = self.plot.graph
+        self._stats_axes = (g.x, g.y)
+        if not self.stats_action.isChecked():
+            return  # computed when the panel is shown
+        headers = self.stats_headers()
+        params = [p for p in (g.x, g.y) if p]
+        rows = self.stats_rows()
+        self.stats_table.setColumnCount(len(headers))
+        self.stats_table.setHorizontalHeaderLabels(headers)
         self.stats_table.setRowCount(len(rows))
-        for i, p in enumerate(rows):
-            self.stats_table.setItem(i, 0, QTableWidgetItem(p.display_name))
-            self.stats_table.setItem(i, 1, QTableWidgetItem(f"{p.count:,}"))
-            self.stats_table.setItem(i, 2, QTableWidgetItem(format_value("Freq. of Parent", p.freq_of_parent)))
-            self.stats_table.setItem(i, 3, QTableWidgetItem(format_value("Freq. of Total", p.freq_of_total)))
+        right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        for i, (label, s, p) in enumerate(rows):
+            values = [f"{p.count:,}", format_value("Freq. of Parent", p.freq_of_parent), format_value("Freq. of Total", p.freq_of_total)]
+            for param in params:
+                med = mean = float("nan")
+                try:
+                    v = np.asarray(s.data(param))[p.mask()]
+                    v = v[np.isfinite(v)]
+                    if v.size:
+                        med, mean = float(np.median(v)), float(np.mean(v))
+                except (KeyError, IndexError, ValueError):
+                    pass
+                values += [format_value("Median", med), format_value("Mean", mean)]
+            item = QTableWidgetItem(label)
+            item.setToolTip(label)
+            self.stats_table.setItem(i, 0, item)
+            for j, text in enumerate(values, start=1):
+                cell = QTableWidgetItem(text)
+                cell.setTextAlignment(right)
+                self.stats_table.setItem(i, j, cell)
+        hh = self.stats_table.horizontalHeader()
+        for j in range(1, len(headers)):
+            hh.setSectionResizeMode(j, QHeaderView.ResizeMode.ResizeToContents)
+
+    def stats_tsv(self) -> str:
+        t = self.stats_table
+        lines = ["\t".join(t.horizontalHeaderItem(j).text() for j in range(t.columnCount()))]
+        for i in range(t.rowCount()):
+            lines.append("\t".join((t.item(i, j).text() if t.item(i, j) else "") for j in range(t.columnCount())))
+        return "\n".join(lines) + "\n"
+
+    def copy_stats(self):
+        if not self.stats_action.isChecked():
+            self.stats_action.setChecked(True)
+        self._refresh_stats()
+        QApplication.clipboard().setText(self.stats_tsv())
+        self.statusBar().showMessage("Statistics copied to the clipboard", 3000)
 
     def _choose_overlays(self):
         group = self.group or self.controller.current_group
@@ -519,16 +653,96 @@ class GraphWindow(QMainWindow):
         dlg = OverlayDialog(samples, self.plot.overlays, self)
         if dlg.exec():
             self.plot.set_overlays([(s, p) for s, p in dlg.values() if not (s is self.sample and p is self.population)])
+            self._refresh_stats()
 
     def _add_to_layout(self):
         if self.controller.add_to_layout is not None:
             self.controller.add_to_layout(self.sample, self.population)
 
     def _copy_image(self):
-        opts = self.plot.options()
-        res = render_plot(self.sample, self.population, self.plot.graph, self.plot.width(), self.plot.height(), opts, overlays=self.plot.overlays, dpr=2.0)
-        QApplication.clipboard().setImage(res.image)
+        QApplication.clipboard().setImage(self.plot_image(2.0))
         self.statusBar().showMessage("Plot copied to the clipboard", 3000)
+
+    # ---------------------------------------------------------------- export
+    def _export_size(self) -> tuple[int, int]:
+        return max(240, self.plot.width()), max(240, self.plot.height())
+
+    def _render_onto(self, painter: QPainter | None, dpr: float):
+        w, h = self._export_size()
+        return render_plot(self.sample, self.population, self.plot.graph, w, h, self.plot.options(), overlays=self.plot.overlays or None, dpr=dpr, painter=painter)
+
+    def plot_image(self, dpr: float = 2.0):
+        return self._render_onto(None, dpr).image
+
+    def save_plot(self, path) -> Path:
+        """Write the plot to `path`: PNG (2x resolution), SVG or PDF by suffix."""
+        path = Path(path)
+        suffix = path.suffix.lower()
+        w, h = self._export_size()
+        if suffix == ".svg":
+            from PySide6.QtSvg import QSvgGenerator
+
+            gen = QSvgGenerator()
+            gen.setFileName(str(path))
+            gen.setSize(QSize(w, h))
+            gen.setViewBox(QRect(0, 0, w, h))
+            gen.setTitle(self.windowTitle())
+            gen.setDescription("FlowDesk plot")
+            painter = QPainter(gen)
+            self._render_onto(painter, 3.0)
+            painter.end()
+        elif suffix == ".pdf":
+            writer = QPdfWriter(str(path))
+            writer.setResolution(300)
+            writer.setPageSize(QPageSize(QSizeF(w, h), QPageSize.Unit.Point, "plot"))
+            writer.setPageMargins(QMarginsF(0, 0, 0, 0))
+            writer.setTitle(self.windowTitle())
+            painter = QPainter(writer)
+            k = writer.resolution() / 72.0  # one logical pixel = one point
+            painter.scale(k, k)
+            self._render_onto(painter, 3.0)
+            painter.end()
+        else:
+            if suffix not in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"):
+                path = path.with_suffix(".png")
+            if not self.plot_image(2.0).save(str(path)):
+                raise OSError(f"could not write {path}")
+        return path
+
+    def _save_plot_dialog(self):
+        base = f"{self.sample.name} {self.population.display_name}".replace("/", "_").replace(":", "_")
+        path, chosen = QFileDialog.getSaveFileName(self, "Save Plot As", base + ".png", PLOT_FILE_FILTERS)
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += ".svg" if "svg" in chosen.lower() else ".pdf" if "pdf" in chosen.lower() else ".png"
+        try:
+            out = self.save_plot(path)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not save the plot: {exc}", 6000)
+            return
+        self.statusBar().showMessage(f"Saved {out.name}", 4000)
+
+    def print_plot(self, printer):
+        """Paint the plot, scaled to fit, on a QPrinter (or any paged device)."""
+        from PySide6.QtPrintSupport import QPrinter
+
+        w, h = self._export_size()
+        painter = QPainter(printer)
+        page = printer.pageRect(QPrinter.Unit.DevicePixel)
+        k = min(page.width() / w, page.height() / h)
+        painter.translate((page.width() - w * k) / 2, (page.height() - h * k) / 2)
+        painter.scale(k, k)
+        self._render_onto(painter, 3.0)
+        painter.end()
+
+    def _print_dialog(self):
+        from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        if dlg.exec():
+            self.print_plot(printer)
 
     # ------------------------------------------------------------ context menu
     def _context_menu(self, pop: Population | None, global_pos):
@@ -556,6 +770,19 @@ class GraphWindow(QMainWindow):
             for name, value in (("Black", "#000000"), ("Red", "#d81b1b"), ("Blue", "#2f6fd6"), ("Green", "#2e9e5b"), ("Orange", "#e8912d"), ("Purple", "#7c4dd6")):
                 a = color.addAction(name)
                 a.triggered.connect(lambda checked=False, v=value: self._set_gate_color(pop, v))
+            tint = menu.addMenu("Tint")
+            grp = QActionGroup(tint)
+            current = float(getattr(pop.gate, "tint", 0.0) or 0.0)
+            for name, value in TINT_CHOICES:
+                a = tint.addAction(name)
+                a.setCheckable(True)
+                a.setChecked(abs(current - value) < 1e-6 or (value == 0.0 and current == 0.0))
+                grp.addAction(a)
+                a.triggered.connect(lambda checked=False, v=value: self._set_gate_tint(pop, v))
+            act = menu.addAction(icon("lock"), "Lock gate")
+            act.setCheckable(True)
+            act.setChecked(bool(getattr(pop.gate, "locked", False)))
+            act.triggered.connect(lambda on: self._set_gate_locked(pop, on))
             act = menu.addAction("Reset label position")
             act.triggered.connect(lambda: self._reset_label(pop))
             menu.addSeparator()
@@ -566,6 +793,8 @@ class GraphWindow(QMainWindow):
         act.triggered.connect(self._add_to_layout)
         act = menu.addAction(icon("copy"), "Copy plot image")
         act.triggered.connect(self._copy_image)
+        menu.addAction(self.save_plot_action)
+        menu.addAction(self.print_action)
         if self.plot.view != (0.0, 1.0, 0.0, 1.0):
             act = menu.addAction("Reset zoom")
             act.triggered.connect(self.plot.reset_zoom)
@@ -592,6 +821,20 @@ class GraphWindow(QMainWindow):
 
     def _set_gate_color(self, pop: Population, value: str):
         pop.gate.color = None if value == "#000000" else value
+        self.controller.gate_changed(pop, self.group)
+
+    def _set_gate_tint(self, pop: Population, value: float):
+        self.controller.begin_change("gate tint")
+        pop.gate.tint = float(value)
+        self.controller.gate_changed(pop, self.group)
+
+    def _set_gate_locked(self, pop: Population, on: bool):
+        self.controller.begin_change("unlock gate" if not on else "lock gate")
+        targets = [pop] + self.plot._quadrant_siblings(pop)
+        for p in targets:
+            p.gate.locked = bool(on)
+        for p in targets[1:]:
+            self.controller.gate_changed(p, self.group)
         self.controller.gate_changed(pop, self.group)
 
     def _reset_label(self, pop: Population):

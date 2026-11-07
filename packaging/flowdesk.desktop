@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=FlowDesk
+GenericName=Flow Cytometry Analysis
+Comment=Gate, compensate and report flow cytometry (FCS) data
+# Exec/Icon are rewritten by `packaging/install_linux_desktop.sh` to absolute paths;
+# with `pip install` on PATH the plain names below work as-is.
+Exec=flowdesk %F
+Icon=flowdesk
+Terminal=false
+Categories=Science;Biology;Education;Qt;
+Keywords=FCS;cytometry;gating;FlowJo;
+StartupNotify=true
+StartupWMClass=FlowDesk

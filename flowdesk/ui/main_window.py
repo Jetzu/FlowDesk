@@ -42,6 +42,10 @@ from .table_editor import TableEditorWindow
 
 SAMPLES_MIME = "application/x-flowdesk-samples"
 
+from .style import modifier_html as _modifier_html  # noqa: E402
+
+_MOD = _modifier_html()
+
 QUICK_START_HTML = f"""
 <h2>{APP_NAME} Quick Start</h2>
 <p>If you have analysed cytometry data before, you already know this workflow.</p>
@@ -51,10 +55,10 @@ contains <i>comp</i> or <i>unstained</i> land in the <span style="color:#bc1900"
 The spillover matrix stored in each file is applied (parameters named <b>Comp-&hellip;</b>).</p>
 <h3>2. Gate</h3>
 <p>Double-click a sample to open its <b>graph window</b>. Pick parameters with the axis buttons below and left of the plot
-(or <b>&#8984;/Ctrl + arrow keys</b>), choose the plot type, and draw with the tools:
+(or <b>{_MOD} + arrow keys</b>), choose the plot type, and draw with the tools:
 Rectangle (R), Polygon (P), Ellipse (E), Quadrant (Q), Range (H), Bisector (B), Freehand (F), Zoom (Z), Select (V).
 Name the population when asked. <b>Double-click inside a gate</b> to drill down. Drag gates and their handles to adjust;
-<b>Delete</b> removes, <b>&#8984;/Ctrl+Z</b> undoes. The <b>T</b> buttons customise the axis scale (biexponential width basis etc.).</p>
+<b>Delete</b> removes, <b>{_MOD}+Z</b> undoes. The <b>T</b> buttons customise the axis scale (biexponential width basis etc.).</p>
 <h3>3. Apply to the group</h3>
 <p>Drag a population from the sample list onto a group in the group pane (or <b>Apply to Group</b>) to copy it to every sample
 of that group. Gates drawn in a group's own graph window (double-click the group) apply to all members at once; new samples that
@@ -485,7 +489,7 @@ class MainWindow(QMainWindow):
         self.controller = controller or WorkspaceController()
         c = self.controller
         self.setWindowIcon(icon("app"))
-        self.resize(1080, 760)
+        self.resize(1280, 800)
         self.graph_windows: dict[tuple, GraphWindow] = {}
         self.layout_editor: LayoutEditorWindow | None = None
         self.table_editor: TableEditorWindow | None = None
@@ -587,6 +591,28 @@ class MainWindow(QMainWindow):
         self.act_acq_comp = self._act("Use Acquisition Matrix", "compensation", self.use_acquisition_comp, None, "Use the spillover matrix stored in the FCS file")
         for a in (self.act_new, self.act_open, self.act_save, self.act_save_as, self.act_quit, self.act_add_samples, self.act_graph, self.act_layout, self.act_table, self.act_comp, self.act_undo, self.act_redo, self.act_cut, self.act_copy, self.act_paste, self.act_delete, self.act_rename, self.act_select_all, self.act_prefs):
             self.addAction(a)
+        # short labels for the ribbon buttons (menus keep the full text)
+        for act, short in (
+            (self.act_import_wsp, "Import FlowJo .wsp"),
+            (self.act_export_wsp, "Export FlowJo .wsp"),
+            (self.act_export_events, "Events CSV"),
+            (self.act_export_fcs, "Population FCS"),
+            (self.act_acq_comp, "Acquisition Matrix"),
+            (self.act_uncompensate, "Uncompensate"),
+            (self.act_concat, "Concatenate"),
+            (self.act_derive, "Derive Parameter"),
+            (self.act_wizard, "Compensation Wizard"),
+            (self.act_create_group, "Create Group"),
+            (self.act_add_stat, "Add Statistic"),
+            (self.act_add_samples, "Add Samples"),
+            (self.act_add_folder, "Add Folder"),
+            (self.act_remove_samples, "Remove"),
+            (self.act_apply_group, "Apply to Group"),
+            (self.act_remove_group, "Remove from Group"),
+            (self.act_keywords, "Keywords"),
+            (self.act_columns, "Columns"),
+        ):
+            act.setIconText(short)
 
     # Optional feature modules add their own ribbon bands / menu entries through
     # an `install(main_window)` function; a missing or broken module must never
@@ -691,18 +717,18 @@ class MainWindow(QMainWindow):
         band = page.add_band("Populations")
         band.add_large(self.act_create_group)
         band.add_large(self.act_add_stat)
-        band.add_small(self.act_and)
-        band.add_small(self.act_or)
-        band.add_small(self.act_not)
+        boolean_menu = QMenu(self)
+        boolean_menu.addAction(self.act_and)
+        boolean_menu.addAction(self.act_or)
+        boolean_menu.addAction(self.act_not)
+        self.act_boolean = self._act("Boolean Gate", "gate-boolean", lambda: self.create_boolean("and"), None, "Combine populations with AND / OR / NOT")
+        band.add_large(self.act_boolean, boolean_menu)
         band.add_small(self.act_apply_group)
         band.add_small(self.act_remove_group)
         band.add_small(self.act_edit_group)
         band = page.add_band("Keywords")
-        band.add_large(self.act_keywords)
-        band.add_large(self.act_columns)
-        band = page.add_band("View")
-        band.add_small(self.act_expand)
-        band.add_small(self.act_collapse)
+        band.add_small(self.act_keywords)
+        band.add_small(self.act_columns)
         band.add_small(self.act_delete_group)
 
         page = self.ribbon.add_page("Edit")
@@ -729,12 +755,12 @@ class MainWindow(QMainWindow):
         band.add_small(self.act_acq_comp)
         band.add_small(self.act_uncompensate)
         band = page.add_band("Samples")
-        band.add_large(self.act_derive)
-        band.add_large(self.act_concat)
+        band.add_small(self.act_derive)
+        band.add_small(self.act_concat)
         band = page.add_band("Export")
-        band.add_large(self.act_add_to_layout)
-        band.add_large(self.act_add_to_table)
-        band.add_large(self.act_export_fcs)
+        band.add_small(self.act_add_to_layout)
+        band.add_small(self.act_add_to_table)
+        band.add_small(self.act_export_fcs)
         band.add_small(self.act_export_events)
         band.add_small(self.act_export_wsp)
 
@@ -816,6 +842,8 @@ class MainWindow(QMainWindow):
         self.act_and.setEnabled(len(pops) >= 1)
         self.act_or.setEnabled(len(pops) >= 1)
         self.act_not.setEnabled(len(pops) >= 1)
+        if hasattr(self, "act_boolean"):
+            self.act_boolean.setEnabled(len(pops) >= 1)
         self.act_apply_group.setEnabled(bool(pops))
         self.act_remove_group.setEnabled(bool(pops))
         self.act_copy.setEnabled(bool(pops))
