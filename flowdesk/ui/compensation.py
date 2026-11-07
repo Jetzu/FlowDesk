@@ -522,21 +522,22 @@ class CompensationWindow(QMainWindow):
         n = len(e.matrix.params)
         if not (0 <= row < n and 0 <= col < n):
             return
-        if e.stored:
-            m = e.matrix.copy()
-        else:
-            m = e.matrix.copy(_unique_name(self.workspace.matrices, f"{e.label} (edited)"))
-        m.matrix[row, col] = percent / 100.0
-        self._current_label = m.name
-        users = [s for s in self.workspace.samples if e.stored and s.comp is not None and s.comp.name == m.name]
-        self.controller.store_matrix(m)
-        # samples using a workspace matrix follow its edits
-        for enabled in (True, False):
-            group = [s for s in users if s.comp_enabled == enabled]
-            if group:
-                self.controller.set_compensation(group, m, enabled)
-        if self._current_label != (self.current_entry().label if self.current_entry() else None):
-            self.select_matrix(m.name)
+        with self.controller.undo_group('edit matrix', kind="matrices"):
+            if e.stored:
+                m = e.matrix.copy()
+            else:
+                m = e.matrix.copy(_unique_name(self.workspace.matrices, f"{e.label} (edited)"))
+            m.matrix[row, col] = percent / 100.0
+            self._current_label = m.name
+            users = [s for s in self.workspace.samples if e.stored and s.comp is not None and s.comp.name == m.name]
+            self.controller.store_matrix(m)
+            # samples using a workspace matrix follow its edits
+            for enabled in (True, False):
+                group = [s for s in users if s.comp_enabled == enabled]
+                if group:
+                    self.controller.set_compensation(group, m, enabled)
+            if self._current_label != (self.current_entry().label if self.current_entry() else None):
+                self.select_matrix(m.name)
 
     def _on_cell_changed(self, row: int, col: int):
         item = self.grid.item(row, col)
@@ -600,17 +601,18 @@ class CompensationWindow(QMainWindow):
         if new_name in self.workspace.matrices:
             QMessageBox.warning(self, "Rename Matrix", f"A matrix named “{new_name}” already exists.")
             return
-        old = e.label
-        m = e.matrix.copy(new_name)
-        users = [s for s in self.workspace.samples if s.comp is not None and s.comp.name == old]
-        self._current_label = new_name
-        self.controller.remove_matrix(old)
-        self.controller.store_matrix(m)
-        for enabled in (True, False):
-            group = [s for s in users if s.comp_enabled == enabled]
-            if group:
-                self.controller.set_compensation(group, m, enabled)
-        self.select_matrix(new_name)
+        with self.controller.undo_group('rename matrix', kind="matrices"):
+            old = e.label
+            m = e.matrix.copy(new_name)
+            users = [s for s in self.workspace.samples if s.comp is not None and s.comp.name == old]
+            self._current_label = new_name
+            self.controller.remove_matrix(old)
+            self.controller.store_matrix(m)
+            for enabled in (True, False):
+                group = [s for s in users if s.comp_enabled == enabled]
+                if group:
+                    self.controller.set_compensation(group, m, enabled)
+            self.select_matrix(new_name)
 
     def delete_matrix(self, confirm: bool = True):
         e = self.current_entry()

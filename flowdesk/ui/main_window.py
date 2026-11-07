@@ -622,6 +622,7 @@ class MainWindow(QMainWindow):
         "flowdesk.ui.plate_editor",
         "flowdesk.ui.tools_analysis",
         "flowdesk.ui.tools_biology",
+        "flowdesk.ui.tools_qc",
         "flowdesk.ui.graph_extras",
         "flowdesk.ui.cytometer",
     )
@@ -1005,7 +1006,7 @@ class MainWindow(QMainWindow):
         if not confirm(self, "Apply template", f"Apply the groups, gates, scales, layouts and tables of “{path.name}” to the {len(ws.samples)} sample(s) in this workspace?"):
             return
         c = self.controller
-        c.begin_change("apply template")
+        c.begin_change("apply template", kind="all")
         report = apply_template(ws, template)
         c.mark_modified()
         c.groupsChanged.emit()
@@ -1038,11 +1039,13 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            export_wsp(ws, path)
+            warnings = export_wsp(ws, path)
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
         self.statusBar().showMessage(f"Exported {Path(path).name}", 4000)
+        if warnings:
+            QMessageBox.information(self, "Export notes", "\n".join(warnings[:20]) + ("\n…" if len(warnings) > 20 else ""))
 
     def export_events(self):
         rows = self.controller.selected
@@ -1387,6 +1390,7 @@ class MainWindow(QMainWindow):
         s = samples[0]
         dlg = KeywordsDialog(s, self)
         if dlg.exec():
+            self.controller.begin_change("edit keywords", kind="samples")
             s.keywords = dlg.values()
             s.refresh_channels_from_keywords()
             self.controller.mark_modified()
@@ -1468,14 +1472,20 @@ class MainWindow(QMainWindow):
         from ..core.compensation import SpilloverMatrix
 
         samples = self.controller.selected_samples()
-        changed = []
+        found = []
         for s in samples:
-            s.comp_cleared = False
             if s.ensure_loaded():
                 m = SpilloverMatrix.from_fcs(s.fcs)
                 if m is not None:
-                    s.set_compensation(m, True)
-                    changed.append(s)
+                    found.append((s, m))
+        if not found:
+            return
+        self.controller.begin_change("use acquisition matrix")
+        changed = []
+        for s, m in found:
+            s.comp_cleared = False
+            s.set_compensation(m, True)
+            changed.append(s)
         if changed:
             self.controller.mark_modified()
             self.controller.compensationChanged.emit(None)

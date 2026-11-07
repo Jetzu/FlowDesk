@@ -120,3 +120,36 @@ def test_sample_to_dict_survives_paths_on_different_drives(monkeypatch, tmp_path
     d = serialization.sample_to_dict(sample, tmp_path / "ws")
     assert d["rel_path"] is None
     assert d["path"] == str(tmp_path / "a.fcs")
+
+
+def test_file_open_event_opens_workspace(tmp_path):
+    """macOS Finder double-click / Dock drop arrives as a QFileOpenEvent."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from flowdesk.app import _FileOpenFilter, create_app, open_path_in_window
+
+    app = create_app([])
+    from PySide6.QtGui import QFileOpenEvent
+    from PySide6.QtWidgets import QApplication
+
+    from flowdesk.core.fcs import Channel, write_fcs
+    from flowdesk.ui.main_window import MainWindow
+
+    import numpy as np
+
+    fcs = tmp_path / "evt.fcs"
+    write_fcs(fcs, np.random.default_rng(0).normal(1000, 100, (300, 2)).astype(np.float32), [Channel(1, "FSC-A", "", 262144), Channel(2, "SSC-A", "", 262144)])
+    win = MainWindow()
+    flt = _FileOpenFilter(win)
+    app.installEventFilter(flt)
+    try:
+        QApplication.sendEvent(app, QFileOpenEvent(str(fcs)))
+        app.processEvents()
+        assert [s.name for s in win.controller.workspace.samples] == ["evt.fcs"]
+        assert open_path_in_window(win, tmp_path / "missing.fdw") is False
+        assert open_path_in_window(win, tmp_path / "notes.txt") is False
+    finally:
+        app.removeEventFilter(flt)
+        win.controller.workspace.modified = False
+        win.close()

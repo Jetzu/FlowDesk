@@ -34,7 +34,15 @@ from PySide6.QtWidgets import (
 from ..core import biology as bio
 from .icons import icon
 
-PHASE_COLORS = {"G1": QColor("#1f6fd1"), "S": QColor("#2e9e44"), "G2/M": QColor("#d1352b"), "Model": QColor("#111111")}
+PHASE_COLORS = {
+    "G1": QColor("#1f6fd1"),
+    "S": QColor("#2e9e44"),
+    "G2/M": QColor("#d1352b"),
+    "Debris": QColor("#8c6d31"),
+    "Aggregates": QColor("#8e44ad"),
+    "Model": QColor("#111111"),
+}
+CURVE_ORDER = ("G1", "S", "G2/M", "Debris", "Aggregates", "Model")
 GEN_COLORS = ["#d1352b", "#e67e22", "#c9a400", "#2e9e44", "#16a3a3", "#1f6fd1", "#6a3fc1", "#b03a9a", "#7f5539", "#555555"]
 
 
@@ -61,7 +69,7 @@ def _fmt_tick(v: float) -> str:
         return "0"
     a = abs(v)
     if a >= 1e5 or a < 1e-3:
-        return f"{v:.0e}"
+        return f"{v:.3g}"  # 1.5e+05, not a second "2e+05"
     return f"{v:g}"
 
 
@@ -225,9 +233,9 @@ class BiologyPlot(QWidget):
             y = area.top() + 4
             for name, _, col in self.curves:
                 p.setPen(QPen(col, 2))
-                p.drawLine(QPointF(area.right() - 78, y + 6), QPointF(area.right() - 62, y + 6))
+                p.drawLine(QPointF(area.right() - 92, y + 6), QPointF(area.right() - 76, y + 6))
                 p.setPen(QColor("#222222"))
-                p.drawText(QRectF(area.right() - 58, y, 56, 13), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+                p.drawText(QRectF(area.right() - 72, y, 70, 13), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
                 y += 13
         p.end()
 
@@ -536,9 +544,28 @@ class CellCycleDialog(BiologyDialog):
         self.g1_spin.setDecimals(1)
         self.g1_spin.setSpecialValueText("Auto")
         self.g1_spin.setToolTip("Initial G1 peak position (0 = find the highest peak)")
+        self.model_combo = QComboBox()
+        for key, label in bio.CELL_CYCLE_MODELS.items():
+            self.model_combo.addItem(label, key)
+        self.model_combo.setItemData(0, "S phase as a Gaussian-broadened plateau, all components fitted together", Qt.ItemDataRole.ToolTipRole)
+        self.model_combo.setItemData(1, "G1 and G2/M fitted on their outer halves, S phase by subtraction (no S-phase shape assumed)", Qt.ItemDataRole.ToolTipRole)
+        self.debris_check = QCheckBox("Model debris (decreasing exponential below G1)")
+        self.aggregates_check = QCheckBox("Model aggregates (G1+G1, G1+G2, G2+G2 doublets)")
         form.addRow("DNA parameter:", self.param_combo)
+        form.addRow("Model:", self.model_combo)
+        form.addRow("", self.debris_check)
+        form.addRow("", self.aggregates_check)
         form.addRow("Bins:", self.bins_spin)
         form.addRow("G1 guess:", self.g1_spin)
+
+    def set_model(self, model: str, debris: bool | None = None, aggregates: bool | None = None):
+        idx = self.model_combo.findData(bio.cell_cycle_model_key(model))
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        if debris is not None:
+            self.debris_check.setChecked(bool(debris))
+        if aggregates is not None:
+            self.aggregates_check.setChecked(bool(aggregates))
 
     def _refresh_params(self, sample):
         self._fill_params(self.param_combo, sample, bio.default_dna_parameter(sample) if sample else None)
@@ -548,21 +575,31 @@ class CellCycleDialog(BiologyDialog):
         if not param:
             raise ValueError("no parameter")
         g1 = self.g1_spin.value() or None
-        return bio.cell_cycle_for_population(population, param, bins=self.bins_spin.value(), g1_guess=g1)
+        return bio.cell_cycle_for_population(
+            population, param, bins=self.bins_spin.value(), g1_guess=g1, model=self.model_combo.currentData(),
+            debris=self.debris_check.isChecked(), aggregates=self.aggregates_check.isChecked(),
+        )
 
     def show_result(self, r):
-        curves = [(k, r.curves[k], PHASE_COLORS[k]) for k in ("G1", "S", "G2/M", "Model")]
+        curves = [(k, r.curves[k], PHASE_COLORS[k]) for k in CURVE_ORDER if k in r.curves]
         self.plot.set_histogram(r.centers, r.counts, curves, xlabel=self._param(self.param_combo) or "")
 
     def describe(self, r):
-        return f"G1 {r.percent_g1:.1f}%  S {r.percent_s:.1f}%  G2/M {r.percent_g2m:.1f}%"
+        text = f"{r.model_name}: G1 {r.percent_g1:.1f}%  S {r.percent_s:.1f}%  G2/M {r.percent_g2m:.1f}%"
+        if math.isfinite(r.percent_debris):
+            text += f"  (debris {r.percent_debris:.1f}%"
+            text += f", aggregates {r.percent_aggregates:.1f}%)" if math.isfinite(r.percent_aggregates) else ")"
+        elif math.isfinite(r.percent_aggregates):
+            text += f"  (aggregates {r.percent_aggregates:.1f}%)"
+        return text
 
     def group_header(self):
-        return ["Sample", "Population", "Parameter", "%G1", "%S", "%G2/M", "G1 Mean", "G2 Mean", "G1 CV", "G2 CV", "G2/G1", "RMS", "Events", "Note"]
+        return ["Sample", "Population", "Parameter", "%G1", "%S", "%G2/M", "G1 Mean", "G2 Mean", "G1 CV", "G2 CV", "G2/G1", "RMS", "Events", "%Debris", "%Aggregates", "Model", "Note"]
 
     def group_row(self, sample, population, r):
         s = r.summary()
-        return [sample.name, population.display_name, self._param(self.param_combo)] + [s[k] for k in self.group_header()[3:-1]] + ["" if r.success else r.message]
+        values = [s.get(k, float("nan")) for k in self.group_header()[3:-2]]
+        return [sample.name, population.display_name, self._param(self.param_combo)] + values + [r.model_name, "" if r.success else r.message]
 
 
 class ProliferationDialog(BiologyDialog):
@@ -579,10 +616,117 @@ class ProliferationDialog(BiologyDialog):
         self.log_check = QCheckBox("Fit on the display (log/logicle) scale")
         self.log_check.setChecked(True)
         self.log_check.setToolTip("Checked: fit the sample's display-transformed values; unchecked: fit log10 of the raw values")
+        # generation 0 (undivided): automatic, a typed intensity, or the median
+        # of an undivided control population
+        self.g0_mode = QComboBox()
+        for label, key in self.G0_MODES:
+            self.g0_mode.addItem(label, key)
+        self.g0_spin = QDoubleSpinBox()
+        self.g0_spin.setRange(0.0, 1e9)
+        self.g0_spin.setDecimals(1)
+        self.g0_spin.setValue(0.0)
+        self.g0_spin.setToolTip("Generation-0 (undivided) peak intensity in data units")
+        self.control_sample_combo = QComboBox()
+        self.control_pop_combo = QComboBox()
+        self.control_sample_combo.setToolTip("An undivided (unstimulated) control stained with the same dye")
+        self.fix_g0_check = QCheckBox("Hold generation 0 at this position")
+        self.fix_g0_check.setChecked(True)
+        self.fix_g0_check.setToolTip("Unchecked: the position is only where the search for generation 0 starts")
+        self.g0_info = QLabel("")
         form.addRow("Dye parameter:", self.param_combo)
         form.addRow("Bins:", self.bins_spin)
         form.addRow("Max generations:", self.gen_spin)
         form.addRow("", self.log_check)
+        form.addRow("Generation 0:", self.g0_mode)
+        form.addRow("Gen 0 intensity:", self.g0_spin)
+        form.addRow("Control sample:", self.control_sample_combo)
+        form.addRow("Control population:", self.control_pop_combo)
+        form.addRow("", self.fix_g0_check)
+        form.addRow("", self.g0_info)
+        self.g0_mode.currentIndexChanged.connect(lambda *_: self._g0_mode_changed())
+        self.control_sample_combo.currentIndexChanged.connect(lambda *_: self._refresh_control_populations())
+        self.controller.gatingChanged.connect(lambda *_: self._refresh_control_populations())
+        self._g0_mode_changed()
+
+    G0_MODES = [("Auto (brightest peak)", "auto"), ("Intensity", "value"), ("Undivided control", "control")]
+
+    def _g0_mode_changed(self):
+        mode = self.g0_mode.currentData()
+        self.form.setRowVisible(self.g0_spin, mode == "value")
+        self.form.setRowVisible(self.control_sample_combo, mode == "control")
+        self.form.setRowVisible(self.control_pop_combo, mode == "control")
+        self.form.setRowVisible(self.fix_g0_check, mode != "auto")
+        self.g0_info.setText("")
+
+    def refresh(self):
+        super().refresh()
+        self._refresh_control_samples()
+
+    def _refresh_control_samples(self):
+        keep = self.control_sample_combo.currentData()
+        self.control_sample_combo.blockSignals(True)
+        self.control_sample_combo.clear()
+        for s in self.controller.workspace.samples:
+            self.control_sample_combo.addItem(s.name, s.id)
+        idx = self.control_sample_combo.findData(keep) if keep is not None else -1
+        self.control_sample_combo.setCurrentIndex(max(idx, 0) if self.control_sample_combo.count() else -1)
+        self.control_sample_combo.blockSignals(False)
+        self._refresh_control_populations()
+
+    def _control_sample(self):
+        sid = self.control_sample_combo.currentData()
+        return self.controller.workspace.sample_by_id(sid) if sid is not None else None
+
+    def _refresh_control_populations(self, pop_path: str | None = None):
+        sample = self._control_sample()
+        if pop_path is None:
+            pop_path = self.control_pop_combo.currentData()
+        self.control_pop_combo.blockSignals(True)
+        self.control_pop_combo.clear()
+        if sample is not None:
+            sample.ensure_loaded()
+            self.control_pop_combo.addItem("Ungated", "")
+            for pop in sample.populations():
+                self.control_pop_combo.addItem("  " * (pop.depth - 1) + pop.name, pop.path)
+        idx = self.control_pop_combo.findData(pop_path) if pop_path is not None else -1
+        self.control_pop_combo.setCurrentIndex(max(idx, 0) if self.control_pop_combo.count() else -1)
+        self.control_pop_combo.blockSignals(False)
+
+    def set_g0_auto(self):
+        self.g0_mode.setCurrentIndex(self.g0_mode.findData("auto"))
+
+    def set_g0_value(self, value: float, fix: bool = True):
+        self.g0_mode.setCurrentIndex(self.g0_mode.findData("value"))
+        self.g0_spin.setValue(float(value))
+        self.fix_g0_check.setChecked(fix)
+
+    def set_g0_control(self, sample, pop_path: str = "", fix: bool = True):
+        """Take generation 0 from the median of an undivided control population."""
+        self.g0_mode.setCurrentIndex(self.g0_mode.findData("control"))
+        idx = self.control_sample_combo.findData(sample.id)
+        if idx >= 0:
+            self.control_sample_combo.setCurrentIndex(idx)
+        self._refresh_control_populations(pop_path)
+        self.fix_g0_check.setChecked(fix)
+
+    def g0_setting(self, param: str) -> tuple[float | None, bool]:
+        """(generation-0 position in data units or None for automatic, hold it fixed)."""
+        mode = self.g0_mode.currentData()
+        fix = self.fix_g0_check.isChecked()
+        if mode == "value":
+            v = self.g0_spin.value()
+            return (v if v > 0 else None), fix
+        if mode == "control":
+            sample = self._control_sample()
+            if sample is None or not sample.ensure_loaded():
+                raise ValueError("choose an undivided control sample")
+            pop = sample.root.find(self.control_pop_combo.currentData() or "")
+            if pop is None:
+                raise ValueError("choose an undivided control population")
+            g0 = bio.control_g0(pop, param)
+            self.g0_info.setText(f"Control median: {_fmt(g0)}")
+            return g0, fix
+        return None, False
 
     def _refresh_params(self, sample):
         self._fill_params(self.param_combo, sample, bio.default_dye_parameter(sample) if sample else None)
@@ -591,7 +735,11 @@ class ProliferationDialog(BiologyDialog):
         param = self._param(self.param_combo)
         if not param:
             raise ValueError("no parameter")
-        return bio.proliferation_for_population(population, param, bins=self.bins_spin.value(), max_generations=self.gen_spin.value(), display=self.log_check.isChecked())
+        g0, fix = self.g0_setting(param)
+        return bio.proliferation_for_population(
+            population, param, bins=self.bins_spin.value(), max_generations=self.gen_spin.value(),
+            display=self.log_check.isChecked(), g0=g0, fix_g0=fix and g0 is not None,
+        )
 
     def show_result(self, r):
         curves = []

@@ -9,6 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from flowdesk.core import analysis as A  # noqa: E402
@@ -67,9 +68,12 @@ def _wait(app, cond, timeout=60.0):
 def test_install_adds_bands_and_menu(window):
     ext = window.extensions["flowdesk.ui.tools_analysis"]
     assert isinstance(ext, T.AnalysisTools)
-    assert set(ext.actions) == {"tsne", "umap", "pca", "flowsom", "kmeans", "compare"}
+    assert set(ext.actions) == {"tsne", "umap", "pca", "project", "flowsom", "phenograph", "kmeans", "compare"}
     titles = [a.text() for a in window.menus["tools"].actions()]
     assert "Dimensionality Reduction" in titles and "Clustering" in titles and "Compare" in titles
+    assert "Project onto Existing…" in titles
+    clustering = next(a.menu() for a in window.menus["tools"].actions() if a.text() == "Clustering")
+    assert [a.text() for a in clustering.actions()] == ["FlowSOM", "Phenograph", "k-means"]
     assert ext.actions["umap"].isEnabled() == A.has_umap()
 
 
@@ -95,10 +99,14 @@ def test_dialogs_construct_with_defaults(app, ws):
         assert dlg.chosen_parameters() == FL  # Time excluded
         assert dlg.events_spin.value() == 5000
         dlg.close()
-    for method in ("kmeans", "flowsom"):
+    for method in ("kmeans", "flowsom", "phenograph"):
         dlg = T.ClusteringDialog(c, method)
         assert dlg.chosen_parameters() == FL
         dlg.close()
+    dlg = T.ClusteringDialog(c, "phenograph")
+    assert dlg.options() == {"k": 30, "resolution": 1.0}
+    assert dlg.events_spin.value() == 10000
+    dlg.close()
     # selected populations win over the default
     s = ws.samples[0]
     c.set_selection([(s, s.root)])
@@ -190,3 +198,93 @@ def test_compare_dialog(app, tmp_path):
     content = open(out, encoding="utf-8").read().splitlines()
     assert content[0].startswith("Parameter,") and content[1].startswith("FL2-A,")
     dlg.close()
+
+
+def test_phenograph_dialog_creates_populations_and_heatmap(window, app, ws):
+    c = window.controller
+    dlg = T.ClusteringDialog(c, "phenograph")
+    dlg.resolution_spin.setValue(0.5)
+    dlg.run_now()
+    name, created = dlg.created
+    assert name == "Phenograph" and created == ["Phenograph 1", "Phenograph 2", "Phenograph 3"]
+    for s in ws.samples:
+        counts = [s.root.find(f"/{n}").count for n in created]
+        assert sum(counts) == s.n_events and min(counts) > 200
+    assert ws.samples[0].computed_info["Phenograph"]["resolution"] == 0.5
+    assert dlg.heatmap.table.rowCount() == 3
+    dlg.close()
+    dlg.heatmap.close()
+
+
+def _row_of(dlg, param):
+    return next(i for i, r in enumerate(dlg.results) if param in r.outputs)
+
+
+def test_project_dialog_lists_results_and_projects(window, app, ws):
+    c = window.controller
+    a, b = ws.samples
+    T.run_dimreduction(c, "pca", populations=[a.root], max_events=600, open_graph=False)
+    T.run_clustering(c, "flowsom", populations=[a.root], options={"n_metaclusters": 3})
+    # a t-SNE result whose fitted embedding is not in this session
+    X, index = A.prepare_matrix([a], "", FL, 200)
+    A.write_result(ws, index, {"tSNE_1": X[:, 0], "tSNE_2": X[:, 1]}, {"tool": "t-SNE", "parameters": FL}, model={"kind": "tsne", "engine": "openTSNE"})
+
+    dlg = T.ProjectDialog(c)
+    assert dlg.result_list.count() == 3
+    texts = [dlg.result_list.item(i).text() for i in range(3)]
+    assert texts[0].startswith("PCA: PC_1 / PC_2") and texts[1].startswith("FlowSOM: FlowSOM") and texts[2].startswith("t-SNE: tSNE_1 / tSNE_2")
+    tsne_item = dlg.result_list.item(_row_of(dlg, "tSNE_1"))
+    assert not tsne_item.flags() & Qt.ItemFlag.ItemIsEnabled
+    assert "session" in tsne_item.toolTip()
+    assert dlg.chosen_result().outputs == ["PC_1", "PC_2"]  # first projectable one
+    assert [dlg.sample_list.item(i).text() for i in range(dlg.sample_list.count())] == [b.name]
+    assert dlg.population_path() == "" and dlg.events_spin.value() == 0 and dlg.run_button.isEnabled()
+    assert not dlg.select_result("tSNE_2")
+
+    dlg.run_now()
+    assert dlg.created == ["PC_1", "PC_2"]
+    assert int(np.isfinite(b.data("PC_1")).sum()) == b.n_events
+    assert b.computed_info["PC_1"]["projected"] and ws.modified
+    assert any(k[0] == b.id for k in window.graph_windows)  # opened on the new axes
+
+    dlg.refresh("FlowSOM")
+    assert dlg.chosen_result().outputs == ["FlowSOM"]
+    assert dlg.sample_list.count() == 1
+    dlg.run_now()
+    assert dlg.created == ["FlowSOM"] and dlg.populations_created == ["FlowSOM 1", "FlowSOM 2", "FlowSOM 3"]
+    counts = [b.root.find(f"/FlowSOM {k}").count for k in (1, 2, 3)]
+    assert sum(counts) == b.n_events and min(counts) > 200
+    # same cluster ids as the analysed sample's populations for the same planted cluster
+    from sklearn.metrics import adjusted_rand_score
+
+    from .test_analysis import make_events
+
+    _, truth_b = make_events(1200, 21)
+    assert adjusted_rand_score(truth_b, b.data("FlowSOM")) >= 0.9
+
+    dlg.refresh()
+    pca_row = _row_of(dlg, "PC_1")
+    assert "0 without" in dlg.result_list.item(pca_row).text()
+    dlg.close()
+
+
+def test_project_dialog_threaded_and_empty(window, app, ws):
+    c = window.controller
+    empty = T.ProjectDialog(c)
+    assert empty.result_list.count() == 0 and not empty.run_button.isEnabled()
+    assert "no t-SNE" in empty.note.text()
+    empty.close()
+
+    a, b = ws.samples
+    T.run_dimreduction(c, "pca", populations=[a.root], max_events=500, open_graph=False)
+    dlg = T.ProjectDialog(c, param="PC_2")
+    dlg.events_spin.setValue(400)
+    dlg.start()
+    assert _wait(app, lambda: getattr(dlg, "created", None) is not None)
+    _wait(app, lambda: not dlg._thread.isRunning())
+    assert dlg.created == ["PC_1", "PC_2"]
+    assert int(np.isfinite(b.data("PC_2")).sum()) == 400
+    ext = window.extensions["flowdesk.ui.tools_analysis"]
+    opened = ext.open_project()
+    assert isinstance(opened, T.ProjectDialog) and opened in ext.dialogs
+    opened.close()

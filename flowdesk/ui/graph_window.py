@@ -1,6 +1,7 @@
 """The graph window: one population, gate tools, axis selectors, ancestry."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from ..core.model import PLOT_TYPES, GraphSettings, Group, Population, Sample
 from ..core.stats import format_value
+from ..core.transforms import LinearScale
 from .dialogs import OverlayDialog, ScaleDialog, confirm
 from .icons import icon
 from .plot_widget import PlotWidget
@@ -39,6 +41,29 @@ from .style import PLOT_FONT_DPI, shortcut_text
 
 PLOT_FILE_FILTERS = "PNG image (*.png);;SVG vector graphic (*.svg);;PDF document (*.pdf)"
 TINT_CHOICES = [("None", 0.0), ("Light", 0.15), ("Medium", 0.3)]
+
+
+def prepare_scale_dialog(dlg, scale) -> None:
+    """Give the linear limits of a ScaleDialog enough decimals for `scale`.
+
+    Computed parameters (tSNE/UMAP/PCA axes, cluster ids) get a linear
+    auto-scale over a small range such as -1.27..1.02; whole-number spin boxes
+    would round it on OK (to -1..1, or to a degenerate 0..0 for PCA-sized
+    ranges)."""
+    if not isinstance(scale, LinearScale):
+        return
+    spins = [getattr(dlg, "lin_min", None), getattr(dlg, "lin_max", None)]
+    if any(sp is None for sp in spins):
+        return
+    span = abs(float(scale.max) - float(scale.min))
+    if span >= 1000:
+        return
+    decimals = 4 if span <= 0 else min(6, max(2, 3 - int(math.floor(math.log10(span)))))
+    for sp, value in zip(spins, (scale.min, scale.max)):
+        if sp.decimals() < decimals:
+            sp.setDecimals(decimals)
+        sp.setSingleStep(span / 20.0 if span > 0 else 0.1)
+        sp.setValue(float(value))
 
 TOOL_ACTIONS = [
     ("pointer", "Select", "pointer", "Select and edit gates (double-click a gate to open it)"),
@@ -525,7 +550,9 @@ class GraphWindow(QMainWindow):
         if not param:
             return
         group = self.group or self.controller.current_group
-        dlg = ScaleDialog(self.sample, param, self.sample.scale(param), group, self)
+        current = self.sample.scale(param)
+        dlg = ScaleDialog(self.sample, param, current, group, self)
+        prepare_scale_dialog(dlg, current)
         if not dlg.exec():
             return
         scale = dlg.scale()

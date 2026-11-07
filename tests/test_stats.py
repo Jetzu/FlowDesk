@@ -25,7 +25,7 @@ def tree(synthetic_fcs):
 
 
 def test_statistics_list_consistent():
-    assert len(STATISTICS) == len(set(STATISTICS)) == 16
+    assert len(STATISTICS) == len(set(STATISTICS)) == 22  # 16 + 6 cell-cycle / proliferation fits
     assert NEEDS_PARAM <= set(STATISTICS)
     assert PERCENT_STATS <= set(STATISTICS)
 

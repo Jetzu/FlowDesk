@@ -28,15 +28,17 @@ works the way a FlowJo user expects; details and differences are noted.
 | **Compensation** | Matrix editor, apply to group, wizard from controls | Same | Wizard within ~1 point of FACSDiva on real controls |
 | **Layout Editor** | Drag plots, overlays, text, arrange, batch, export PDF/PNG/SVG | Same | |
 | **Table Editor** | Population×statistic columns, keywords, batch over group, CSV | Same | |
-| **Tools: dimensionality reduction** | tSNE, UMAP, PCA (plugins) | Same (openTSNE/sklearn, umap-learn, sklearn PCA) | Results become parameters you can gate on |
-| Tools: clustering | FlowSOM, Phenograph, X-shift | FlowSOM-style SOM + metaclustering, k-means | Phenograph/X-shift not included |
+| **Tools: dimensionality reduction** | tSNE, UMAP, PCA (plugins) | Same (openTSNE/sklearn, umap-learn, sklearn PCA) | Results become parameters you can gate on; *Project onto Existing…* places further samples on an earlier PCA/FlowSOM/k-means result (model saved with the workspace) or t-SNE (openTSNE)/UMAP result (same session only) |
+| Tools: clustering | FlowSOM, Phenograph, X-shift | FlowSOM-style SOM + metaclustering, Phenograph (Jaccard kNN graph + built-in Louvain), k-means | X-shift not included |
 | Tools: population comparison | Chi-squared T(x) | Same + KS | |
-| Tools: cell cycle | Dean-Jett-Fox, Watson | Dean-Jett-Fox style fit | |
-| Tools: proliferation | Division modelling | Same (dye-dilution peaks; division/proliferation index) | |
+| Tools: cell cycle | Dean-Jett-Fox, Watson | Same: Dean-Jett-Fox and Watson pragmatic models, optional debris and aggregate (doublet) components | %G1 / %S / %G2M also available as table statistics |
+| Tools: proliferation | Division modelling | Same (dye-dilution generations; division, proliferation and expansion index; generation 0 from an undivided control) | Division index, proliferation index and % divided also available as table statistics |
 | Tools: kinetics | Statistic vs time | Same | |
 | Tools: concatenate / downsample / export | Yes | Concatenate, export population as FCS/CSV | Downsample via "max events per sample" when concatenating |
 | Plugins | Java plugin API | Python modules with `install(window)` | See `flowdesk/ui/main_window.py` `EXTENSION_MODULES` |
-| Calibration (MESF beads) | Yes | Not included | |
+| Calibration (MESF beads) | Yes | Same: *Calibrate (MESF)…* finds the bead peaks, fits intensity ↔ MESF in log-log space and creates `<param> MESF` parameters | Quality Control band |
+| Data cleaning (FlowAI / FlowClean / PeacoQC plugins) | Plugins | *Data Cleaning…*: flow-rate, signal-stability, change-point and dynamic-range checks → a "QC pass" population (flag parameter or time gates), batch over a group | Quality Control band |
+| Undo / redo | Gating only | Gating, keywords, sample order and names, computed parameters, compensation matrices, experiment / cytometer / plate settings, layouts and tables | One step per action, grouped for multi-step tools |
 | Cloud / portal, licensing | FlowJo Portal | Not applicable | |
 
 Platforms: macOS, Windows and Linux (see docs/INSTALL.md); tests run on all

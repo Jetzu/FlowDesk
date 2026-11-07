@@ -128,15 +128,13 @@ def apply_cytometer_settings(controller, cytometer: str, specs: dict[str, dict])
     and store them as that cytometer's defaults. Returns the affected samples."""
     ws = controller.workspace
     samples = group_by_cytometer(ws).get(cytometer, [])
-    cytometer_settings(ws)[cytometer] = {p: dict(sp) for p, sp in specs.items()}
-    if not samples:
-        controller.mark_modified()
-        return []
-    controller.begin_change(f"cytometer settings ({cytometer})")
-    # one undo step: the per-parameter set_scale calls must not push their own
-    original = controller.begin_change
-    controller.begin_change = lambda *a, **k: None
-    try:
+    # one undo step for the stored defaults and every scale written (the
+    # set_scale calls inside the group push no step of their own)
+    with controller.undo_group(f"cytometer settings ({cytometer})", "settings"):
+        cytometer_settings(ws)[cytometer] = {p: dict(sp) for p, sp in specs.items()}
+        if not samples:
+            controller.mark_modified()
+            return []
         for param, spec in specs.items():
             holders = [s for s in samples if param in s.channel_names]
             if not holders:
@@ -150,11 +148,6 @@ def apply_cytometer_settings(controller, cytometer: str, specs: dict[str, dict])
                     comp_names.setdefault(cn, []).append(s)
             for cn, owners in comp_names.items():
                 controller.set_scale(owners, cn, scale)
-    finally:
-        try:
-            del controller.begin_change  # back to the class method
-        except AttributeError:
-            controller.begin_change = original
     return samples
 
 
@@ -324,11 +317,13 @@ class CytometerDialog(QDialog):
 
     def apply(self):
         """Apply every cytometer viewed in this dialog (the current one first)."""
-        order = [self._current] + [c for c in self._specs if c != self._current]
-        for cyt in order:
-            if cyt is None:
-                continue
-            apply_cytometer_settings(self.controller, cyt, self.specs(cyt))
+        order = [c for c in [self._current] + [c for c in self._specs if c != self._current] if c is not None]
+        if not order:
+            return
+        label = f"cytometer settings ({order[0]})" if len(order) == 1 else "cytometer settings"
+        with self.controller.undo_group(label, "settings"):  # one undo step for all
+            for cyt in order:
+                apply_cytometer_settings(self.controller, cyt, self.specs(cyt))
 
 
 # ---------------------------------------------------------------------- install

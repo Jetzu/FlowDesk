@@ -3,26 +3,43 @@ kinetics (a statistic as a function of acquisition time).
 
 Everything here is plain numpy/scipy so it can run (and be tested) without Qt.
 
-* `fit_cell_cycle`   -- Dean-Jett-Fox style model on a linear DNA histogram:
-                        G1 Gaussian + G2/M Gaussian at ~2x G1 + an S phase that is
-                        a rectangle between both peaks smoothed by their widths.
+* `fit_cell_cycle`   -- two models on a linear DNA histogram, both with a G1
+                        Gaussian and a G2/M Gaussian at ~2x G1:
+                        "dean_jett_fox": S phase is a rectangle between both peaks
+                        smoothed by their widths (closed-form error-function
+                        plateau), everything fitted jointly;
+                        "watson": the Watson pragmatic model (Watson, Chambers &
+                        Smith 1987) -- G1 is fitted on its outer (left) half, G2/M
+                        on its outer (right) half and the S phase is what is left
+                        between them after subtracting G1, G2/M, debris and
+                        aggregates, so no S-phase shape is assumed.
+                        Optional debris (exponentially decreasing from the left
+                        edge) and aggregate components (doublets as the
+                        self-convolution of the singlet distribution: G1+G1 at 2x
+                        G1, G1+G2 at 3x, G2+G2 at 4x and the S-phase mixtures).
 * `fit_proliferation`-- generations as Gaussians whose intensities halve per
                         division, amplitudes by non-negative least squares,
                         generation-0 position and the shared width refined by a
-                        grid search followed by a Nelder-Mead polish.
+                        grid search followed by a Nelder-Mead polish; the
+                        generation-0 position can be given (e.g. the median of an
+                        undivided control) and optionally held fixed.
 * `kinetics`         -- events binned by time, a statistic per bin.
+* `cached_population_fit` -- cell-cycle / proliferation fits of a population
+                        behind a small LRU cache, used by the table statistics.
 """
 from __future__ import annotations
 
 import csv
+import json
 import math
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-from scipy.optimize import least_squares, minimize, nnls
+from scipy.optimize import least_squares, minimize, minimize_scalar, nnls
 from scipy.signal import find_peaks, peak_widths
 from scipy.special import ndtr
 
@@ -74,13 +91,23 @@ class CellCycleResult:
     fit_range: tuple[float, float] = (0.0, 0.0)
     success: bool = True
     message: str = ""
+    model: str = "dean_jett_fox"
+    # percent of all modelled events; NaN when the component was not modelled.
+    # %G1 + %S + %G2/M always sum to 100 (of the cycling singlets).
+    percent_debris: float = float("nan")
+    percent_aggregates: float = float("nan")
+    debris_decay: float = float("nan")  # 1/e length of the debris exponential
 
     @property
     def g2_g1_ratio(self) -> float:
         return self.g2_mean / self.g1_mean if self.g1_mean else float("nan")
 
+    @property
+    def model_name(self) -> str:
+        return CELL_CYCLE_MODELS.get(self.model, self.model)
+
     def summary(self) -> dict[str, float]:
-        return {
+        out = {
             "%G1": self.percent_g1,
             "%S": self.percent_s,
             "%G2/M": self.percent_g2m,
@@ -92,6 +119,26 @@ class CellCycleResult:
             "RMS": self.rms,
             "Events": self.n_events,
         }
+        if math.isfinite(self.percent_debris):
+            out["%Debris"] = self.percent_debris
+        if math.isfinite(self.percent_aggregates):
+            out["%Aggregates"] = self.percent_aggregates
+        return out
+
+
+CELL_CYCLE_MODELS = {"dean_jett_fox": "Dean-Jett-Fox", "watson": "Watson Pragmatic"}
+_MODEL_ALIASES = {
+    "dean_jett_fox": "dean_jett_fox", "djf": "dean_jett_fox", "deanjettfox": "dean_jett_fox", "dean": "dean_jett_fox",
+    "watson": "watson", "watson_pragmatic": "watson", "pragmatic": "watson",
+}
+
+
+def cell_cycle_model_key(model: str | None) -> str:
+    """Normalise a model name ("Watson Pragmatic", "DJF", ...) to its key."""
+    key = str(model or "dean_jett_fox").strip().lower().replace("-", "_").replace(" ", "_")
+    if key not in _MODEL_ALIASES:
+        raise ValueError(f"unknown cell-cycle model {model!r}; use one of {sorted(CELL_CYCLE_MODELS)}")
+    return _MODEL_ALIASES[key]
 
 
 def cell_cycle_components(x, n1, ns, n2, mu, s1, s2, ratio, width=1.0):
@@ -103,6 +150,38 @@ def cell_cycle_components(x, n1, ns, n2, mu, s1, s2, ratio, width=1.0):
     # the G1 sd at the lower edge and the G2 sd at the upper edge
     s = width * ns * (ndtr((x - mu) / s1) - ndtr((x - m2) / s2)) / max(m2 - mu, 1e-12)
     return g1, s, g2
+
+
+def debris_component(x, nd, decay, x0, width=1.0):
+    """Expected debris counts per bin: `nd` events distributed as an
+    exponential decreasing from `x0` (the left histogram edge) with 1/e length
+    `decay`; exact bin integrals for bins of width `width` centred on `x`."""
+    x = np.asarray(x, dtype=float)
+    decay = max(float(decay), 1e-12)
+    a = np.maximum(x - 0.5 * width - x0, 0.0)
+    b = np.maximum(x + 0.5 * width - x0, 0.0)
+    return nd * (np.exp(-a / decay) - np.exp(-b / decay))
+
+
+def aggregate_component(x, na, n1, ns, n2, mu, s1, s2, ratio, width=1.0):
+    """Expected doublet counts per bin: `na` aggregates whose DNA content is the
+    sum of two randomly paired singlets, i.e. the self-convolution of the
+    singlet (G1 + S + G2/M) distribution -- G1+G1 at 2x G1, G1+G2/M at 3x,
+    G2/M+G2/M at 4x, plus the S-phase mixtures, with the widths adding in
+    quadrature."""
+    x = np.asarray(x, dtype=float)
+    tot = n1 + ns + n2
+    if na <= 0 or tot <= 0 or x.size == 0:
+        return np.zeros_like(x)
+    step = 0.5 * width
+    xmax = float(np.max(x)) + width
+    if xmax <= 0:
+        return np.zeros_like(x)
+    t = np.arange(0.0, xmax + step, step)
+    g1, s, g2 = cell_cycle_components(t, n1 / tot, ns / tot, n2 / tot, mu, s1, s2, ratio, width=1.0)
+    f = g1 + s + g2
+    d = np.convolve(f, f)[: t.size] * step
+    return width * na * np.interp(x, t, d, left=0.0, right=0.0)
 
 
 def _cycle_guesses(centers, counts, g1_guess):
@@ -142,8 +221,26 @@ def _cycle_guesses(centers, counts, g1_guess):
     return x1, x2, s1
 
 
-def fit_cell_cycle(values, bins: int = 256, g1_guess: float | None = None, range: tuple[float, float] | None = None) -> CellCycleResult:  # noqa: A002
-    """Fit G1 / S / G2-M fractions to linear DNA-content values."""
+def fit_cell_cycle(
+    values,
+    bins: int = 256,
+    g1_guess: float | None = None,
+    range: tuple[float, float] | None = None,  # noqa: A002
+    model: str = "dean_jett_fox",
+    debris: bool = False,
+    aggregates: bool = False,
+) -> CellCycleResult:
+    """Fit G1 / S / G2-M fractions to linear DNA-content values.
+
+    model: "dean_jett_fox" (S = Gaussian-smoothed rectangle, joint fit) or
+    "watson" (Watson pragmatic: G1 / G2-M Gaussians fitted on their outer
+    halves, S by subtraction). debris / aggregates add an exponentially
+    decreasing debris component below G1 and a doublet component (the
+    self-convolution of the singlet distribution); the fit then covers the
+    whole histogram. %G1/%S/%G2M are percentages of the cycling singlets;
+    percent_debris / percent_aggregates are percentages of all modelled events.
+    """
+    model = cell_cycle_model_key(model)
     v = _finite(values)
     n = int(v.size)
     if n < 50:
@@ -159,12 +256,13 @@ def fit_cell_cycle(values, bins: int = 256, g1_guess: float | None = None, range
     counts = counts.astype(float)
     centers = 0.5 * (edges[:-1] + edges[1:])
     width = float(edges[1] - edges[0])
+    x0 = float(edges[0])
 
     x1, x2, s1 = _cycle_guesses(centers, counts, g1_guess)
     ratio0 = float(np.clip(x2 / x1, 1.9, 2.1)) if x1 > 0 else 2.0
     s2 = s1 * ratio0
-    fit_lo = max(lo, x1 - 5 * s1)
-    fit_hi = min(hi, ratio0 * x1 + 5 * s2)
+    fit_lo = lo if debris else max(lo, x1 - 5 * s1)
+    fit_hi = hi if aggregates else min(hi, ratio0 * x1 + 5 * s2)
     sel = (centers >= fit_lo) & (centers <= fit_hi)
     xs, ys = centers[sel], counts[sel]
     total = max(ys.sum(), 1.0)
@@ -172,16 +270,47 @@ def fit_cell_cycle(values, bins: int = 256, g1_guess: float | None = None, range
     in2 = np.abs(xs - ratio0 * x1) < 2 * s2
     n1 = max(ys[in1].sum(), 1.0)
     n2 = max(ys[in2].sum(), 0.05 * total)
-    ns = max(total - n1 - n2, 0.05 * total)
-    p0 = np.array([n1, ns, n2, x1, s1, s2, ratio0])
-    lb = [0, 0, 0, 0.7 * x1, 0.5 * width, 0.5 * width, 1.9]
-    ub = [np.inf, np.inf, np.inf, 1.3 * x1, 0.3 * x1, 0.6 * x1, 2.1]
+    extra0: list[float] = []
+    extra_lb: list[float] = []
+    extra_ub: list[float] = []
+    nd0 = na0 = 0.0
+    if debris:
+        cut = x1 - 3 * s1
+        below = xs < cut
+        cnt = float(ys[below].sum())
+        decay0 = float(np.average(xs[below] - x0, weights=ys[below])) if cnt > 0 else 0.3 * x1
+        decay0 = float(np.clip(decay0, width, 1.5 * max(x1, width)))
+        nd0 = max(cnt / max(1.0 - math.exp(-max(cut - x0, 0.0) / decay0), 0.05), 1.0)
+        extra0 += [nd0, decay0]
+        extra_lb += [0.0, 0.5 * width]
+        extra_ub += [np.inf, 3.0 * max(x1, width)]
+    if aggregates:
+        above = xs > ratio0 * x1 + 3 * s2
+        na0 = max(float(ys[above].sum()) / 0.7, 1.0)
+        extra0 += [na0]
+        extra_lb += [0.0]
+        extra_ub += [np.inf]
+    ns = max(total - n1 - n2 - nd0 - na0, 0.05 * total)
+    p0 = np.array([n1, ns, n2, x1, s1, s2, ratio0] + extra0)
+    lb = [0, 0, 0, 0.7 * x1, 0.5 * width, 0.5 * width, 1.9] + extra_lb
+    ub = [np.inf, np.inf, np.inf, 1.3 * x1, 0.3 * x1, 0.6 * x1, 2.1] + extra_ub
     p0 = np.clip(p0, np.array(lb) + 1e-9, np.array(ub) - 1e-9)
     wts = 1.0 / np.sqrt(ys + 1.0)
 
+    def components(x, p):
+        g1, s, g2 = cell_cycle_components(x, *p[:7], width=width)
+        k = 7
+        deb = agg = None
+        if debris:
+            deb = debris_component(x, p[k], p[k + 1], x0, width)
+            k += 2
+        if aggregates:
+            agg = aggregate_component(x, p[k], *p[:7], width=width)
+        return g1, s, g2, deb, agg
+
     def resid(p):
-        g1, s, g2 = cell_cycle_components(xs, *p, width=width)
-        return (g1 + s + g2 - ys) * wts
+        parts = components(xs, p)
+        return (sum(c for c in parts if c is not None) - ys) * wts
 
     success, message = True, ""
     try:
@@ -190,12 +319,43 @@ def fit_cell_cycle(values, bins: int = 256, g1_guess: float | None = None, range
         success, message = bool(sol.success), str(sol.message)
     except Exception as exc:  # pragma: no cover - defensive
         p, success, message = p0, False, str(exc)
-    n1, ns, n2, mu, s1, s2, ratio = p
-    g1, s, g2 = cell_cycle_components(centers, *p, width=width)
-    model = g1 + s + g2
-    tot = n1 + ns + n2
-    pct = (100 * n1 / tot, 100 * ns / tot, 100 * n2 / tot) if tot > 0 else (float("nan"),) * 3
-    rms = float(np.sqrt(np.mean((model[sel] - counts[sel]) ** 2)))
+    if (debris or aggregates) and success:
+        # data-weighted least squares underestimates sparse regions (the
+        # debris tail, the doublet peaks) by ~1 count per bin; polish with the
+        # Poisson deviance (maximum likelihood) from that solution
+        def dev(q):
+            return _poisson_deviance_residuals(sum(c for c in components(xs, q) if c is not None), ys)
+
+        try:
+            start = np.clip(p, np.array(lb) + 1e-9, np.array(ub) - 1e-9)
+            sol2 = least_squares(dev, start, bounds=(lb, ub), x_scale="jac", max_nfev=4000)
+            if sol2.success:
+                p = sol2.x
+        except Exception:  # pragma: no cover - defensive
+            pass
+    p = np.asarray(p, dtype=float)
+    n1, ns, n2, mu, s1, s2, ratio = p[:7]
+    nd = float(p[7]) if debris else 0.0
+    decay = float(p[8]) if debris else float("nan")
+    na = float(p[-1]) if aggregates else 0.0
+    g1, s, g2, deb, agg = components(centers, p)
+    zeros = np.zeros_like(centers)
+    if model == "watson":
+        n1, ns, n2, mu, s1, s2, ratio, g1, s, g2, agg, ok, msg = _watson_pragmatic(
+            centers, counts, width, (fit_lo, fit_hi), p[:7], s, deb if deb is not None else zeros, na if aggregates else 0.0
+        )
+        success, message = success and ok, msg or message
+    model_curve = g1 + s + g2 + (deb if deb is not None else zeros) + (agg if agg is not None else zeros)
+    cycling = n1 + ns + n2
+    pct = (100 * n1 / cycling, 100 * ns / cycling, 100 * n2 / cycling) if cycling > 0 else (float("nan"),) * 3
+    everything = cycling + nd + na
+    rms = float(np.sqrt(np.mean((model_curve[sel] - counts[sel]) ** 2)))
+    curves = {"G1": g1, "S": s, "G2/M": g2}
+    if deb is not None:
+        curves["Debris"] = deb
+    if agg is not None:
+        curves["Aggregates"] = agg
+    curves["Model"] = model_curve
     return CellCycleResult(
         percent_g1=float(pct[0]),
         percent_s=float(pct[1]),
@@ -208,13 +368,95 @@ def fit_cell_cycle(values, bins: int = 256, g1_guess: float | None = None, range
         g2_sd=float(s2),
         centers=centers,
         counts=counts,
-        curves={"G1": g1, "S": s, "G2/M": g2, "Model": model},
+        curves=curves,
         rms=rms,
         n_events=n,
         fit_range=(float(fit_lo), float(fit_hi)),
         success=success,
         message=message,
+        model=model,
+        percent_debris=float(100 * nd / everything) if debris and everything > 0 else float("nan"),
+        percent_aggregates=float(100 * na / everything) if aggregates and everything > 0 else float("nan"),
+        debris_decay=decay,
     )
+
+
+def _poisson_deviance_residuals(model, counts):
+    """Signed square roots of the Poisson deviance terms: least squares on
+    these is maximum likelihood for histogram counts."""
+    m = np.maximum(model, 1e-9)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ylog = np.where(counts > 0, counts * np.log(counts / m), 0.0)
+    return np.sign(counts - m) * np.sqrt(np.maximum(2.0 * (ylog - (counts - m)), 0.0))
+
+
+def _watson_pragmatic(centers, counts, width, fit_range, p, plateau, deb, na, iterations: int = 4):
+    """Watson pragmatic refinement of a joint fit `p` (n1, ns, n2, mu, s1, s2,
+    ratio). G1 is refitted on its outer half (from 4 SD below the mean to
+    1.5 SD above it) and G2/M on its outer half (1.5 SD below to 4 SD above),
+    with debris and aggregates as a fixed background and the S phase under each
+    peak as a Gaussian-smoothed step whose height is the S level measured just
+    inside that peak (so early- or late-S accumulation is followed). The S
+    phase is everything in the cycle region not explained by G1, G2/M, debris
+    and aggregates; a few iterations update the S levels and the doublet
+    shape."""
+    n1, ns, n2, mu, s1, s2, ratio = (float(q) for q in p)
+    m2 = mu * ratio
+    fit_lo, fit_hi = fit_range
+    ok, msg = True, ""
+
+    def agg_of():
+        if na <= 0:
+            return np.zeros_like(centers)
+        return aggregate_component(centers, na, n1, ns, n2, mu, s1, s2, m2 / mu, width)
+
+    def refit(mask, start, lb, ub, bg):
+        x, y, b = centers[mask], counts[mask], bg[mask]
+
+        def r(q):
+            return _poisson_deviance_residuals(width * q[0] * _gauss(x, q[1], q[2]) + b, y)
+
+        start = np.clip(start, np.array(lb) + 1e-9, np.array(ub) - 1e-9)
+        return least_squares(r, start, bounds=(lb, ub), x_scale="jac").x
+
+    agg = agg_of()
+    h = float(np.max(plateau)) if plateau.size else 0.0  # plateau height per bin
+    h1 = h2 = h
+    region = (centers >= mu - 4 * s1) & (centers <= m2 + 4 * s2)
+    rest = np.where(region, counts - deb - agg, 0.0)
+    g1 = width * n1 * _gauss(centers, mu, s1)
+    g2 = width * n2 * _gauss(centers, m2, s2)
+    for _ in range(iterations):
+        left = (centers >= max(fit_lo, mu - 4 * s1)) & (centers <= mu + 1.5 * s1)
+        right = (centers >= m2 - 1.5 * s2) & (centers <= min(fit_hi, m2 + 4 * s2))
+        try:
+            if np.count_nonzero(left) >= 4:
+                bg1 = h1 * ndtr((centers - mu) / s1) + deb + agg
+                n1, mu, s1 = (float(q) for q in refit(left, [n1, mu, s1], [0, 0.9 * mu, 0.5 * s1], [np.inf, 1.1 * mu, 2.0 * s1], bg1))
+            if np.count_nonzero(right) >= 4:
+                bg2 = h2 * ndtr((m2 - centers) / s2) + deb + agg
+                lo2, hi2 = max(1.8 * mu, 0.95 * m2), min(2.2 * mu, 1.05 * m2)
+                if hi2 <= lo2:
+                    lo2, hi2 = 1.8 * mu, 2.2 * mu
+                n2, m2, s2 = (float(q) for q in refit(right, [n2, m2, s2], [0, lo2, 0.5 * s2], [np.inf, hi2, 2.0 * s2], bg2))
+        except Exception as exc:  # pragma: no cover - defensive
+            ok, msg = False, str(exc)
+            break
+        g1 = width * n1 * _gauss(centers, mu, s1)
+        g2 = width * n2 * _gauss(centers, m2, s2)
+        region = (centers >= mu - 4 * s1) & (centers <= m2 + 4 * s2)
+        rest = np.where(region, counts - g1 - g2 - deb - agg, 0.0)
+        ns = max(float(rest.sum()), 0.0)
+        # S level just inside each peak
+        w1 = (centers >= mu + 2.5 * s1) & (centers <= mu + 4.0 * s1)
+        w2 = (centers >= m2 - 4.0 * s2) & (centers <= m2 - 2.5 * s2)
+        if w1.any():
+            h1 = max(float(rest[w1].mean()), 0.0)
+        if w2.any():
+            h2 = max(float(rest[w2].mean()), 0.0)
+        agg = agg_of()
+    s_curve = np.where(region, np.clip(gaussian_filter1d(rest, 1.0), 0.0, None), 0.0)
+    return n1, ns, n2, mu, s1, s2, m2 / mu, g1, s_curve, g2, (agg if na > 0 else None), ok, msg
 
 
 # =============================================================================
@@ -293,6 +535,7 @@ def fit_proliferation(
     forward: Callable | None = None,
     inverse: Callable | None = None,
     spacing: float = LOG2,
+    fix_g0: bool = False,
 ) -> ProliferationResult:
     """Fit a dye-dilution histogram with one Gaussian per generation.
 
@@ -302,7 +545,11 @@ def fit_proliferation(
     display space). With `forward`/`inverse` (the display transform and its
     inverse) generation k sits at forward(inverse(pos0) / 2**k), which is exact
     for any transform; without them peaks are spaced by `spacing`.
-    g0_guess is in the fitting coordinate (log10 units when log=True).
+    g0_guess is in the fitting coordinate (log10 units when log=True); it is
+    where the search for the generation-0 (undivided) peak starts -- without
+    it the brightest clear peak is taken. fix_g0=True holds generation 0
+    exactly at g0_guess (e.g. the median of an undivided control) and only
+    fits the peak width and the amplitudes.
     """
     v = _finite(values)
     if log:
@@ -314,6 +561,8 @@ def fit_proliferation(
         raise ValueError("at least 50 events are needed for a proliferation fit")
     max_generations = max(1, int(max_generations))
     lo, hi = float(np.percentile(v, 0.05)), float(np.percentile(v, 99.95))
+    if g0_guess is not None and math.isfinite(float(g0_guess)):
+        hi = max(hi, float(g0_guess))  # keep a given generation 0 on the histogram
     if hi <= lo:
         hi = lo + 1.0
 
@@ -338,6 +587,7 @@ def fit_proliferation(
     width = float(edges[1] - edges[0])
 
     if g0_guess is None:
+        fix_g0 = False
         smooth = gaussian_filter1d(counts, 1.5)
         peaks, _ = find_peaks(smooth, height=0.05 * smooth.max(), prominence=0.02 * smooth.max())
         g0 = float(centers[peaks[-1]]) if peaks.size else float(np.percentile(v, 99))
@@ -355,22 +605,35 @@ def fit_proliferation(
         amp, rnorm = nnls(basis * wts[:, None], counts * wts, maxiter=50 * max_generations)
         return amp, rnorm, basis, pos
 
-    # coarse grid around the brightest peak, then a local polish
-    best = (np.inf, g0, 0.2 * dsp)
-    for p0 in g0 + np.linspace(-0.4, 0.4, 17) * dsp:
-        for sd in np.linspace(0.06, 0.5, 12) * dsp:
-            r = solve(p0, sd)[1]
-            if r < best[0]:
-                best = (r, p0, sd)
+    if fix_g0:
+        # generation 0 is given: only the shared width is searched
+        sds = np.linspace(0.06, 0.5, 23) * dsp
+        res = [solve(g0, sd)[1] for sd in sds]
+        k = int(np.argmin(res))
+        a, b = sds[max(k - 1, 0)], sds[min(k + 1, sds.size - 1)]
+        a = max(a, 0.26 * width)
+        p0, sd = g0, float(sds[k])
+        if b > a:
+            opt = minimize_scalar(lambda z: solve(g0, z)[1], bounds=(a, b), method="bounded", options={"xatol": 1e-4 * dsp})
+            if opt.fun <= res[k]:
+                sd = float(opt.x)
+    else:
+        # coarse grid around the brightest peak, then a local polish
+        best = (np.inf, g0, 0.2 * dsp)
+        for p0 in g0 + np.linspace(-0.4, 0.4, 17) * dsp:
+            for sd in np.linspace(0.06, 0.5, 12) * dsp:
+                r = solve(p0, sd)[1]
+                if r < best[0]:
+                    best = (r, p0, sd)
 
-    def objective(z):
-        p0, sd = z
-        if sd <= 0.25 * width or abs(p0 - g0) > 0.6 * dsp:
-            return 1e300
-        return solve(p0, sd)[1]
+        def objective(z):
+            p0, sd = z
+            if sd <= 0.25 * width or abs(p0 - g0) > 0.6 * dsp:
+                return 1e300
+            return solve(p0, sd)[1]
 
-    opt = minimize(objective, [best[1], best[2]], method="Nelder-Mead", options={"xatol": 1e-4 * dsp, "fatol": 1e-6, "maxiter": 400})
-    p0, sd = (opt.x if opt.fun <= best[0] else (best[1], best[2]))
+        opt = minimize(objective, [best[1], best[2]], method="Nelder-Mead", options={"xatol": 1e-4 * dsp, "fatol": 1e-6, "maxiter": 400})
+        p0, sd = (opt.x if opt.fun <= best[0] else (best[1], best[2]))
     amp, _, basis, pos = solve(float(p0), float(sd))
     curves = {f"Gen {k}": basis[:, k] * amp[k] for k in range(max_generations)}
     model = basis @ amp
@@ -592,18 +855,50 @@ def population_values(population, param: str, display: bool = False) -> np.ndarr
     return np.asarray(data)[population.mask()]
 
 
-def cell_cycle_for_population(population, param: str, bins: int = 256, g1_guess: float | None = None) -> CellCycleResult:
-    return fit_cell_cycle(population_values(population, param), bins=bins, g1_guess=g1_guess)
+def cell_cycle_for_population(population, param: str, bins: int = 256, g1_guess: float | None = None, model: str = "dean_jett_fox", debris: bool = False, aggregates: bool = False) -> CellCycleResult:
+    return fit_cell_cycle(population_values(population, param), bins=bins, g1_guess=g1_guess, model=model, debris=debris, aggregates=aggregates)
 
 
-def proliferation_for_population(population, param: str, bins: int = 256, max_generations: int = 10, display: bool = True, g0_guess: float | None = None) -> ProliferationResult:
+def control_g0(population, param: str) -> float:
+    """Generation-0 position from an undivided control: the median of the
+    control population's `param` values, in data units (the median commutes
+    with the monotonic display transforms, so it is the peak position on
+    every scale)."""
+    values = _finite(population_values(population, param))
+    if values.size == 0:
+        raise ValueError(f"the control population {getattr(population, 'display_name', '')!r} has no events")
+    return float(np.median(values))
+
+
+def proliferation_for_population(
+    population,
+    param: str,
+    bins: int = 256,
+    max_generations: int = 10,
+    display: bool = True,
+    g0_guess: float | None = None,
+    g0: float | None = None,
+    fix_g0: bool = False,
+) -> ProliferationResult:
     """display=True fits the 0..1 display values (the sample's logicle/log
     transform) with generations placed exactly at halved intensities;
-    display=False fits log10 of the raw values."""
+    display=False fits log10 of the raw values.
+
+    g0_guess is in the fitting coordinate; g0 is the generation-0 (undivided)
+    position in data units (e.g. `control_g0(control, param)`) and is
+    converted to the fitting coordinate. fix_g0 holds generation 0 there."""
+    if g0 is not None:
+        g0 = float(g0)
+        if display:
+            g0_guess = float(population.sample.scale(param).forward_scalar(g0))
+        else:
+            if g0 <= 0:
+                raise ValueError("the generation-0 position must be positive for a log10 fit")
+            g0_guess = math.log10(g0)
     if display:
         scale = population.sample.scale(param)
-        return fit_proliferation(population_values(population, param, display=True), bins=bins, max_generations=max_generations, log=False, g0_guess=g0_guess, forward=scale.forward, inverse=scale.inverse)
-    return fit_proliferation(population_values(population, param), bins=bins, max_generations=max_generations, log=True, g0_guess=g0_guess)
+        return fit_proliferation(population_values(population, param, display=True), bins=bins, max_generations=max_generations, log=False, g0_guess=g0_guess, forward=scale.forward, inverse=scale.inverse, fix_g0=fix_g0)
+    return fit_proliferation(population_values(population, param), bins=bins, max_generations=max_generations, log=True, g0_guess=g0_guess, fix_g0=fix_g0)
 
 
 def kinetics_for_population(population, time_param: str, param: str, n_bins: int = 20, statistic: str = "median", threshold: float | None = None, binning: str = "equal_count") -> KineticsResult:
@@ -611,3 +906,72 @@ def kinetics_for_population(population, time_param: str, param: str, n_bins: int
     if sample is None or not sample.ensure_loaded():
         raise ValueError("sample data is not available")
     return kinetics(sample.data(time_param), sample.data(param), n_bins=n_bins, statistic=statistic, mask=population.mask(), threshold=threshold, binning=binning)
+
+
+# =============================================================================
+# fits as population statistics (Table Editor, plate editor, Add Statistic)
+# =============================================================================
+FIT_CACHE_SIZE = 128
+_FIT_CACHE: "OrderedDict[tuple, object]" = OrderedDict()
+_FIT_CACHE_INFO = {"hits": 0, "misses": 0}
+FIT_KINDS = ("cell_cycle", "proliferation")
+
+
+def clear_fit_cache():
+    _FIT_CACHE.clear()
+    _FIT_CACHE_INFO.update(hits=0, misses=0)
+
+
+def fit_cache_info() -> dict:
+    return {**_FIT_CACHE_INFO, "size": len(_FIT_CACHE)}
+
+
+def _scale_key(sample, param: str) -> str:
+    try:
+        return json.dumps(sample.scale(param).to_dict(), sort_keys=True, default=str)
+    except Exception:
+        return ""
+
+
+def cached_population_fit(kind: str, population, param: str):
+    """The default cell-cycle ("cell_cycle": Dean-Jett-Fox, 256 bins) or
+    proliferation ("proliferation": display scale, 10 generations, automatic
+    generation 0) fit of a population, from a small LRU cache keyed by the
+    population identity, parameter, event count and a fingerprint of the
+    values (and the display scale for proliferation), so that several table
+    columns over the same population run the fit once. Raises ValueError when
+    the fit is not possible (no data, too few events)."""
+    if kind not in FIT_KINDS:
+        raise ValueError(f"unknown fit {kind!r}")
+    sample = population.sample
+    if sample is None or not sample.ensure_loaded():
+        raise ValueError("sample data is not available")
+    raw = np.ascontiguousarray(population_values(population, param))
+    key = (
+        kind,
+        getattr(population, "id", id(population)),
+        getattr(sample, "id", None),
+        param,
+        int(raw.size),
+        hash(raw.tobytes()),
+        _scale_key(sample, param) if kind == "proliferation" else "",
+    )
+    if key in _FIT_CACHE:
+        _FIT_CACHE.move_to_end(key)
+        _FIT_CACHE_INFO["hits"] += 1
+        result = _FIT_CACHE[key]
+    else:
+        _FIT_CACHE_INFO["misses"] += 1
+        try:
+            if kind == "cell_cycle":
+                result = fit_cell_cycle(raw)
+            else:
+                result = proliferation_for_population(population, param)
+        except (ValueError, KeyError, RuntimeError) as exc:
+            result = ValueError(str(exc))
+        _FIT_CACHE[key] = result
+        while len(_FIT_CACHE) > FIT_CACHE_SIZE:
+            _FIT_CACHE.popitem(last=False)
+    if isinstance(result, Exception):
+        raise ValueError(str(result))
+    return result

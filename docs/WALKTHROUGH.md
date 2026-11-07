@@ -37,6 +37,10 @@ the right column is the same action in FlowDesk. Nothing here is a mock-up.
 | Cell cycle | Dean-Jett-Fox-style fit with %G1/%S/%G2M | ![](walkthrough/24_cell_cycle.png) |
 | Proliferation | Generations, division and proliferation index | ![](walkthrough/25_proliferation.png) |
 | Kinetics | Statistic versus time | ![](walkthrough/26_kinetics.png) |
+| Data cleaning (FlowAI / FlowClean) | Flow rate, signal stability, change points and saturation → a "QC pass" population | ![](walkthrough/28_data_cleaning.png) |
+| Calibrate (MESF) | Bead peaks ↔ MESF values, log-log fit, `<param> MESF` parameters | ![](walkthrough/29_calibrate_mesf.png) |
+| Phenograph | kNN graph + Louvain communities, one population per cluster | ![](walkthrough/30_phenograph_dialog.png) |
+| Project onto existing result | Place new samples on an earlier PCA / FlowSOM / k-means / UMAP run | ![](walkthrough/31_project_onto_existing.png) |
 
 ## Ten-minute acceptance check (for someone who knows FlowJo)
 

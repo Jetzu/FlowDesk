@@ -178,6 +178,20 @@ def axis_title(sample: Sample, name: str, style: str) -> str:
     return f"{name} :: {stain or name}"
 
 
+def has_parameter(sample: Sample, name: str) -> bool:
+    """Whether `sample` can provide values for `name` (FCS channel or stain,
+    compensated, derived or computed parameter). Computed parameters exist only
+    on the samples a tool ran on, so a plot or an overlay may ask a sample for
+    a parameter it does not have."""
+    if not name:
+        return False
+    if name in sample.computed or name in sample.derived or name in sample.channel_names:
+        return True
+    if name in sample.parameter_names():
+        return True
+    return any(c.stain == name for c in sample.channels)
+
+
 def format_freq(value: float, decimals: int = 1) -> str:
     if value is None or math.isnan(value):
         return ""
@@ -312,6 +326,14 @@ def _paint_plot(painter: QPainter, image: QImage, sample, population, graph, wid
         if not histogram:
             y = y2
         result.x, result.y = x, y
+    absent = [n for n in (x, y) if n and not has_parameter(sample, n)]
+    if absent:
+        # e.g. a tSNE plot of a group batch over a sample tSNE was not run on;
+        # checked before scale() so no default scale is cached for it
+        names = " / ".join(dict.fromkeys(absent))
+        _draw_message(painter, plot_rect, f"{names} not available\nfor {sample.name}", label_font)
+        result.error = f"parameter not found: {names}"
+        return result
     try:
         x_scale = sample.scale(x)
         xd_all = sample.display(x)
@@ -362,7 +384,7 @@ def _paint_plot(painter: QPainter, image: QImage, sample, population, graph, wid
             _blit(painter, plot_rect, buf, dpr)
         if overlays:
             for k, (osample, opop) in enumerate(overlays):
-                if not osample.ensure_loaded():
+                if not osample.ensure_loaded() or not (has_parameter(osample, x) and has_parameter(osample, y)):
                     continue
                 try:
                     oidx = _subsample(np.flatnonzero(opop.mask()), int(options.dots_to_draw))
@@ -370,6 +392,9 @@ def _paint_plot(painter: QPainter, image: QImage, sample, population, graph, wid
                     oy = osample.display(y)[oidx]
                 except KeyError:
                     continue
+                ok = np.isfinite(ox) & np.isfinite(oy)  # computed parameters: NaN = not computed
+                if not ok.all():
+                    ox, oy = ox[ok], oy[ok]
                 if zoomed:
                     ox, oy = apply_view_x(ox), apply_view_y(oy)
                 color = QColor(options.overlay_colors[k % len(options.overlay_colors)])
@@ -396,7 +421,11 @@ def _paint_plot(painter: QPainter, image: QImage, sample, population, graph, wid
     if overlays and options.show_legend:
         entries = [(f"{sample.name} / {population.display_name}", options.histogram_line if histogram else "#7a7f87")]
         for k, (osample, opop) in enumerate(overlays):
-            entries.append((f"{osample.name} / {opop.display_name}", options.overlay_colors[k % len(options.overlay_colors)]))
+            label = f"{osample.name} / {opop.display_name}"
+            absent = [n for n in (x, y) if n and not has_parameter(osample, n)]
+            if absent:
+                label += f" (no {' / '.join(absent)})"
+            entries.append((label, options.overlay_colors[k % len(options.overlay_colors)]))
         result.legend_entries = entries
         result.legend_rect = _draw_legend(painter, plot_rect, entries, number_font)
     return result
@@ -559,12 +588,13 @@ def _draw_histogram(painter: QPainter, rect: QRectF, xd: np.ndarray, options: Re
     series.append((counts, QColor(options.histogram_line), True))
     if overlays:
         for k, (osample, opop) in enumerate(overlays):
-            if not osample.ensure_loaded():
+            if not osample.ensure_loaded() or not has_parameter(osample, x):
                 continue
             try:
                 od = osample.display(x)[opop.mask()]
             except KeyError:
                 continue
+            od = od[np.isfinite(od)]
             if result.view != (0.0, 1.0, 0.0, 1.0):
                 od = (od - result.view[0]) / (result.view[1] - result.view[0])
             oc = np.histogram(np.clip(od, 0, 1), bins=bins, range=(0.0, 1.0))[0].astype(float)

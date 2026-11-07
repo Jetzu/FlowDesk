@@ -391,6 +391,12 @@ class Sample:
                     cache = (comp, values)
                     self._comp_cache = cache
                 return cache[1][:, comp.params.index(base)]
+        if name not in self.channel_names and self.comp is not None:
+            # identity or disabled matrix: "Comp-X" is the raw channel X, so
+            # gates drawn on compensated parameters keep working
+            base = self.comp.base_name(name)
+            if base is not None and base in self.channel_names:
+                return self.fcs.column(base)
         return self.fcs.column(name)
 
     def _derived_values(self, name: str) -> np.ndarray:

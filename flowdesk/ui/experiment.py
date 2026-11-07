@@ -76,27 +76,38 @@ def panel_parameters(samples: list[Sample]) -> list[tuple[str, str]]:
     return list(seen.items())
 
 
-def set_panel_stains(controller, stains: dict[str, str]) -> int:
-    """Write $PnS for every sample channel named in `stains`. Returns the number
-    of samples changed. Emits the refresh signals when anything changed."""
-    changed = 0
-    for s in controller.workspace.samples:
-        touched = False
+def _stain_edits(samples: list[Sample], stains: dict[str, str]) -> list[tuple[Sample, dict[str, str]]]:
+    """(sample, {$PnS keyword: new stain or ""}) for the samples whose stains differ."""
+    out = []
+    for s in samples:
+        edits = {}
         for ch in s.channels:
             if ch.name not in stains:
                 continue
             new = (stains[ch.name] or "").strip()
             key = f"$P{ch.index}S"
-            if s.keywords.get(key, "").strip() == new:
-                continue
+            if s.keywords.get(key, "").strip() != new:
+                edits[key] = new
+        if edits:
+            out.append((s, edits))
+    return out
+
+
+def set_panel_stains(controller, stains: dict[str, str]) -> int:
+    """Write $PnS for every sample channel named in `stains` (one undo step).
+    Returns the number of samples changed. Emits the refresh signals when
+    anything changed."""
+    edits = _stain_edits(controller.workspace.samples, stains)
+    if edits:
+        controller.begin_change("edit stains", "samples")
+    for s, keys in edits:
+        for key, new in keys.items():
             if new:
                 s.keywords[key] = new
             else:
                 s.keywords.pop(key, None)
-            touched = True
-        if touched:
-            s.refresh_channels_from_keywords()
-            changed += 1
+        s.refresh_channels_from_keywords()
+    changed = len(edits)
     if changed:
         controller.mark_modified()
         controller.samplesChanged.emit()
@@ -111,8 +122,6 @@ def apply_annotation(controller, info: dict, original_stains: dict[str, str] | N
     info = dict(info)
     panel = [dict(row) for row in info.get("panel", [])]
     info["panel"] = panel
-    controller.workspace.settings["experiment"] = info
-    controller.mark_modified()
     stains = {}
     for row in panel:
         param = row.get("parameter")
@@ -121,7 +130,15 @@ def apply_annotation(controller, info: dict, original_stains: dict[str, str] | N
         stain = row.get("stain", "")
         if original_stains is None or original_stains.get(param, "") != stain:
             stains[param] = stain
-    return set_panel_stains(controller, stains) if stains else 0
+    ws = controller.workspace
+    if ws.settings.get("experiment") == info and not _stain_edits(ws.samples, stains):
+        controller.mark_modified()
+        return 0
+    # one undo step for the annotation and the stains it propagates
+    with controller.undo_group("annotate experiment", ("samples", "settings")):
+        ws.settings["experiment"] = info
+        controller.mark_modified()
+        return set_panel_stains(controller, stains) if stains else 0
 
 
 def keyword_values_from_regex(samples: list[Sample], pattern: str) -> dict[int, str]:
@@ -180,7 +197,7 @@ def set_keyword(controller, samples: list[Sample], name: str, values: dict[int, 
     targets = [s for s in samples if s.id in per_sample]
     if not targets:
         return 0
-    controller.begin_change(f"set keyword {name}")
+    controller.begin_change(f"set keyword {name}", "samples")
     ws = controller.workspace
     for s in targets:
         s.keywords[name] = str(per_sample[s.id])
@@ -228,7 +245,10 @@ def sort_samples_by_keyword(controller, keyword: str, descending: bool = False):
     have = [s for s in ws.samples if value(s) not in (None, "")]
     missing = [s for s in ws.samples if value(s) in (None, "")]
     have.sort(key=lambda s: natural_key(value(s)), reverse=descending)
-    ws.samples[:] = have + missing
+    order = have + missing
+    if any(a is not b for a, b in zip(order, ws.samples)):
+        controller.begin_change(f"sort samples by {keyword}", "samples")
+        ws.samples[:] = order
     controller.mark_modified()
     controller.samplesChanged.emit()
 
@@ -304,7 +324,7 @@ def save_workspace_template(controller, path: Path | str) -> Path:
 
 def apply_workspace_template(controller, path: Path | str, replace_groups: bool = True, apply_scales: bool = True, add_layouts: bool = True) -> dict:
     template = load_template(path)
-    controller.begin_change("apply template")
+    controller.begin_change("apply template", "all")
     report = apply_template(controller.workspace, template, replace_groups, apply_scales, add_layouts)
     ws = controller.workspace
     if controller.current_group not in ws.groups:

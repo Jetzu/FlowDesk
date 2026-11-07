@@ -24,8 +24,40 @@ STATISTICS = [
     "Sum",
 ]
 
-NEEDS_PARAM = {"Mean", "Median", "Geometric Mean", "Mode", "SD", "CV", "Robust SD", "Robust CV", "Min", "Max", "Percentile", "Sum"}
-PERCENT_STATS = {"Freq. of Parent", "Freq. of Total", "Freq. of Grandparent", "CV", "Robust CV"}
+# model fits as statistics: the parameter is the DNA dye (cell cycle, default
+# Dean-Jett-Fox fit) or the proliferation dye (display-scale fit, automatic
+# generation 0); name -> (fit kind, result attribute)
+BIOLOGY_STATISTICS = {
+    "Cell Cycle %G1": ("cell_cycle", "percent_g1"),
+    "Cell Cycle %S": ("cell_cycle", "percent_s"),
+    "Cell Cycle %G2M": ("cell_cycle", "percent_g2m"),
+    "Prolif. Division Index": ("proliferation", "division_index"),
+    "Prolif. Proliferation Index": ("proliferation", "proliferation_index"),
+    "Prolif. % Divided": ("proliferation", "percent_divided"),
+}
+STATISTICS += list(BIOLOGY_STATISTICS)
+
+NEEDS_PARAM = {"Mean", "Median", "Geometric Mean", "Mode", "SD", "CV", "Robust SD", "Robust CV", "Min", "Max", "Percentile", "Sum"} | set(BIOLOGY_STATISTICS)
+PERCENT_STATS = {"Freq. of Parent", "Freq. of Total", "Freq. of Grandparent", "CV", "Robust CV", "Cell Cycle %G1", "Cell Cycle %S", "Cell Cycle %G2M", "Prolif. % Divided"}
+
+
+def biology_statistic(name: str, population, param: str | None) -> float:
+    """A cell-cycle / proliferation fit result of a population (fits are
+    cached per population, parameter and data). NaN when the fit fails."""
+    kind, attr = BIOLOGY_STATISTICS[name]
+    if not param:
+        return float("nan")
+    from .biology import cached_population_fit
+
+    try:
+        result = cached_population_fit(kind, population, param)
+    except (ValueError, KeyError, RuntimeError):
+        return float("nan")
+    value = getattr(result, attr, float("nan"))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def compute_statistic(name: str, population, param: str | None = None, percentile: float | None = None) -> float:
@@ -46,11 +78,14 @@ def compute_statistic(name: str, population, param: str | None = None, percentil
         raise ValueError(f"unknown statistic {name!r}")
     if not param:
         return float("nan")
+    if name in BIOLOGY_STATISTICS:
+        return biology_statistic(name, population, param)
     sample = population.sample
     if sample is None or not sample.ensure_loaded():
         return float("nan")
     try:
         values = sample.data(param)[population.mask()]
+        values = values[np.isfinite(values)]  # computed parameters are NaN where a tool did not run
     except KeyError:
         return float("nan")
     if values.size == 0:

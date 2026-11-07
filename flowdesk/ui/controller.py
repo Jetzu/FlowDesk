@@ -7,6 +7,7 @@ through it (or call the notify_* methods after changing the model directly).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -15,11 +16,14 @@ from PySide6.QtCore import QObject, QSettings, Signal
 from ..core.compensation import SpilloverMatrix
 from ..core.gates import Gate
 from ..core.model import Group, Population, Sample, StatNode, Workspace
-from ..core.serialization import gating_snapshot, restore_snapshot
+from ..core.serialization import extend_snapshot, gating_snapshot, restore_snapshot, snapshot_kind
 from ..core.transforms import Scale
 
 POPULATION_MIME = "application/x-flowdesk-population"
 MAX_UNDO = 60
+# begin_change() callers written before `kind` existed that change more than
+# the gating state (labels as they pass them)
+LEGACY_UNDO_KINDS = {"apply template": "all", "add samples": "samples", "remove samples": "samples"}
 
 DEFAULT_PREFERENCES = {
     "polygon_gating": "exact",  # exact | bitmap (FlowJo-compatible 256-bin evaluation)
@@ -116,6 +120,7 @@ class WorkspaceController(QObject):
     compensationChanged = Signal(object)  # sample id or None
     layoutsChanged = Signal()
     tablesChanged = Signal()
+    settingsChanged = Signal()  # workspace.settings replaced by undo / redo
     preferencesChanged = Signal()
     # -- ui state
     currentGroupChanged = Signal(object)  # Group
@@ -133,6 +138,7 @@ class WorkspaceController(QObject):
         self.preferences = Preferences()
         self._undo: list[tuple[str, dict]] = []
         self._redo: list[tuple[str, dict]] = []
+        self._undo_group_depth = 0
         # Callbacks installed by the main window so that other windows can open things.
         self.open_graph: Callable[[Sample, Population], object] | None = None
         self.open_group_graph: Callable[[Group, Population | None], object] | None = None
@@ -178,12 +184,48 @@ class WorkspaceController(QObject):
         self.modifiedChanged.emit(False)
 
     # ------------------------------------------------------------------- undo
-    def begin_change(self, label: str = "change"):
-        """Call before mutating gates, scales, compensation or groups."""
-        self._undo.append((label, gating_snapshot(self.workspace)))
+    def begin_change(self, label: str = "change", kind=None):
+        """Call before mutating the workspace; undo brings back what `kind` covers.
+
+        kind "gating" (the default) covers every sample's gates, statistics,
+        graph settings, scales, compensation, derived and computed parameters
+        plus the groups. Changes to more than that pass "all" or the extra
+        sections they touch: "samples" (sample list and order, names,
+        keywords), "matrices", "settings", "layouts", "tables" (one name or a
+        tuple). Inside `undo_group` a call adds no step of its own; it only
+        widens the open step when it needs more sections."""
+        if kind is None:
+            kind = LEGACY_UNDO_KINDS.get(label, "gating")
+        if self._undo_group_depth and self._undo:
+            extend_snapshot(self.workspace, self._undo[-1][1], kind)
+            return
+        self._push_undo(label, gating_snapshot(self.workspace, kind))
+
+    def _push_undo(self, label: str, snap: dict):
+        self._undo.append((label, snap))
         if len(self._undo) > MAX_UNDO:
             self._undo.pop(0)
         self._redo.clear()
+
+    def push_undo(self, label: str, snapshot: dict):
+        """Record an undo step from a snapshot taken earlier (editors that
+        mutate the model during a drag and announce the change afterwards)."""
+        self._push_undo(label, snapshot)
+
+    def undo_top_snapshot(self) -> dict | None:
+        """The snapshot of the step an undo would restore next, or None."""
+        return self._undo[-1][1] if self._undo else None
+
+    @contextmanager
+    def undo_group(self, label: str, kind=None):
+        """One undo step for everything done in the block (begin_change calls
+        made inside, e.g. by set_scale, add none)."""
+        self.begin_change(label, kind)
+        self._undo_group_depth += 1
+        try:
+            yield
+        finally:
+            self._undo_group_depth -= 1
 
     @property
     def can_undo(self) -> bool:
@@ -200,34 +242,59 @@ class WorkspaceController(QObject):
         if not self._undo:
             return
         label, snap = self._undo.pop()
-        self._redo.append((label, gating_snapshot(self.workspace)))
-        restore_snapshot(self.workspace, snap)
-        self._after_restore()
+        # the redo snapshot has the same sections as the one restored
+        current = gating_snapshot(self.workspace, snapshot_kind(snap))
+        changes = restore_snapshot(self.workspace, snap, current)
+        self._redo.append((label, current))
+        self._after_restore(changes)
         self.statusMessage.emit(f"Undid {label}")
 
     def redo(self):
         if not self._redo:
             return
         label, snap = self._redo.pop()
-        self._undo.append((label, gating_snapshot(self.workspace)))
-        restore_snapshot(self.workspace, snap)
-        self._after_restore()
+        current = gating_snapshot(self.workspace, snapshot_kind(snap))
+        changes = restore_snapshot(self.workspace, snap, current)
+        self._undo.append((label, current))
+        self._after_restore(changes)
         self.statusMessage.emit(f"Redid {label}")
 
-    def _after_restore(self):
+    def _after_restore(self, changes: set[str]):
+        """Re-point the ui state at the restored model and emit the signals
+        for what `changes` (from restore_snapshot) says changed."""
         groups = self.workspace.groups
-        self.current_group = next((g for g in groups if g.name == self.current_group.name), groups[0])
+        cur = self.current_group
+        if not any(g is cur for g in groups):
+            self.current_group = next((g for g in groups if g.id == cur.id), None) or next((g for g in groups if g.name == cur.name), groups[0])
         self.selected = []
+        self.selected_groups = [g for g in self.selected_groups if any(g is x for x in groups)]
         self.mark_modified()
-        self.groupsChanged.emit()
-        self.gatingChanged.emit(None)
-        self.scalesChanged.emit(None)
-        self.compensationChanged.emit(None)
+        if "samples" in changes:  # first: windows of samples that left close
+            self.samplesChanged.emit()
+        if changes & {"samples", "groups"}:  # keywords / sample list change memberships
+            self.groupsChanged.emit()
+        if changes & {"samples", "gating", "scales", "compensation", "groups"}:
+            self.gatingChanged.emit(None)
+        if "scales" in changes:
+            self.scalesChanged.emit(None)
+        if changes & {"compensation", "matrices"}:
+            self.compensationChanged.emit(None)
+        if "layouts" in changes:
+            self.layoutsChanged.emit()
+        if "tables" in changes:
+            self.tablesChanged.emit()
+        if "settings" in changes:
+            self.settingsChanged.emit()
         self.currentGroupChanged.emit(self.current_group)
         self.selectionChanged.emit()
 
     # --------------------------------------------------------------- samples
     def add_samples(self, paths: list[str | Path]) -> list[Sample]:
+        if self._undo_group_depth:
+            self.begin_change("add samples", "samples")
+            snap = None
+        else:
+            snap = gating_snapshot(self.workspace, "samples")
         added = []
         for p in paths:
             p = Path(p)
@@ -238,6 +305,8 @@ class WorkspaceController(QObject):
             if len(self.workspace.samples) > before:
                 added.append(s)
         if added:
+            if snap is not None:
+                self._push_undo("add samples", snap)
             self.mark_modified()
             self.samplesChanged.emit()
             self.groupsChanged.emit()
@@ -253,7 +322,7 @@ class WorkspaceController(QObject):
     def remove_samples(self, samples: list[Sample]):
         if not samples:
             return
-        self.begin_change("remove samples")
+        self.begin_change("remove samples", "samples")
         for s in samples:
             self.workspace.remove_sample(s)
         self.selected = [(s, p) for s, p in self.selected if s in self.workspace.samples]
@@ -264,6 +333,7 @@ class WorkspaceController(QObject):
 
     def rename_sample(self, sample: Sample, name: str):
         if name and name != sample.name:
+            self.begin_change("rename sample", "samples")
             sample.name = name
             sample.root.name = name
             self.mark_modified()
@@ -485,12 +555,14 @@ class WorkspaceController(QObject):
         self.gatingChanged.emit(samples[0].id if len(samples) == 1 else None)
 
     def store_matrix(self, matrix: SpilloverMatrix):
+        self.begin_change("edit matrix", "matrices")
         self.workspace.matrices[matrix.name] = matrix
         self.mark_modified()
         self.compensationChanged.emit(None)
 
     def remove_matrix(self, name: str):
         if name in self.workspace.matrices:
+            self.begin_change("delete matrix", "matrices")
             del self.workspace.matrices[name]
             self.mark_modified()
             self.compensationChanged.emit(None)

@@ -4,6 +4,12 @@ A .wsp file is XML: a FlowJo envelope (groups, sample list, population tree,
 graphs, layouts) that embeds ISAC Gating-ML 2.0 gates, transformations and
 spillover matrices. This reader is written from the XML structure of the files
 alone; layouts, tables and other FlowJo-only sections are ignored.
+
+Gates on parameters FlowDesk cannot compute - FlowJo derived parameters,
+Gating-ML "new dimensions" (ratio transforms) or parameters missing from the
+FCS file - are kept with their dimension names, so the population tree stays
+complete; such populations evaluate as empty (0 events) and are listed in the
+import report's warnings.
 """
 from __future__ import annotations
 
@@ -242,8 +248,13 @@ def parse_gate(gate_el: ET.Element, report: ImportReport, where: str) -> tuple[G
     dim_els = _dimensions(gel)
     dims = [_param_name(d) for d in dim_els]
     if any(d is None for d in dims):
-        report.warn(f"{where}: gate dimension without an FCS parameter name (ratio/new dimension unsupported)")
-        return None, None
+        # a Gating-ML new-dimension (ratio transform) or an unnamed dimension:
+        # keep the gate on a placeholder name, the population evaluates empty
+        for k, (d_el, d) in enumerate(zip(dim_els, dims)):
+            if d is None:
+                ref = next((_get(c, "transformation-ref") for c in d_el.iter() if _local(c.tag) == "new-dimension"), None)
+                dims[k] = ref or "unnamed dimension"
+                report.warn(f"{where}: gate dimension {dims[k]!r} is a transformed (ratio / new) dimension FlowDesk cannot compute – the population stays empty")
     gate: Gate | None = None
     boolean = None
     if kind == "RectangleGate":
@@ -573,6 +584,54 @@ def _parse_group(node: ET.Element, report: ImportReport) -> Group:
     return group
 
 
+def _derived_parameter_names(sample_el: ET.Element) -> list[str]:
+    """Names of the FlowJo derived parameters defined for a sample."""
+    out = []
+    for el in sample_el.iter():
+        if _local(el.tag) == "DerivedParameter" and el.get("name"):
+            out.append(el.get("name"))
+    return out
+
+
+def missing_parameters(sample: Sample) -> dict[str, list[str]]:
+    """Gate dimensions of `sample`'s populations that the sample cannot
+    provide: {parameter: [population paths]}. Empty when the sample has no
+    channel information (file and keywords missing)."""
+    if not sample.channels:
+        return {}
+    known = set(sample.parameter_names())
+    known.update(c.stain for c in sample.channels if c.stain)
+    out: dict[str, list[str]] = {}
+    for pop in sample.root.walk(include_self=False):
+        gate = pop.gate
+        if gate is None or isinstance(gate, BooleanGate):
+            continue
+        for d in gate.dims:
+            if d not in known:
+                paths = out.setdefault(d, [])
+                if pop.path not in paths:
+                    paths.append(pop.path)
+    return out
+
+
+def _warn_missing(report: ImportReport, missing: dict[str, dict], flowjo_derived: dict[str, None]):
+    for param, entry in missing.items():
+        samples = entry["samples"]
+        paths = list(entry["paths"])
+        if param in flowjo_derived:
+            what = "a FlowJo derived parameter (not imported)"
+        elif entry.get("compensated"):
+            what = "a compensated parameter that is not available (identity or disabled matrix)"
+        else:
+            what = "not a parameter of the FCS file"
+        shown = ", ".join(paths[:3]) + (", …" if len(paths) > 3 else "")
+        where = ", ".join(samples[:3]) + (f" and {len(samples) - 3} more" if len(samples) > 3 else "")
+        report.warn(f"{param} is {what}: {len(paths)} population(s) gated on it stay empty ({shown}) in {where}")
+    unused = [n for n in flowjo_derived if n not in missing]
+    if unused:
+        report.warn(f"FlowJo derived parameters are not imported: {', '.join(unused)}")
+
+
 def import_wsp(path, search_dirs=None) -> tuple[Workspace, ImportReport]:
     path = Path(path)
     report = ImportReport()
@@ -613,6 +672,8 @@ def import_wsp(path, search_dirs=None) -> tuple[Workspace, ImportReport]:
     # samples
     dirs = [Path(d) for d in (search_dirs or [])]
     finder = _FileFinder(path.parent, dirs)
+    flowjo_derived: dict[str, None] = {}
+    missing: dict[str, dict] = {}
     sample_list = root.find("SampleList")
     for sel in (sample_list if sample_list is not None else []):
         if sel.tag != "Sample":
@@ -674,8 +735,19 @@ def import_wsp(path, search_dirs=None) -> tuple[Workspace, ImportReport]:
             builder = _TreeBuilder(report, f"sample {sid}")
             builder.children_of(node, sample.root)
             builder.resolve()
+        for name in _derived_parameter_names(sel):
+            flowjo_derived.setdefault(name, None)
+        for param, paths in missing_parameters(sample).items():
+            entry = missing.setdefault(param, {"samples": [], "paths": {}, "compensated": False})
+            comp = sample.comp
+            if comp is not None and comp.base_name(param) in sample.channel_names:
+                entry["compensated"] = True
+            entry["samples"].append(sample.name)
+            for p in paths:
+                entry["paths"].setdefault(p, None)
         ws.samples.append(sample)
         report.samples += 1
+    _warn_missing(report, missing, flowjo_derived)
     ws._next_id = max([s.id for s in ws.samples], default=0) + 1
     ws.modified = False
     return ws, report

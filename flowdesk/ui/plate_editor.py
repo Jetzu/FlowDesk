@@ -4,7 +4,9 @@ Wells are assigned from a keyword ($WELLID, WELL ID, ...) or from a pattern on
 the sample name ("Specimen_001_A1.fcs" -> A1); unassigned samples can be put
 on a well by hand (pick the sample in the side list, click a well). Each well is
 colour-coded by a statistic of a chosen population. Clicking a well selects the
-sample in the workspace, double-clicking opens its graph window.
+sample in the workspace, double-clicking opens its graph window. A plate map
+CSV (well -> sample name, as two columns or as a plate-shaped grid) can fill
+the wells in one go.
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from PySide6.QtCore import QItemSelectionModel, QObject, QPointF, QRectF, QSize,
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -120,6 +123,89 @@ def assign_wells(samples: list[Sample], source: str, rows: int, cols: int, patte
         else:
             wells[w] = s
     return wells, unassigned
+
+
+STRICT_WELL_RE = re.compile(r"^\s*([A-Pa-p])\s*[-_ ]?\s*0*(\d{1,2})\s*$")
+
+
+def strict_well(text: str, rows: int = 16, cols: int = 24) -> tuple[int, int] | None:
+    """A cell that is nothing but a well ID ("A1", "b07", "H-12")."""
+    m = STRICT_WELL_RE.match(str(text or ""))
+    if not m:
+        return None
+    r, c = ROW_LETTERS.find(m.group(1).upper()), int(m.group(2)) - 1
+    return (r, c) if 0 <= r < rows and 0 <= c < cols else None
+
+
+def read_plate_map(path, rows: int = 16, cols: int = 24) -> list[tuple[tuple[int, int], str]]:
+    """Read a plate-map file (see `parse_plate_map`); UTF-8 (with or without
+    a BOM) or Latin-1. Raises OSError when the file cannot be read."""
+    raw = Path(path).read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    return parse_plate_map(text, rows, cols)
+
+
+def parse_plate_map(text: str, rows: int = 16, cols: int = 24) -> list[tuple[tuple[int, int], str]]:
+    """A plate map: either two columns (well, sample name -- in either order,
+    an optional header row is skipped) or a plate-shaped grid whose first row
+    holds column numbers and first column row letters. Comma, semicolon and
+    tab separators are recognised. Returns [((row, col), name)] in file
+    order; empty names and wells off the plate are skipped."""
+    lines = [ln for ln in str(text).splitlines() if ln.strip()]
+    if not lines:
+        return []
+    sample_text = "\n".join(lines[:20])
+    delim = max([",", ";", "\t"], key=lambda d: sample_text.count(d))
+    table = [[c.strip() for c in r] for r in csv.reader(lines, delimiter=delim)]
+    out: list[tuple[tuple[int, int], str]] = []
+    # grid layout: header row of column numbers, row letters down the side
+    head = table[0]
+    numbers = [c for c in head[1:] if c]
+    if len(numbers) >= 2 and all(c.isdigit() for c in numbers):
+        col_of = {i: int(c) - 1 for i, c in enumerate(head) if i > 0 and c.isdigit()}
+        for line in table[1:]:
+            if not line:
+                continue
+            letter = line[0].strip().upper()
+            if len(letter) != 1 or letter not in ROW_LETTERS:
+                continue
+            r = ROW_LETTERS.index(letter)
+            for i, cell in enumerate(line):
+                c = col_of.get(i)
+                if c is not None and cell and r < rows and 0 <= c < cols:
+                    out.append(((r, c), cell))
+        return out
+    for line in table:
+        cells = [c for c in line if c]
+        if len(cells) < 2:
+            continue
+        well_idx = next((i for i, c in enumerate(cells) if strict_well(c, rows, cols) is not None), None)
+        if well_idx is None:
+            continue  # header or junk
+        name = next((c for i, c in enumerate(cells) if i != well_idx), "")
+        if name:
+            out.append((strict_well(cells[well_idx], rows, cols), name))
+    return out
+
+
+def match_sample(samples: list[Sample], name: str) -> Sample | None:
+    """The sample called `name`: exact, then case-insensitive, then without
+    the .fcs extension."""
+    for s in samples:
+        if s.name == name:
+            return s
+    low = name.strip().lower()
+    for s in samples:
+        if s.name.lower() == low:
+            return s
+    stem = low[:-4] if low.endswith(".fcs") else low
+    for s in samples:
+        if Path(s.name).stem.lower() == stem:
+            return s
+    return None
 
 
 def color_for(t: float) -> QColor:
@@ -331,9 +417,17 @@ class PlateEditorWindow(QMainWindow):
         self.stat_combo.addItems(STATISTICS)
         self.param_combo = QComboBox()
         self.param_combo.setMinimumWidth(140)
+        self.pct_spin = QDoubleSpinBox()
+        self.pct_spin.setRange(0.0, 100.0)
+        self.pct_spin.setDecimals(1)
+        self.pct_spin.setValue(50.0)
+        self.pct_spin.setSuffix(" %")
+        self.pct_label = QLabel("Percentile:")
         for w, label in ((self.pop_combo, "Population:"), (self.stat_combo, "Statistic:"), (self.param_combo, "Parameter:")):
             stat_row.addWidget(QLabel(label))
             stat_row.addWidget(w)
+        stat_row.addWidget(self.pct_label)
+        stat_row.addWidget(self.pct_spin)
         stat_row.addStretch(1)
         outer.addLayout(stat_row)
 
@@ -365,6 +459,9 @@ class PlateEditorWindow(QMainWindow):
         split.setSizes([800, 220])
         outer.addWidget(split, 1)
 
+        self.fill_csv_btn = QPushButton(icon("import"), "Fill Wells from CSV…")
+        self.fill_csv_btn.setToolTip("Assign samples to wells from a plate map: two columns (well, sample name) or a plate-shaped grid")
+        sl.addWidget(self.fill_csv_btn)
         btns = QHBoxLayout()
         self.export_btn = QPushButton(icon("export"), "Export CSV…")
         self.copy_btn = QPushButton(icon("copy"), "Copy Image")
@@ -382,6 +479,8 @@ class PlateEditorWindow(QMainWindow):
         self.pop_combo.currentIndexChanged.connect(lambda *_: self._stat_changed())
         self.stat_combo.currentIndexChanged.connect(lambda *_: self._stat_changed())
         self.param_combo.currentIndexChanged.connect(lambda *_: self._stat_changed())
+        self.pct_spin.valueChanged.connect(lambda *_: self._stat_changed())
+        self.fill_csv_btn.clicked.connect(lambda: self.fill_from_csv())
         self.unassigned_list.currentRowChanged.connect(self._list_row_changed)
         self.assign_combo.currentIndexChanged.connect(self._assign_combo_changed)
         self.plate.wellClicked.connect(self.click_well)
@@ -395,6 +494,7 @@ class PlateEditorWindow(QMainWindow):
         c.samplesChanged.connect(self.refresh)
         c.gatingChanged.connect(lambda _sid: self.refresh())
         c.workspaceReplaced.connect(self._workspace_replaced)
+        c.settingsChanged.connect(self._workspace_replaced)  # undo / redo of wells, format, source
         c.currentGroupChanged.connect(lambda _g: self.refresh())
         c.groupsChanged.connect(self.refresh)
         self._load_settings()
@@ -403,6 +503,11 @@ class PlateEditorWindow(QMainWindow):
     # ----------------------------------------------------------- persistence
     def _settings(self) -> dict:
         return self.controller.workspace.settings.setdefault("plate_editor", {})
+
+    def _begin_settings_change(self, label: str):
+        """Open an undo step that snapshots workspace.settings; call before
+        writing to workspace.settings["plate_editor"]."""
+        self.controller.begin_change(label, kind="settings")
 
     def _load_settings(self):
         st = self.controller.workspace.settings.get("plate_editor", {})
@@ -443,7 +548,7 @@ class PlateEditorWindow(QMainWindow):
             idx = self.source_combo.count() - 1
         self.source_combo.setCurrentIndex(idx)
 
-    def set_statistic(self, population_path: str, statistic: str, param: str | None = None):
+    def set_statistic(self, population_path: str, statistic: str, param: str | None = None, percentile: float | None = None):
         self._updating = True
         i = self.pop_combo.findData(population_path)
         if i >= 0:
@@ -453,23 +558,38 @@ class PlateEditorWindow(QMainWindow):
             j = self.param_combo.findText(param)
             if j >= 0:
                 self.param_combo.setCurrentIndex(j)
+        if percentile is not None:
+            self.pct_spin.setValue(float(percentile))
         self._updating = False
         self._stat_changed()
+
+    def _update_stat_widgets(self):
+        stat = self.stat_combo.currentText()
+        self.param_combo.setEnabled(stat in NEEDS_PARAM)
+        self.pct_spin.setVisible(stat == "Percentile")
+        self.pct_label.setVisible(stat == "Percentile")
+
+    @property
+    def percentile(self) -> float | None:
+        return float(self.pct_spin.value()) if self.stat_combo.currentText() == "Percentile" else None
 
     def _layout_changed(self):
         if self._updating:
             return
-        st = self._settings()
-        st["format"] = int(self.format_combo.currentData() or 96)
-        st["source"] = self.source_combo.currentText()
-        st["pattern"] = self.pattern_edit.text()
+        new = {"format": int(self.format_combo.currentData() or 96), "source": self.source_combo.currentText(), "pattern": self.pattern_edit.text()}
+        st = self.controller.workspace.settings.get("plate_editor", {})
+        old = {"format": st.get("format", 96), "source": st.get("source", AUTO_SOURCE), "pattern": st.get("pattern", DEFAULT_NAME_PATTERN)}
+        if old != new:
+            self._begin_settings_change("plate layout")
+            self._settings().update(new)
+            self.controller.mark_modified()
         self.plate.selected.clear()
         self.refresh()
 
     def _stat_changed(self):
         if self._updating:
             return
-        self.param_combo.setEnabled(self.stat_combo.currentText() in NEEDS_PARAM)
+        self._update_stat_widgets()
         self.compute_values()
         self.plate.update()
 
@@ -510,7 +630,7 @@ class PlateEditorWindow(QMainWindow):
             if j >= 0:
                 self.param_combo.setCurrentIndex(j)
         self.param_combo.blockSignals(False)
-        self.param_combo.setEnabled(self.stat_combo.currentText() in NEEDS_PARAM)
+        self._update_stat_widgets()
         self._updating = False
         self.assign()
         self.compute_values()
@@ -557,12 +677,12 @@ class PlateEditorWindow(QMainWindow):
                 values[well] = float("nan")
                 continue
             try:
-                values[well] = compute_statistic(stat, pop, param, 50.0 if stat == "Percentile" else None)
+                values[well] = compute_statistic(stat, pop, param, self.percentile)
             except (ValueError, KeyError):
                 values[well] = float("nan")
         self.values = values
         vr = value_range(values)
-        label = statistic_label(stat, param, 50.0 if stat == "Percentile" else None)
+        label = statistic_label(stat, param, self.percentile)
         if path:
             label = f"{path.strip('/')} · {label}"
         self.plate.values = values
@@ -602,6 +722,7 @@ class PlateEditorWindow(QMainWindow):
             self.select_in_workspace([self.wells[w] for w in sorted(self.plate.selected)] if additive else [sample])
 
     def assign_sample(self, sample: Sample, row: int, col: int):
+        self._begin_settings_change(f"assign {sample.name} to {well_name(row, col)}")
         manual = self._settings().setdefault("manual", {})
         manual[str(sample.id)] = well_name(row, col)
         self.controller.mark_modified()
@@ -610,12 +731,67 @@ class PlateEditorWindow(QMainWindow):
         self.compute_values()
         self.plate.update()
 
+    def fill_from_csv(self, path: str | None = None) -> dict | None:
+        """Assign samples to wells from a plate-map CSV (well -> sample name).
+        The listed wells become manual assignments (replacing whatever was
+        there); returns {"assigned": n, "missing": [names not found],
+        "conflicts": [wells whose entry was ignored because the well or the
+        sample was already listed]} or None when cancelled."""
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, "Fill Wells from CSV", str(Path.home()), "CSV / text (*.csv *.tsv *.txt);;All files (*)")
+            if not path:
+                return None
+        rows, cols = self.dims
+        try:
+            entries = read_plate_map(path, rows, cols)
+        except (OSError, csv.Error) as exc:
+            self.status.setText(f"Could not read {Path(str(path)).name}: {exc}")
+            return {"assigned": 0, "missing": [], "conflicts": [], "error": str(exc)}
+        samples = self.controller.workspace.samples
+        placed: dict[tuple[int, int], Sample] = {}
+        missing: list[str] = []
+        conflicts: list[str] = []
+        for well, name in entries:
+            s = match_sample(samples, name)
+            if s is None:
+                missing.append(name)
+                continue
+            if well in placed or any(t is s for t in placed.values()):
+                if placed.get(well) is not s:
+                    conflicts.append(well_name(*well))
+                continue  # a well or a sample listed twice: the first entry wins
+            placed[well] = s
+        if placed:
+            self._begin_settings_change(f"fill wells from {Path(str(path)).name}")
+            manual = self._settings().setdefault("manual", {})
+            wells_taken = {well_name(*w) for w in placed}
+            moved = {str(s.id) for s in placed.values()}
+            for sid in [k for k, w in manual.items() if w in wells_taken and k not in moved]:
+                manual.pop(sid)  # another sample was put on a listed well by hand
+            for w, s in placed.items():
+                manual[str(s.id)] = well_name(*w)
+            self.controller.mark_modified()
+        self.plate.selected.clear()
+        self.assign()
+        self.compute_values()
+        self.plate.update()
+        msg = f"Filled {len(placed)} wells from {Path(str(path)).name}"
+        if missing:
+            msg += f" · {len(missing)} names not found"
+        if conflicts:
+            msg += f" · {len(conflicts)} duplicate entries ignored"
+        self.status.setText(msg)
+        return {"assigned": len(placed), "missing": missing, "conflicts": conflicts}
+
     def unassign_selected(self):
-        manual = self._settings().setdefault("manual", {})
-        for w in list(self.plate.selected):
-            s = self.wells.get(w)
-            if s is not None:
-                manual.pop(str(s.id), None)
+        raw = self.controller.workspace.settings.get("plate_editor", {}).get("manual", {})
+        ids = [str(self.wells[w].id) for w in self.plate.selected if w in self.wells]
+        if any(sid in raw for sid in ids):
+            self._begin_settings_change("unassign wells")
+            manual = self._settings().setdefault("manual", {})
+            for sid in ids:
+                manual.pop(sid, None)
+            self.controller.mark_modified()
         self.plate.selected.clear()
         self.assign()
         self.compute_values()

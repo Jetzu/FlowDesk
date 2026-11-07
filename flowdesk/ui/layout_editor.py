@@ -7,11 +7,14 @@ Coordinates: one scene unit is one page point (1/72 inch). The persisted model
 is flowdesk.core.layouts.Layout / LayoutItem; every edit made on the canvas is
 written back into those objects and announced through
 controller.notify_layouts() (coalesced with a short timer while dragging).
+Every such announcement also records an undo step ("edit layout"), see
+SectionUndoRecorder.
 """
 from __future__ import annotations
 
 import json
 import math
+import time
 from collections import OrderedDict
 
 from PySide6.QtCore import QMarginsF, QPointF, QRectF, QSizeF, Qt, QTimer
@@ -136,6 +139,71 @@ def _reading_order(items: list[LayoutItem]) -> list[LayoutItem]:
     return sorted(items, key=lambda i: (round(i.y / 24.0), i.x))
 
 
+# --------------------------------------------------------------------- undo
+class SectionUndoRecorder:
+    """Undo steps for an editor that changes one workspace section
+    ("layouts" or "tables") in place and announces the change afterwards.
+
+    The editors write into the model objects directly (a drag moves the
+    LayoutItem as it goes), so there is no single place to call
+    controller.begin_change() *before* a change. The recorder keeps the
+    section as it was after the last recorded change (the baseline); record()
+    pushes one undo step that brings back that baseline plus the present
+    gating state (unchanged by an editor). Steps recorded with coalesce=True
+    within COALESCE_SECONDS of the previous coalescing step of the same
+    recorder merge into it, so one drag is one undo step."""
+
+    COALESCE_SECONDS = 1.0
+
+    def __init__(self, controller, section: str, label: str):
+        self.controller = controller
+        self.section = section
+        self.label = label
+        self._baseline: list[dict] | None = None
+        self._pushed: dict | None = None
+        self._pushed_coalescing = False
+        self._time = 0.0
+        self.reset()
+
+    def _state(self) -> list[dict]:
+        return [o.to_dict() for o in getattr(self.controller.workspace, self.section, [])]
+
+    def reset(self):
+        """Take the present state as the one the next step returns to (after
+        undo / redo, a replaced workspace or a change made elsewhere)."""
+        self._baseline = self._state()
+
+    def record(self, coalesce: bool = False) -> bool:
+        """Call after a change, before announcing it. Returns whether a new
+        undo step was pushed."""
+        c = self.controller
+        current = self._state()
+        before, self._baseline = self._baseline, current
+        if before is None or before == current:
+            return False
+        if getattr(c, "_undo_group_depth", 0):
+            # inside an open undo group: only make sure it covers the section
+            c.begin_change(self.label, kind=self.section)
+            return False
+        now = time.monotonic()
+        if (
+            coalesce
+            and self._pushed_coalescing
+            and self._pushed is not None
+            and c.undo_top_snapshot() is self._pushed
+            and now - self._time < self.COALESCE_SECONDS
+        ):
+            self._time = now  # same burst: the open step already returns to before it
+            return False
+        from ..core.serialization import gating_snapshot
+
+        snap = gating_snapshot(c.workspace, self.section)
+        snap[self.section] = before
+        c.push_undo(self.label, snap)
+        self._pushed, self._pushed_coalescing, self._time = snap, coalesce, now
+        return True
+
+
 # -------------------------------------------------------------- plot images
 class PlotImageCache:
     """LRU cache of rendered plot images, keyed by everything that affects the
@@ -231,6 +299,15 @@ class PlotOptionsDialog(QDialog):
         self.title_check = QCheckBox("Show title")
         self.title_check.setChecked(item.show_title)
         form.addRow(self.title_check)
+        # overlay render options; stored in item.graph.options like a graph
+        # window stores them in the population's graph settings
+        effective = RenderOptions.from_prefs(editor.controller.preferences, item.graph)
+        self.legend_check = QCheckBox("Show overlay legend")
+        self.legend_check.setChecked(bool(effective.show_legend))
+        form.addRow(self.legend_check)
+        self.offset_check = QCheckBox("Offset (staggered) overlaid histograms")
+        self.offset_check.setChecked(bool(effective.histogram_offset))
+        form.addRow(self.offset_check)
         self.overlay_list = QListWidget()
         self.overlay_list.setMinimumHeight(90)
         form.addRow("Overlays:", self.overlay_list)
@@ -287,6 +364,8 @@ class PlotOptionsDialog(QDialog):
             it.graph.y = None
         it.show_caption = self.caption_check.isChecked()
         it.show_title = self.title_check.isChecked()
+        it.graph.options["show_legend"] = self.legend_check.isChecked()
+        it.graph.options["histogram_offset"] = self.offset_check.isChecked()
         it.overlays = self.overlays
 
 
@@ -680,7 +759,8 @@ class LayoutEditorWindow(QMainWindow):
         self._notify_timer = QTimer(self)
         self._notify_timer.setSingleShot(True)
         self._notify_timer.setInterval(150)
-        self._notify_timer.timeout.connect(self._emit_layouts)
+        self._notify_timer.timeout.connect(lambda: self._emit_layouts(coalesce=True))
+        self.undo_recorder = SectionUndoRecorder(controller, "layouts", "edit layout")
 
         self.scene = QGraphicsScene(self)
         self.scene.setBackgroundBrush(QColor("#8a8f96"))
@@ -789,13 +869,15 @@ class LayoutEditorWindow(QMainWindow):
     def flush_notify(self):
         if self._notify_timer.isActive():
             self._notify_timer.stop()
-            self._emit_layouts()
+            self._emit_layouts(coalesce=True)
 
     def _notify_now(self):
         self._notify_timer.stop()
         self._emit_layouts()
 
-    def _emit_layouts(self):
+    def _emit_layouts(self, coalesce: bool = False):
+        # one undo step per edit; drags (timer-driven) merge into one
+        self.undo_recorder.record(coalesce)
         self._suppress = True
         try:
             self.controller.notify_layouts()
@@ -806,9 +888,13 @@ class LayoutEditorWindow(QMainWindow):
         if self._suppress:
             self._sync_list()
             return
+        # undo / redo or a change made elsewhere: the model is the truth now
+        self._notify_timer.stop()
+        self.undo_recorder.reset()
         self.refresh()
 
     def _on_workspace_replaced(self):
+        self.undo_recorder.reset()
         self._layout = None
         self.cache.invalidate()
         self._fill_groups()
@@ -833,6 +919,7 @@ class LayoutEditorWindow(QMainWindow):
         if not ws.layouts:
             ws.layouts.append(Layout("Layout"))
             self._layout = ws.layouts[0]
+            self.undo_recorder.reset()  # the default layout is the baseline, not an undoable edit
             self._notify_now()
             self._sync_list()
             self._rebuild_scene()

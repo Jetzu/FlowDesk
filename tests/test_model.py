@@ -642,3 +642,26 @@ def test_restore_snapshot_refreshes_derived_on_compensated_params(sample, synthe
     assert not np.allclose(sample.data("cdiff"), original, rtol=1e-4, atol=0.1)
     restore_snapshot(ws, snap)
     np.testing.assert_allclose(sample.data("cdiff"), original, rtol=1e-4, atol=0.1)
+
+
+def test_identity_matrix_comp_names_alias_raw_channels(tmp_path):
+    """FlowJo writes identity matrices for uncompensated samples and still
+    gates on "Comp-" names: those must read the raw channel, not count 0."""
+    from flowdesk.core.fcs import Channel, write_fcs
+
+    rng = np.random.default_rng(5)
+    events = np.column_stack([rng.normal(1000, 100, 500), rng.normal(2000, 100, 500)]).astype(np.float32)
+    path = tmp_path / "ident.fcs"
+    write_fcs(path, events, [Channel(1, "FITC-A", "", 262144), Channel(2, "PE-A", "", 262144)])
+    ws = Workspace()
+    s = ws.add_sample(path)
+    s.ensure_loaded()
+    ident = SpilloverMatrix("acq", ["FITC-A", "PE-A"], np.eye(2))
+    s.set_compensation(ident, True)
+    assert "Comp-FITC-A" not in s.parameter_names()  # no clutter for identity matrices
+    assert np.array_equal(s.data("Comp-FITC-A"), s.data("FITC-A"))
+    pop = Population("bright", RectangleGate(["Comp-FITC-A"], [1000.0], [None]))
+    s.root.add_child(pop)
+    assert pop.count == int((events[:, 0] >= 1000).sum())
+    s.set_compensation(ident, False)  # disabled matrix: same alias
+    assert np.array_equal(s.data("Comp-PE-A"), s.data("PE-A"))

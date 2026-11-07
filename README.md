@@ -53,8 +53,9 @@ passing it on the command line or by dropping it onto the workspace window.
 | **Experiment** (Workspace tab) | `Annotate Experiment…` (metadata and the stain panel), `Inspect Sample…`, `Add Keyword…` (one value, from a file-name pattern, or from a CSV), `Export Keywords`, `Sort Samples by Keyword…`, and the **Plate Editor** (96/384-well view coloured by any statistic, wells from `$WELLID`/the file name). |
 | **Templates** | `File ▸ Save as Template…` writes the analysis without the samples (`.fdwt`); `Apply Template…` (or opening a `.fdwt`/FlowJo `.wspt`) applies groups, gates, scales, matrices, layouts and tables to new samples. |
 | **Cytometer settings** | Default axis scales per cytometer (`$CYT`), applied to its samples. |
-| **Tools: analysis** | t-SNE, UMAP, PCA (results become parameters you can gate on), FlowSOM-style and k-means clustering (one population per cluster, with a median heat-map), population comparison (chi-squared T(x), KS). |
-| **Tools: biology** | Cell cycle (Dean-Jett-Fox-style fit), proliferation (dye-dilution generations, division/proliferation index), kinetics (statistic vs time), each with group batch tables and CSV export. |
+| **Tools: analysis** | t-SNE, UMAP, PCA (results become parameters you can gate on; *Project onto Existing…* places further samples on an earlier result), FlowSOM-style, Phenograph and k-means clustering (one population per cluster, with a median heat-map), population comparison (chi-squared T(x), KS). |
+| **Tools: biology** | Cell cycle (Dean-Jett-Fox or Watson model, optional debris/aggregates), proliferation (dye-dilution generations, division/proliferation index, generation 0 from an undivided control), kinetics (statistic vs time), each with group batch tables and CSV export; the fit results are also table statistics. |
+| **Tools: quality control** | Data cleaning (flow rate, signal stability, change points, saturation → a "QC pass" population) and MESF bead calibration (`<param> MESF` parameters). |
 
 Workspaces are saved as `.fdw` (JSON). `File ▸ Export FlowJo Workspace…`
 writes a `.wsp`. Populations can be exported as new FCS files or CSV; samples
@@ -135,14 +136,15 @@ real FlowJo workspaces (identical for rectangle gates, within ~1 % for polygons)
 flowdesk/core      fcs.py (reader/writer), transforms.py (scales), gates.py, stats.py,
                    compensation.py, model.py (workspace/sample/population/group),
                    layouts.py, serialization.py, templates.py, wsp_import.py, wsp_export.py,
-                   analysis.py (PCA/t-SNE/UMAP, FlowSOM, k-means, comparison),
-                   biology.py (cell cycle, proliferation, kinetics)
+                   analysis.py (PCA/t-SNE/UMAP, FlowSOM, Phenograph, k-means, comparison, projection),
+                   biology.py (cell cycle, proliferation, kinetics), qc.py (data cleaning),
+                   calibration.py (MESF beads)
 flowdesk/ui        main_window.py (ribbon, groups, sample tree), graph_window.py,
                    plot_widget.py (gate drawing/editing), renderer.py (plots),
                    layout_editor.py, table_editor.py, compensation.py, dialogs.py,
                    icons.py (drawn icons), style.py, controller.py (signals/undo/prefs);
                    extensions loaded through install(window): experiment.py,
-                   plate_editor.py, tools_analysis.py, tools_biology.py,
+                   plate_editor.py, tools_analysis.py, tools_biology.py, tools_qc.py,
                    graph_extras.py, cytometer.py
 packaging          PyInstaller spec, icons, Linux desktop entry (see docs/INSTALL.md)
 tests              pytest suite (core + UI, run offscreen on macOS, Windows and Linux in CI)

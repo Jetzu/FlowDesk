@@ -114,8 +114,8 @@ class ScaleDialog(QDialog):
         # linear
         w = QWidget()
         f = QFormLayout(w)
-        self.lin_min = _spin(-1e9, 1e9, 0)
-        self.lin_max = _spin(-1e9, 1e9, 262144)
+        self.lin_min = _spin(-1e9, 1e9, 0, decimals=4)
+        self.lin_max = _spin(-1e9, 1e9, 262144, decimals=4)
         f.addRow("Minimum:", self.lin_min)
         f.addRow("Maximum:", self.lin_max)
         self.stack.addWidget(w)

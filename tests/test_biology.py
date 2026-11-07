@@ -5,6 +5,10 @@ import numpy as np
 import pytest
 
 from flowdesk.core.biology import (
+    CELL_CYCLE_MODELS,
+    aggregate_component,
+    cell_cycle_model_key,
+    debris_component,
     fit_cell_cycle,
     fit_proliferation,
     kinetics,
@@ -24,6 +28,30 @@ def synth_cell_cycle(n=20000, fractions=(0.60, 0.15, 0.25), g1=100.0, cv=0.04, g
         rng.uniform(g1, 2 * g1, ns),
         rng.normal(2 * g1, g2_cv * 2 * g1, n2),
     ])
+
+
+def synth_cell_cycle_mixed(n=20000, fractions=(0.60, 0.15, 0.25), g1=100.0, cv=0.04, debris=0.10, doublets=0.05,
+                           debris_decay=0.35, s_shape="flat", seed=0):
+    """A DNA histogram with debris and doublets. `debris` and `doublets` are
+    fractions of all events; `fractions` (G1, S, G2/M) are of the singlets.
+    S-phase cells are spread between G1 and G2/M (flat, or accumulating early /
+    late) and measured with the same CV as the peaks; debris is exponential
+    from 0 with 1/e length debris_decay*g1; a doublet is the sum of two
+    randomly paired singlets (G1+G1 at 2x, G1+G2 at 3x, G2+G2 at 4x G1)."""
+    rng = np.random.default_rng(seed)
+    nd, na = int(debris * n), int(doublets * n)
+    nsing = n - nd - na
+    n1, ns = int(fractions[0] * nsing), int(fractions[1] * nsing)
+    n2 = nsing - n1 - ns
+    u = rng.uniform(0, 1, ns)
+    frac = {"flat": u, "early": 1 - np.sqrt(u), "late": np.sqrt(u)}[s_shape]
+    s = g1 * (1 + frac) * (1 + cv * rng.standard_normal(ns))
+    singles = np.concatenate([rng.normal(g1, cv * g1, n1), s, rng.normal(2 * g1, cv * 2 * g1, n2)])
+    doublet = rng.choice(singles, size=(na, 2)).sum(axis=1)
+    junk = rng.exponential(debris_decay * g1, nd)
+    out = np.concatenate([singles, doublet, junk])
+    rng.shuffle(out)
+    return out
 
 
 GEN_FRACTIONS = np.array([0.10, 0.20, 0.30, 0.25, 0.15])
@@ -151,3 +179,153 @@ def test_kinetics_percent_positive_and_table(tmp_path):
     with open(path) as fh:
         back = list(csv.reader(fh))
     assert len(back) == 5 and float(back[3][2]) == 100.0
+
+
+# ----------------------------------------------------------- cell-cycle models
+MIXES = [(0.60, 0.15, 0.25), (0.45, 0.30, 0.25), (0.35, 0.20, 0.45), (0.70, 0.10, 0.20)]
+
+
+@pytest.mark.parametrize("model", ["dean_jett_fox", "watson"])
+@pytest.mark.parametrize("mix", MIXES)
+@pytest.mark.parametrize("seed", [0, 1])
+def test_cell_cycle_with_debris_and_doublets(model, mix, seed):
+    """10 % debris and 5 % doublets: both models recover %G1/%S/%G2M to
+    within 3 points and the debris / aggregate fractions."""
+    v = synth_cell_cycle_mixed(fractions=mix, seed=seed)
+    r = fit_cell_cycle(v, model=model, debris=True, aggregates=True)
+    assert r.model == model and r.model_name == CELL_CYCLE_MODELS[model]
+    assert abs(r.percent_g1 - 100 * mix[0]) < 3
+    assert abs(r.percent_s - 100 * mix[1]) < 3
+    assert abs(r.percent_g2m - 100 * mix[2]) < 3
+    assert r.percent_g1 + r.percent_s + r.percent_g2m == pytest.approx(100.0)
+    assert abs(r.percent_debris - 10) < 1.5
+    assert abs(r.percent_aggregates - 5) < 1.5
+    assert abs(r.g1_mean - 100) < 2 and abs(r.g2_g1_ratio - 2) < 0.05
+    assert {"G1", "S", "G2/M", "Debris", "Aggregates", "Model"} == set(r.curves)
+    assert r.fit_range == (pytest.approx(r.centers[0] - (r.centers[1] - r.centers[0]) / 2), pytest.approx(r.centers[-1] + (r.centers[1] - r.centers[0]) / 2))
+    s = r.summary()
+    assert s["%Debris"] == r.percent_debris and s["%Aggregates"] == r.percent_aggregates
+    # the debris curve sits below G1, the aggregates around 2x-4x G1
+    deb, agg, x = r.curves["Debris"], r.curves["Aggregates"], r.centers
+    assert np.average(x, weights=deb) < 60
+    assert 200 < np.average(x, weights=agg) < 320
+    assert np.isfinite(r.rms) and r.success
+
+
+@pytest.mark.parametrize("seed", [3, 4])
+def test_cell_cycle_ignoring_debris_and_doublets_is_worse(seed):
+    # G1+G1 doublets sit exactly on G2/M: without the aggregate model they
+    # inflate %G2M
+    v = synth_cell_cycle_mixed(doublets=0.10, seed=seed)
+    plain = fit_cell_cycle(v)
+    full = fit_cell_cycle(v, debris=True, aggregates=True)
+    truth = np.array([60, 15, 25])
+
+    def err(r):
+        return np.abs(np.array([r.percent_g1, r.percent_s, r.percent_g2m]) - truth).max()
+
+    assert err(full) < 1.5 < err(plain)
+    assert plain.percent_g2m > 26.5
+    assert abs(full.percent_aggregates - 10) < 1.5
+    assert set(plain.curves) == {"G1", "S", "G2/M", "Model"}
+    assert np.isnan(plain.percent_debris) and np.isnan(plain.percent_aggregates)
+    assert "%Debris" not in plain.summary()
+
+
+@pytest.mark.parametrize("shape", ["early", "late"])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_watson_follows_a_skewed_s_phase(shape, seed):
+    """The pragmatic model assumes no S-phase shape: with S cells piling up
+    early or late it stays within 3 points where the flat-plateau model drifts."""
+    mix = (0.45, 0.30, 0.25)
+    v = synth_cell_cycle_mixed(fractions=mix, s_shape=shape, seed=seed)
+    w = fit_cell_cycle(v, model="Watson Pragmatic", debris=True, aggregates=True)
+    errs = np.abs(np.array([w.percent_g1, w.percent_s, w.percent_g2m]) - 100 * np.array(mix))
+    assert errs.max() < 3
+    assert w.curves["S"].min() >= 0
+
+
+def test_watson_without_debris_on_clean_data():
+    for seed in range(3):
+        r = fit_cell_cycle(synth_cell_cycle(seed=seed), model="watson")
+        assert abs(r.percent_g1 - 60) < 3 and abs(r.percent_s - 15) < 3 and abs(r.percent_g2m - 25) < 3
+        assert set(r.curves) == {"G1", "S", "G2/M", "Model"}
+    # enabling the extra components on data without debris/doublets is harmless
+    r = fit_cell_cycle(synth_cell_cycle(seed=1), model="watson", debris=True, aggregates=True)
+    assert r.percent_debris < 1 and r.percent_aggregates < 1
+    assert abs(r.percent_g1 - 60) < 3
+
+
+def test_cell_cycle_model_names():
+    assert cell_cycle_model_key(None) == "dean_jett_fox"
+    assert cell_cycle_model_key("Dean-Jett-Fox") == "dean_jett_fox"
+    assert cell_cycle_model_key("DJF") == "dean_jett_fox"
+    assert cell_cycle_model_key("Watson Pragmatic") == "watson"
+    with pytest.raises(ValueError):
+        cell_cycle_model_key("ModFit")
+    with pytest.raises(ValueError):
+        fit_cell_cycle(synth_cell_cycle(), model="bogus")
+
+
+def test_debris_and_aggregate_components():
+    width = 1.0
+    x = np.arange(0.5, 600, width)
+    deb = debris_component(x, 1000.0, 30.0, 0.0, width)
+    assert deb.sum() == pytest.approx(1000.0, rel=1e-6)
+    assert np.all(np.diff(deb) < 0)
+    # 50/0/50 G1/G2 singlets -> doublets 25 % at 2x, 50 % at 3x, 25 % at 4x
+    agg = aggregate_component(x, 1000.0, 500.0, 0.0, 500.0, 100.0, 4.0, 8.0, 2.0, width)
+    assert agg.sum() == pytest.approx(1000.0, rel=1e-3)
+    for centre, share in ((200, 0.25), (300, 0.50), (400, 0.25)):
+        near = np.abs(x - centre) < 40
+        assert agg[near].sum() / 1000.0 == pytest.approx(share, abs=0.01)
+        assert abs(x[near][np.argmax(agg[near])] - centre) <= 1
+    # G1+G1 width adds in quadrature: sqrt(2) * 4
+    near = np.abs(x - 200) < 40
+    sd = np.sqrt(np.average((x[near] - 200) ** 2, weights=agg[near]))
+    assert sd == pytest.approx(np.sqrt(2) * 4, rel=0.05)
+    assert not aggregate_component(x, 0.0, 1, 1, 1, 100, 4, 8, 2).any()
+
+
+# ------------------------------------------------------- proliferation g0
+NO_UNDIVIDED = np.array([0.0, 0.06, 0.30, 0.40, 0.24])
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_proliferation_generation0_from_control(seed):
+    """Strong stimulation leaves no undivided cells: the automatic choice
+    takes the brightest peak (generation 1) as generation 0, while the median
+    of an undivided control places the generations correctly."""
+    v = synth_proliferation(fractions=NO_UNDIVIDED, seed=seed)
+    control = synth_proliferation(n=5000, fractions=[1.0], seed=100 + seed)
+    g0 = np.log10(np.median(control))
+    truth = proliferation_indices(NO_UNDIVIDED)
+    auto = fit_proliferation(v)
+    assert abs(auto.division_index - truth["division_index"]) > 0.5  # off by a generation
+    for fix in (True, False):
+        r = fit_proliferation(v, g0_guess=g0, fix_g0=fix)
+        pct = np.zeros(10)
+        pct[: r.n_generations] = r.percents
+        assert np.all(np.abs(pct[:5] - 100 * NO_UNDIVIDED) < 3)
+        assert abs(r.division_index - truth["division_index"]) < 0.1
+        assert abs(r.percent_divided - 100) < 1.5
+        if fix:
+            assert r.positions[0] == pytest.approx(g0)
+    # held exactly where the control says, in display space too
+    scale = LogicleScale(T=262144.0)
+    pos = scale.forward_scalar(float(np.median(control)))
+    r = fit_proliferation(scale.forward(v), log=False, forward=scale.forward, inverse=scale.inverse, g0_guess=pos, fix_g0=True)
+    assert r.positions[0] == pytest.approx(pos)
+    assert abs(r.division_index - truth["division_index"]) < 0.1
+
+
+def test_proliferation_fixed_g0_beyond_the_data():
+    # a generation 0 above every event stays on the histogram and gets ~0 cells
+    v = synth_proliferation(fractions=NO_UNDIVIDED, seed=4)
+    r = fit_proliferation(v, g0_guess=np.log10(50000.0), fix_g0=True)
+    assert r.centers.max() >= np.log10(50000.0)
+    assert r.percents[0] < 1.0
+    # fix_g0 without a position is the automatic search
+    a = fit_proliferation(v, fix_g0=True)
+    b = fit_proliferation(v)
+    assert np.allclose(a.percents, b.percents)

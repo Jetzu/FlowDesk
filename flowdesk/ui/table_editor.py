@@ -34,11 +34,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core.fcs import FCSError
 from ..core.layouts import TableColumn, TableDef
 from ..core.model import Group, Workspace
 from ..core.stats import NEEDS_PARAM, STATISTICS, compute_statistic, format_value, statistic_label
 from .controller import POPULATION_MIME
 from .icons import icon
+from .layout_editor import SectionUndoRecorder
 
 UNGATED = "Ungated"
 
@@ -61,8 +63,11 @@ def cell_value(sample, col: TableColumn, decimals: int = 1) -> str:
     if pop is None:
         return ""
     try:
+        # a parameter the sample lacks (a computed tSNE/cluster parameter of
+        # other samples) gives NaN -> blank; an unreadable file or a stale
+        # computed array must not break the whole table either
         value = compute_statistic(col.statistic, pop, col.param, col.percentile)
-    except (ValueError, KeyError):
+    except (ValueError, KeyError, IndexError, FCSError):
         return ""
     return format_value(col.statistic, value, decimals)
 
@@ -395,6 +400,7 @@ class TableEditorWindow(QMainWindow):
 
         self._build_actions()
         self._build_ui()
+        self.undo_recorder = SectionUndoRecorder(controller, "tables", "edit table")
 
         c = controller
         c.tablesChanged.connect(self.refresh)
@@ -526,6 +532,7 @@ class TableEditorWindow(QMainWindow):
             t = TableDef(name="Table", group_name=self.controller.current_group.name)
             self.workspace.tables.append(t)
             self._current_id = t.id
+            self.undo_recorder.reset()  # the default table is the baseline, not an undoable edit
             self.controller.notify_tables()
 
     def showEvent(self, event):
@@ -537,6 +544,7 @@ class TableEditorWindow(QMainWindow):
         self.hide()
 
     def _on_workspace_replaced(self):
+        self.undo_recorder.reset()
         self._current_id = None
         for w in self.result_windows:
             w.close()
@@ -547,6 +555,9 @@ class TableEditorWindow(QMainWindow):
 
     # ------------------------------------------------------------- refresh
     def refresh(self):
+        # after our own edits the baseline is already current; after undo /
+        # redo or a change made elsewhere the model is the truth now
+        self.undo_recorder.reset()
         self._updating = True
         try:
             tables = self.workspace.tables
@@ -636,6 +647,7 @@ class TableEditorWindow(QMainWindow):
         return sorted({i.row() for i in self.columns.selectedIndexes()})
 
     def _commit(self, select_rows: list[int] | None = None):
+        self.undo_recorder.record()  # one undo step per edit
         self.controller.notify_tables()  # triggers refresh()
         if select_rows is not None:
             self._refresh_columns(select_rows)

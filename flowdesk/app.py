@@ -9,7 +9,7 @@ if __package__ in (None, ""):  # started as a plain script: ``python flowdesk/ap
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = "flowdesk"  # noqa: A001 - lets the relative imports below resolve
 
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
@@ -93,15 +93,48 @@ def main(argv: list[str] | None = None) -> int:
     window = MainWindow()
     window.show()
     for p in paths:
-        if not p.exists():
-            continue
-        if p.suffix.lower() in (".fdw", ".wsp"):
-            window._open_path(str(p))
-        elif p.suffix.lower() == ".fcs":
-            window.controller.add_samples([p])
-        elif p.is_dir():
-            window.controller.add_folder(p)
+        open_path_in_window(window, p)
+    # macOS delivers files opened by double-click / drag onto the Dock icon as
+    # QFileOpenEvent instead of command-line arguments (Finder, Launch Services)
+    file_filter = _FileOpenFilter(window)
+    app.installEventFilter(file_filter)
     return app.exec()
+
+
+WORKSPACE_SUFFIXES = (".fdw", ".wsp", ".fdwt", ".wspt")
+
+
+def open_path_in_window(window, p: Path) -> bool:
+    """Open a workspace / template, add an FCS file or a folder. Returns True if handled."""
+    p = Path(p)
+    if not p.exists():
+        return False
+    suffix = p.suffix.lower()
+    if suffix in WORKSPACE_SUFFIXES:
+        window._open_path(str(p))
+    elif suffix == ".fcs":
+        window.controller.add_samples([p])
+    elif p.is_dir():
+        window.controller.add_folder(p)
+    else:
+        return False
+    window.raise_()
+    window.activateWindow()
+    return True
+
+
+class _FileOpenFilter(QObject):
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+        if event.type() == QEvent.Type.FileOpen:
+            path = event.file()
+            if path:
+                open_path_in_window(self._window, Path(path))
+                return True
+        return super().eventFilter(obj, event)
 
 
 if __name__ == "__main__":

@@ -10,18 +10,51 @@ Pure numpy / scipy / scikit-learn computations (no Qt). The usual flow is
 results can be stored as computed parameters (NaN for events that were not
 part of the subsample).
 
-Optional dependencies: openTSNE (faster t-SNE; falls back to
-sklearn.manifold.TSNE) and umap-learn (required for UMAP).
+Clustering: k-means, FlowSOM (SOM + consensus metaclustering) and
+Phenograph (k-nearest-neighbour graph with Jaccard weights, partitioned by
+the Louvain modularity algorithm implemented here in numpy/scipy.sparse).
+
+Projection: results written with `write_result` keep what is needed to place
+the events of further samples on the same axes / clusters without
+recomputing (`computed_results`, `project_onto`). PCA, FlowSOM and k-means
+store their model in the parameter's `computed_info["model"]` (saved with the
+workspace, so projection always works). t-SNE (openTSNE) and UMAP keep the
+fitted embedding object in a per-workspace in-memory registry, so they can be
+projected only within the session that computed them.
+
+Optional dependencies: openTSNE (faster t-SNE that can also embed new events;
+falls back to sklearn.manifold.TSNE) and umap-learn (required for UMAP).
 """
 from __future__ import annotations
 
 import importlib.util
+import uuid
+import warnings
+import weakref
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Callable, NamedTuple, Sequence
 
 import numpy as np
 
 IndexEntry = tuple[int, np.ndarray]  # (sample id, event row indices)
+ProgressFn = Callable[[str], None]
 
+
+class Cancelled(Exception):
+    """Raised by long computations when their `should_cancel()` returns True."""
+
+
+def _check_cancel(should_cancel) -> None:
+    if should_cancel is not None and should_cancel():
+        raise Cancelled()
+
+
+def _floats(a) -> list:
+    """Nested lists of floats rounded to 10 significant digits (compact JSON)."""
+    arr = np.asarray(a, dtype=np.float64)
+    flat = np.array([float(f"{v:.10g}") for v in arr.ravel()], dtype=np.float64)
+    return flat.reshape(arr.shape).tolist()
 
 # --------------------------------------------------------------- availability
 def has_module(name: str) -> bool:
@@ -99,16 +132,26 @@ def index_size(index: list[IndexEntry]) -> int:
 
 
 # ---------------------------------------------------------------- embeddings
-def run_pca(X: np.ndarray, n_components: int = 2) -> np.ndarray:
-    """Principal component scores (via SVD of the centred matrix)."""
+def fit_pca(X: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, dict]:
+    """Principal component scores (as `run_pca`) and a JSON-friendly model
+    {"kind": "pca", "mean", "components"} with scores = (X - mean) @ components.T,
+    which places new rows on the same components (`apply_model`)."""
     X = np.asarray(X, dtype=np.float64)
     n_components = max(1, min(n_components, X.shape[1], X.shape[0]))
-    centred = X - X.mean(axis=0)
+    mean = X.mean(axis=0)
+    centred = X - mean
     u, s, vt = np.linalg.svd(centred, full_matrices=False)
     # deterministic sign: largest loading of each component positive
     signs = np.sign(vt[np.arange(vt.shape[0]), np.argmax(np.abs(vt), axis=1)])
     signs[signs == 0] = 1
-    return (u[:, :n_components] * s[:n_components]) * signs[:n_components]
+    scores = (u[:, :n_components] * s[:n_components]) * signs[:n_components]
+    components = vt[:n_components] * signs[:n_components, None]
+    return scores, {"kind": "pca", "mean": _floats(mean), "components": _floats(components)}
+
+
+def run_pca(X: np.ndarray, n_components: int = 2) -> np.ndarray:
+    """Principal component scores (via SVD of the centred matrix)."""
+    return fit_pca(X, n_components)[0]
 
 
 def pca_explained_variance(X: np.ndarray, n_components: int = 2) -> np.ndarray:
@@ -121,6 +164,13 @@ def pca_explained_variance(X: np.ndarray, n_components: int = 2) -> np.ndarray:
 
 def run_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed: int = 0) -> np.ndarray:
     """2-D t-SNE embedding (openTSNE when installed, else scikit-learn)."""
+    return fit_tsne(X, perplexity, iterations, seed)[0]
+
+
+def fit_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed: int = 0) -> tuple[np.ndarray, object | None]:
+    """(embedding, fitted model). The model is openTSNE's TSNEEmbedding, whose
+    `transform` places new events in the existing map; None with the
+    scikit-learn engine, which cannot embed new events."""
     X = np.asarray(X, dtype=np.float64)
     n = X.shape[0]
     if n < 5:
@@ -131,7 +181,7 @@ def run_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed:
         from openTSNE import TSNE
 
         emb = TSNE(n_components=2, perplexity=perplexity, n_iter=iterations, random_state=seed, n_jobs=-1, verbose=False).fit(X)
-        return np.asarray(emb, dtype=np.float64)
+        return np.asarray(emb, dtype=np.float64), emb
     try:
         from sklearn.manifold import TSNE
     except ImportError as exc:  # pragma: no cover
@@ -141,23 +191,26 @@ def run_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed:
         model = TSNE(max_iter=iterations, **kwargs)
     except TypeError:  # scikit-learn < 1.5
         model = TSNE(n_iter=iterations, **kwargs)
-    return np.asarray(model.fit_transform(X), dtype=np.float64)
+    return np.asarray(model.fit_transform(X), dtype=np.float64), None
 
 
 def run_umap(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1, seed: int = 0) -> np.ndarray:
     """2-D UMAP embedding (requires umap-learn)."""
+    return fit_umap(X, n_neighbors, min_dist, seed)[0]
+
+
+def fit_umap(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1, seed: int = 0) -> tuple[np.ndarray, object]:
+    """(embedding, fitted umap.UMAP); the model's `transform` places new events."""
     if not has_umap():
         raise ImportError("UMAP requires the optional package umap-learn (pip install umap-learn, or pip install 'flowdesk[analysis]')")
     import umap
 
     X = np.asarray(X, dtype=np.float64)
     n_neighbors = int(max(2, min(n_neighbors, X.shape[0] - 1)))
-    import warnings
-
     model = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=float(min_dist), random_state=seed)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*n_jobs.*", category=UserWarning)
-        return np.asarray(model.fit_transform(X), dtype=np.float64)
+        return np.asarray(model.fit_transform(X), dtype=np.float64), model
 
 
 # ---------------------------------------------------------------- clustering
@@ -314,6 +367,209 @@ def run_flowsom(X: np.ndarray, grid: tuple[int, int] = (10, 10), n_metaclusters:
     for new, old in enumerate(order, start=1):
         mapping[old] = new
     return mapping[event_meta], codes, mapping[meta]
+
+
+def flowsom_model(codes: np.ndarray, metacluster_of_node: np.ndarray) -> dict:
+    """JSON-friendly FlowSOM model: an event belongs to the metacluster of its
+    nearest SOM node (`apply_model`)."""
+    return {"kind": "flowsom", "som_codes": _floats(codes), "metacluster_of_node": [int(m) for m in np.asarray(metacluster_of_node).ravel()]}
+
+
+def kmeans_model(X: np.ndarray, labels: np.ndarray) -> dict:
+    """JSON-friendly k-means model: the centre (mean) of each cluster id 1..k;
+    new events go to the nearest centre."""
+    X = np.asarray(X, dtype=np.float64)
+    labels = np.asarray(labels).astype(np.int64)
+    k = int(labels.max()) if labels.size else 0
+    centres = np.zeros((k, X.shape[1]))
+    for j in range(1, k + 1):
+        sel = labels == j
+        # an id without events (not produced by run_kmeans) is put far away
+        centres[j - 1] = X[sel].mean(axis=0) if sel.any() else 1e6
+    return {"kind": "kmeans", "centres": _floats(centres)}
+
+
+def apply_model(model: dict, X: np.ndarray) -> np.ndarray:
+    """Values (n x outputs) of a stored PCA / FlowSOM / k-means model for the
+    display-space rows of X (columns in the order of the model's parameters)."""
+    X = np.asarray(X, dtype=np.float64)
+    kind = model.get("kind")
+    if kind == "pca":
+        mean = np.asarray(model["mean"], dtype=np.float64)
+        comps = np.atleast_2d(np.asarray(model["components"], dtype=np.float64))
+        if comps.shape[1] != X.shape[1]:
+            raise ValueError(f"the PCA model has {comps.shape[1]} parameters, the data {X.shape[1]}")
+        return (X - mean) @ comps.T
+    if kind == "flowsom":
+        codes = np.asarray(model["som_codes"], dtype=np.float64)
+        meta = np.asarray(model["metacluster_of_node"], dtype=np.int64)
+        if codes.shape[1] != X.shape[1]:
+            raise ValueError(f"the FlowSOM model has {codes.shape[1]} parameters, the data {X.shape[1]}")
+        return meta[_sq_dist_argmin(X, codes)].astype(np.float64)[:, None]
+    if kind == "kmeans":
+        centres = np.asarray(model["centres"], dtype=np.float64)
+        if centres.shape[1] != X.shape[1]:
+            raise ValueError(f"the k-means model has {centres.shape[1]} parameters, the data {X.shape[1]}")
+        return (_sq_dist_argmin(X, centres) + 1).astype(np.float64)[:, None]
+    raise ValueError(f"cannot apply a model of kind {kind!r}")
+
+
+# ---------------------------------------------------------------- phenograph
+def knn_jaccard_graph(X: np.ndarray, k: int = 30):
+    """Phenograph graph: each event is linked to its k nearest neighbours
+    (Euclidean, itself excluded) with weight |N(i) ∩ N(j)| / |N(i) ∪ N(j)|
+    (Jaccard index of the two neighbour sets); the directed graph is
+    symmetrised as (W + Wᵀ) / 2. Returns a scipy.sparse CSR matrix."""
+    import scipy.sparse as sp
+    from sklearn.neighbors import NearestNeighbors
+
+    X = np.asarray(X, dtype=np.float64)
+    n = X.shape[0]
+    if n < 2:
+        return sp.csr_matrix((n, n))
+    k = int(max(1, min(k, n - 1)))
+    _, idx = NearestNeighbors(n_neighbors=k + 1).fit(X).kneighbors(X)
+    # drop each event itself (with duplicate events it need not come first)
+    own = idx == np.arange(n)[:, None]
+    keep = ~own
+    keep[~own.any(axis=1), -1] = False
+    idx = idx[keep].reshape(n, k)
+    # shared-neighbour counts of every edge i -> j: mark N(i) in a boolean
+    # row, then gather the marks at N(j); chunks keep the mask at ~20 MB
+    shared = np.empty((n, k), dtype=np.float64)
+    chunk = max(1, min(n, int(2e7 // n)))
+    mark = np.zeros((chunk, n), dtype=bool)
+    for start in range(0, n, chunk):
+        stop = min(n, start + chunk)
+        rows = np.arange(stop - start)[:, None]
+        nb = idx[start:stop]
+        mark[rows, nb] = True
+        shared[start:stop] = mark[rows[:, :, None], idx[nb]].sum(axis=2)
+        mark[rows, nb] = False
+    weights = shared / (2.0 * k - shared)
+    W = sp.csr_matrix((weights.ravel(), (np.repeat(np.arange(n), k), idx.ravel())), shape=(n, n))
+    W = ((W + W.T) * 0.5).tocsr()
+    W.eliminate_zeros()
+    return W
+
+
+def _louvain_local_moving(W, resolution: float, rng) -> tuple[np.ndarray, int]:
+    """One Louvain level: starting from singletons, move nodes to the
+    neighbouring community with the largest modularity gain until no move
+    improves modularity. Nodes are visited in random order from a queue; a
+    node is re-queued when a neighbour leaves for another community (the
+    "fast local moving" bookkeeping, equivalent to repeated full sweeps).
+    Returns (community per node, number of moves)."""
+    n = W.shape[0]
+    indptr = W.indptr.tolist()
+    indices = W.indices.tolist()
+    data = W.data.tolist()
+    degree_arr = np.asarray(W.sum(axis=1), dtype=np.float64).ravel()
+    m2 = float(degree_arr.sum())  # 2m
+    comm = list(range(n))
+    if m2 <= 0:
+        return np.asarray(comm, dtype=np.int64), 0
+    degree = degree_arr.tolist()
+    tot = list(degree)  # total degree of each community
+    queue = deque(rng.permutation(n).tolist())
+    queued = [True] * n
+    moves = 0
+    budget = 200 * n + 1000  # safety net; convergence needs far fewer visits
+    while queue and budget > 0:
+        budget -= 1
+        i = queue.popleft()
+        queued[i] = False
+        ki = degree[i]
+        if ki <= 0:
+            continue
+        ci = comm[i]
+        links: dict[int, float] = {}
+        for p in range(indptr[i], indptr[i + 1]):
+            j = indices[p]
+            if j != i:
+                c = comm[j]
+                links[c] = links.get(c, 0.0) + data[p]
+        tot[ci] -= ki
+        # gain of joining c (times m): k_i,c - resolution * tot_c * k_i / 2m
+        f = resolution * ki / m2
+        best, best_gain = ci, links.get(ci, 0.0) - f * tot[ci]
+        tol = 1e-12 * ki
+        for c, w in links.items():
+            gain = w - f * tot[c]
+            if gain > best_gain + tol:
+                best, best_gain = c, gain
+        tot[best] += ki
+        if best != ci:
+            comm[i] = best
+            moves += 1
+            for p in range(indptr[i], indptr[i + 1]):
+                j = indices[p]
+                if not queued[j] and comm[j] != best:
+                    queued[j] = True
+                    queue.append(j)
+    return np.asarray(comm, dtype=np.int64), moves
+
+
+def louvain(W, resolution: float = 1.0, seed: int = 0) -> np.ndarray:
+    """Louvain community detection on a weighted undirected graph.
+
+    `W` is a (scipy.sparse or dense) non-negative adjacency matrix; it is
+    symmetrised as (W + Wᵀ) / 2. Alternates the local moving phase with the
+    aggregation of each community into one node (W' = Pᵀ W P, internal weight
+    kept as a self-loop) until a level moves no node. The modularity
+    Q = 1/2m Σ (A_ij − γ k_i k_j / 2m) δ(c_i, c_j) uses the resolution γ;
+    lower values give fewer, larger communities. Deterministic for a given
+    seed (which only sets the node visiting order). Returns community ids
+    1..m numbered by decreasing size.
+    """
+    import scipy.sparse as sp
+
+    W = sp.csr_matrix(W, dtype=np.float64)
+    n = W.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.int64)
+    W = ((W + W.T) * 0.5).tocsr()
+    W.sum_duplicates()
+    rng = np.random.default_rng(seed)
+    labels = np.arange(n)
+    for _level in range(100):
+        comm, moves = _louvain_local_moving(W, float(resolution), rng)
+        uniq, comm = np.unique(comm, return_inverse=True)
+        if moves == 0 or len(uniq) == W.shape[0]:
+            break
+        labels = comm[labels]
+        P = sp.csr_matrix((np.ones(W.shape[0]), (np.arange(W.shape[0]), comm)), shape=(W.shape[0], len(uniq)))
+        W = (P.T @ W @ P).tocsr()
+    return _renumber(labels)
+
+
+def modularity(W, labels, resolution: float = 1.0) -> float:
+    """Newman modularity of a partition (see `louvain`)."""
+    import scipy.sparse as sp
+
+    W = sp.csr_matrix(W, dtype=np.float64)
+    W = ((W + W.T) * 0.5).tocoo()
+    labels = np.asarray(labels)
+    _, labels = np.unique(labels, return_inverse=True)
+    deg = np.bincount(W.row, weights=W.data, minlength=W.shape[0])
+    m2 = float(deg.sum())
+    if m2 <= 0:
+        return 0.0
+    inside = float(W.data[labels[W.row] == labels[W.col]].sum())
+    tot = np.bincount(labels, weights=deg)
+    return inside / m2 - float(resolution) * float((tot**2).sum()) / (m2 * m2)
+
+
+def run_phenograph(X: np.ndarray, k: int = 30, seed: int = 0, resolution: float = 1.0) -> np.ndarray:
+    """Phenograph clustering (Levine et al. 2015): Louvain communities of the
+    Jaccard-weighted k-nearest-neighbour graph. Cluster ids 1..m, largest
+    first. Modularity tends to split compact Gaussian-like populations into
+    several communities at resolution 1; lower the resolution for coarser
+    clusters."""
+    X = np.asarray(X, dtype=np.float64)
+    if X.shape[0] < 3:
+        return np.ones(X.shape[0], dtype=np.int64)
+    return louvain(knn_jaccard_graph(X, k), resolution, seed)
 
 
 def cluster_medians(values: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -505,4 +761,305 @@ def unique_names(workspace, bases: Sequence[str]) -> list[str]:
     return [variant(b, n) for b in bases]
 
 
-ProgressFn = Callable[[str], None]
+# ----------------------------------------------------- stored results / projection
+_KIND_BY_TOOL = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap", "FlowSOM": "flowsom", "k-means": "kmeans", "Phenograph": "phenograph"}
+MODEL_KINDS = ("pca", "flowsom", "kmeans")  # projectable from the saved model
+SESSION_KINDS = ("tsne", "umap")  # projectable only with the in-memory model
+CLUSTER_KINDS = ("flowsom", "kmeans", "phenograph")
+
+# Fitted t-SNE (openTSNE) / UMAP objects cannot be serialised cheaply, so they
+# live here for the lifetime of the workspace object only:
+# workspace -> {parameter name: (run id, fitted model)}.
+_SESSION_MODELS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _session_store(workspace, create: bool = False):
+    try:
+        if create:
+            return _SESSION_MODELS.setdefault(workspace, {})
+        return _SESSION_MODELS.get(workspace)
+    except TypeError:  # not weak-referenceable
+        return None
+
+
+def register_session_model(workspace, names: Sequence[str], run_id: str, model) -> None:
+    """Keep a fitted embedding (an object with `transform`) for the computed
+    parameters `names` of `workspace`, for this session only."""
+    store = _session_store(workspace, create=True)
+    if store is None:
+        return
+    alive = set(names)
+    for s in workspace.samples:
+        alive.update(s.computed.keys())
+    for stale in [n for n in store if n not in alive]:
+        del store[stale]
+    for n in names:
+        store[n] = (run_id, model)
+
+
+def session_model(workspace, name: str):
+    """The in-memory fitted model of computed parameter `name`, or None (other
+    session, workspace reloaded, or the parameter was recomputed)."""
+    store = _session_store(workspace)
+    entry = store.get(name) if store else None
+    if entry is None:
+        return None
+    run_id, model = entry
+    for s in workspace.samples:
+        if name in s.computed:
+            info = s.computed_info.get(name) or {}
+            return model if info.get("run") == run_id else None
+    return None
+
+
+def write_result(workspace, index: list[IndexEntry], columns: dict, info: dict | None = None, model: dict | None = None, session=None) -> list:
+    """`write_back` plus what projection needs.
+
+    All `columns` share a run id (they are one result, e.g. tSNE_1 / tSNE_2)
+    stored with the output names in every parameter's computed_info. `model`
+    is a JSON-friendly dict (see fit_pca / flowsom_model / kmeans_model) saved
+    as computed_info["model"] together with the input parameters; `session`
+    is an unserialisable fitted object (openTSNE embedding, umap.UMAP) kept in
+    memory for this workspace. Returns the samples written."""
+    info = dict(info or {})
+    run_id = uuid.uuid4().hex[:12]
+    info["run"] = run_id
+    info["outputs"] = list(columns)
+    if model is not None:
+        model = dict(model)
+        if info.get("parameters"):
+            model.setdefault("parameters", list(info["parameters"]))
+        info["model"] = model
+    touched = write_back(workspace, index, columns, info)
+    if session is not None:
+        register_session_model(workspace, list(columns), run_id, session)
+    return touched
+
+
+@dataclass
+class ComputedResult:
+    """One run of a tool: its output parameters and where they exist."""
+
+    key: str
+    tool: str
+    kind: str
+    outputs: list[str]
+    parameters: list[str]  # input parameters (display space)
+    samples: list  # samples carrying the result (analysed or projected)
+    missing: list  # samples without it that have the input parameters
+    populations: list[str]  # population paths the tool analysed
+    info: dict
+    source: object  # a sample the tool was run on
+    projectable: bool = False
+    reason: str = ""  # why it cannot be projected
+
+    @property
+    def label(self) -> str:
+        return f"{self.tool}: {' / '.join(self.outputs)}"
+
+    @property
+    def is_clustering(self) -> bool:
+        return self.kind in CLUSTER_KINDS
+
+
+def _has_parameters(sample, params: Sequence[str]) -> bool:
+    if not params:
+        return False
+    available = set(sample.parameter_names())
+    return all(p in available for p in params)
+
+
+def _projectable(workspace, r: ComputedResult) -> tuple[bool, str]:
+    if not r.parameters:
+        return False, "the input parameters of this result were not recorded"
+    model = r.info.get("model") or {}
+    if r.kind in MODEL_KINDS:
+        if model.get("kind") == r.kind:
+            return True, ""
+        return False, f"this {r.tool} result has no stored model (older or imported workspace); re-run {r.tool} to enable projection"
+    if r.kind in SESSION_KINDS:
+        obj = session_model(workspace, r.outputs[0])
+        if obj is not None and hasattr(obj, "transform"):
+            return True, ""
+        if r.kind == "tsne" and model.get("engine") == "scikit-learn":
+            return False, "scikit-learn's t-SNE cannot place new events; install openTSNE and re-run t-SNE"
+        return False, f"{r.tool} results can be projected only in the session that computed them (the fitted embedding is not saved with the workspace); re-run {r.tool} including the new samples"
+    if r.kind == "phenograph":
+        return False, "Phenograph clusters are communities of the k-nearest-neighbour graph of the analysed events and cannot be extended to new events; re-run Phenograph including the new samples"
+    return False, "this result cannot be projected"
+
+
+def computed_results(workspace) -> list[ComputedResult]:
+    """The computed results of a workspace, one entry per run (parameters
+    written together, e.g. tSNE_1 and tSNE_2), with the samples that carry
+    them, the samples that lack them and whether they can be projected.
+    Parameters written without a run id (older workspaces, imports) are
+    grouped by tool and name stem."""
+    groups: dict[str, dict] = {}
+    for s in workspace.samples:
+        for name in s.computed:
+            info = s.computed_info.get(name) or {}
+            run = info.get("run")
+            if run:
+                key = f"run:{run}"
+            else:
+                stem, sep, tail = name.rpartition("_")
+                key = f"legacy:{info.get('tool', '')}:{stem if sep and tail.isdigit() else name}"
+            g = groups.get(key)
+            if g is None:
+                outputs = [str(o) for o in info.get("outputs") or []] if run else []
+                g = groups[key] = {"info": info, "source": s, "outputs": outputs, "samples": []}
+            if name not in g["outputs"] and not (run and info.get("outputs")):
+                g["outputs"].append(name)
+            if not any(x is s for x in g["samples"]):
+                g["samples"].append(s)
+            if g["info"].get("projected") and not info.get("projected"):
+                g["info"], g["source"] = info, s  # prefer an analysed sample
+    results = []
+    for key, g in groups.items():
+        info = g["info"]
+        model = info.get("model") or {}
+        tool = str(info.get("tool") or g["outputs"][0])
+        kind = str(model.get("kind") or _KIND_BY_TOOL.get(tool, ""))
+        params = [str(p) for p in info.get("parameters") or model.get("parameters") or []]
+        have = {id(s) for s in g["samples"]}
+        missing = [s for s in workspace.samples if id(s) not in have and _has_parameters(s, params)]
+        pops = [str(p) for p in info.get("populations") or []]
+        r = ComputedResult(key, tool, kind, list(g["outputs"]), params, list(g["samples"]), missing, pops, info, g["source"])
+        r.projectable, r.reason = _projectable(workspace, r)
+        results.append(r)
+    return results
+
+
+def find_result(workspace, param_name: str) -> ComputedResult | None:
+    """The result one of whose outputs is `param_name`."""
+    for r in computed_results(workspace):
+        if param_name in r.outputs:
+            return r
+    return None
+
+
+@dataclass
+class Projection:
+    """Projected values of new samples, ready for `apply_projection`."""
+
+    result: ComputedResult
+    targets: list
+    population_path: str
+    index: list
+    columns: dict
+    info: dict
+    cluster_ids: list[int] = field(default_factory=list)
+    created: list[str] = field(default_factory=list)  # cluster populations
+
+    @property
+    def outputs(self) -> list[str]:
+        return list(self.columns)
+
+
+def compute_projection(workspace, source_param_name: str, target_samples, max_events: int | None = None, seed: int = 0, population_path: str | None = None, progress: ProgressFn | None = None, should_cancel=None) -> Projection:
+    """Place the events of `target_samples` on an existing result (no changes
+    to the workspace; see apply_projection).
+
+    PCA: the stored mean and components; FlowSOM: nearest stored SOM node and
+    its metacluster; k-means: nearest stored centre; t-SNE / UMAP: the fitted
+    embedding's `transform` (this session only). The input is the targets'
+    display-space values of the result's parameters in `population_path`
+    (default: the population the result was computed on when unique, else
+    Ungated), subsampled to `max_events` per sample. Samples the tool was run
+    on are skipped."""
+    result = find_result(workspace, source_param_name)
+    if result is None:
+        raise ValueError(f"no sample has the computed parameter {source_param_name}")
+    if not result.projectable:
+        raise ValueError(result.reason)
+    analysed = {id(s) for s in result.samples if not (s.computed_info.get(result.outputs[0]) or {}).get("projected")}
+    targets = [s for s in target_samples if id(s) not in analysed]
+    if not targets:
+        raise ValueError("choose samples that were not part of the original analysis")
+    if population_path is None:
+        paths = list(dict.fromkeys(result.populations))
+        population_path = paths[0] if len(paths) == 1 else ""
+    population_path = population_path or ""
+    lacking = [s.name for s in targets if s.root.find(population_path) is None]
+    if lacking:
+        raise ValueError(f"{', '.join(lacking)}: no population {population_path}")
+    if progress:
+        progress("Collecting events…")
+    X, index = prepare_matrix(targets, population_path, result.parameters, max_events, seed)
+    _check_cancel(should_cancel)
+    if progress:
+        progress(f"Projecting {X.shape[0]:,} events onto {result.label}…")
+    model = result.info.get("model") or {}
+    if result.kind in MODEL_KINDS:
+        Y = apply_model(model, X)
+    else:
+        obj = session_model(workspace, result.outputs[0])
+        if obj is None:
+            raise ValueError(f"the fitted {result.tool} model is no longer available")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            Y = np.asarray(obj.transform(X), dtype=np.float64)
+    _check_cancel(should_cancel)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    if Y.shape[0] != X.shape[0] or Y.shape[1] < len(result.outputs):
+        raise ValueError(f"the {result.tool} model returned {Y.shape} values for {X.shape[0]} events")
+    columns = {name: Y[:, j] for j, name in enumerate(result.outputs)}
+    info = dict(result.info)
+    info.update(projected=True, projected_from=getattr(result.source, "name", ""), events=index_size(index), population=population_path)
+    ids: list[int] = []
+    if result.kind == "flowsom":
+        ids = sorted({int(m) for m in model["metacluster_of_node"]})
+    elif result.kind == "kmeans":
+        ids = list(range(1, len(model["centres"]) + 1))
+    return Projection(result, targets, population_path, index, columns, info, ids)
+
+
+def apply_projection(workspace, projection: Projection) -> list:
+    """Store a projection: the parameters on the target samples (same names,
+    same run, the source sample's axis scales) and, for clusterings, the
+    cluster populations "<param> <k>" under the projected population (an
+    existing population of that name gets the gate and keeps its children).
+    Returns the samples written."""
+    from .gates import RectangleGate
+    from .model import Population
+
+    result = projection.result
+    touched = write_back(workspace, projection.index, projection.columns, projection.info)
+    source = result.source
+    for name in projection.columns:
+        if source is not None and name in getattr(source, "computed", {}):
+            scale = source.scale(name)
+            for t in touched:
+                t.set_scale(name, scale.copy())
+    created: list[str] = []
+    if projection.cluster_ids:
+        param = result.outputs[0]
+        created = [f"{param} {k}" for k in projection.cluster_ids]
+        for t in touched:
+            parent = t.root.find(projection.population_path)
+            if parent is None:
+                continue
+            for k, name in zip(projection.cluster_ids, created):
+                gate = RectangleGate([param], [k - 0.5], [k + 0.5])
+                pop = parent.child_by_name(name)
+                if pop is None:
+                    parent.add_child(Population(name, gate))
+                else:
+                    pop.gate = gate
+                    pop.invalidate()
+    projection.created = created
+    workspace.modified = True
+    return touched
+
+
+def project_onto(workspace, source_param_name: str, target_samples, max_events: int | None = None, seed: int = 0, population_path: str | None = None) -> Projection:
+    """Project `target_samples` onto the existing result that produced
+    `source_param_name` and store the projected parameters (and cluster
+    populations) on them. PCA, FlowSOM and k-means results can always be
+    projected (their model is saved with the workspace); t-SNE (openTSNE) and
+    UMAP only within the session that computed them."""
+    projection = compute_projection(workspace, source_param_name, target_samples, max_events, seed, population_path)
+    apply_projection(workspace, projection)
+    return projection
