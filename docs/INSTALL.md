@@ -8,6 +8,7 @@ either **download a built app** (no Python needed) or **run it from source**.
 - [Linux from source](#linux)
 - [macOS from source](#macos)
 - [Building the standalone app yourself](#building-the-standalone-app-yourself)
+- [File associations](#file-associations)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -144,16 +145,80 @@ missing; `QT_DEBUG_PLUGINS=1 ./flowdesk.sh` names it.
 On the platform you want to build for (PyInstaller does not cross-compile):
 
 ```bash
-python -m pip install -e ".[packaging]"     # or let build.py install PyInstaller
+python -m pip install -e ".[packaging,analysis]"   # or let build.py install PyInstaller
 python packaging/build.py --zip
 ```
 
 Output: `dist/FlowDesk.app` (macOS), `dist/FlowDesk/FlowDesk.exe` (Windows),
-`dist/FlowDesk/FlowDesk` (Linux), plus `dist/FlowDesk-<os>.zip`. The macOS build is
-about 130 MB. `packaging/make_icons.py` regenerates `icon.png`/`.ico`/`.icns` from the
+`dist/FlowDesk/FlowDesk` (Linux), plus `dist/FlowDesk-<os>.zip`. The app bundles
+scikit-learn (k-means, the PhenoGraph kNN graph, the fallback t-SNE) and, when the
+`analysis` extra is installed, openTSNE and UMAP (with numba / pynndescent); without the
+extra those are left out. The macOS build with the extra is about 290 MB. After
+building, `build.py` runs k-means, FlowSOM, the kNN graph and, when installed, t-SNE and
+UMAP inside the frozen app, and checks that the macOS bundle declares every file type
+FlowDesk opens; it fails if a library is missing from the bundle (`--no-check` skips the
+analysis run, `--check-only` re-runs the checks on an existing `dist/`).
+`packaging/make_icons.py` regenerates `icon.png`/`.ico`/`.icns` from the
 built-in artwork (the `.icns` needs macOS' `iconutil`). Pushing a tag `v*` runs
 `.github/workflows/release.yml`, which builds all three and attaches the zips to the
 GitHub release.
+
+---
+
+## File associations
+
+FlowDesk opens workspaces (`.fdw`, FlowJo `.wsp`), workspace templates (`.fdwt`,
+FlowJo `.wspt`, applied to the samples of the open workspace) and FCS files (`.fcs`,
+added to the workspace), given on the command line or opened from the file manager.
+
+- **macOS:** the built `FlowDesk.app` declares all five types. Double-click a `.fdw`
+  or `.fdwt` file, or drag any of them onto the app or its Dock icon. For `.fcs`,
+  `.wsp` and `.wspt`, FlowDesk is an alternative handler: right-click → *Open With* →
+  FlowDesk (or *Get Info* → *Open with* → *Change All…* to make it the default).
+- **Windows:** right-click a file → *Open with* → *Choose another app* → *More apps* →
+  *Look for another app on this PC*, pick `FlowDesk.exe` (or `flowdesk-gui.exe` in the
+  source checkout's `.venv\Scripts`) and tick *Always use this app*.
+- **Linux:** `packaging/flowdesk.desktop` lists the MIME types below; the desktop needs
+  their definitions once per user, then the menu entry:
+
+  ```bash
+  mkdir -p ~/.local/share/mime/packages
+  cat > ~/.local/share/mime/packages/flowdesk.xml <<'XML'
+  <?xml version="1.0" encoding="UTF-8"?>
+  <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+    <mime-type type="application/x-flowdesk-workspace">
+      <comment>FlowDesk workspace</comment>
+      <sub-class-of type="application/json"/>
+      <glob pattern="*.fdw"/>
+    </mime-type>
+    <mime-type type="application/x-flowdesk-template">
+      <comment>FlowDesk workspace template</comment>
+      <sub-class-of type="application/json"/>
+      <glob pattern="*.fdwt"/>
+    </mime-type>
+    <mime-type type="application/x-flowjo-workspace">
+      <comment>FlowJo workspace</comment>
+      <sub-class-of type="application/xml"/>
+      <glob pattern="*.wsp"/>
+    </mime-type>
+    <mime-type type="application/x-flowjo-template">
+      <comment>FlowJo workspace template</comment>
+      <sub-class-of type="application/xml"/>
+      <glob pattern="*.wspt"/>
+    </mime-type>
+    <mime-type type="application/vnd.isac.fcs">
+      <comment>Flow Cytometry Standard data file</comment>
+      <glob pattern="*.fcs"/>
+    </mime-type>
+  </mime-info>
+  XML
+  update-mime-database ~/.local/share/mime
+  packaging/install_linux_desktop.sh [/path/to/FlowDesk/FlowDesk]
+  xdg-mime default flowdesk.desktop application/x-flowdesk-workspace application/x-flowdesk-template
+  ```
+
+  The last line makes FlowDesk the default for its own workspaces and templates;
+  `.fcs`, `.wsp` and `.wspt` offer it under *Open With*.
 
 ---
 

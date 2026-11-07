@@ -123,11 +123,44 @@ def apply_cytometer_defaults(workspace, sample) -> int:
     return n
 
 
+def _planned_scales(samples: list, specs: dict[str, dict]) -> list[tuple[list, str, Scale]]:
+    """(samples, parameter, scale) for every scale that applying `specs` writes."""
+    plan = []
+    for param, spec in specs.items():
+        holders = [s for s in samples if param in s.channel_names]
+        if not holders:
+            continue
+        top = max(_top(s, param) for s in holders)
+        scale = scale_from_spec(spec, top)
+        plan.append((holders, param, scale))
+        comp_names: dict[str, list] = {}
+        for s in holders:
+            for cn in _comp_names_for(s, param):
+                comp_names.setdefault(cn, []).append(s)
+        for cn, owners in comp_names.items():
+            plan.append((owners, cn, scale))
+    return plan
+
+
+def cytometer_settings_would_change(workspace, cytometer: str, specs: dict[str, dict]) -> bool:
+    """False when applying `specs` to `cytometer` changes nothing: the stored
+    defaults are the same and every sample already has exactly these scales."""
+    new = {p: dict(sp) for p, sp in specs.items()}
+    if (workspace.settings.get(SETTINGS_KEY) or {}).get(cytometer) != new:
+        return True
+    samples = group_by_cytometer(workspace).get(cytometer, [])
+    return any(s.scales.get(name) != scale for owners, name, scale in _planned_scales(samples, specs) for s in owners)
+
+
 def apply_cytometer_settings(controller, cytometer: str, specs: dict[str, dict]) -> list:
     """Write `specs` ({param: spec}) to every sample of `cytometer` as one undo step
-    and store them as that cytometer's defaults. Returns the affected samples."""
+    and store them as that cytometer's defaults. Returns the affected samples
+    (none, and no undo step, when nothing would change)."""
     ws = controller.workspace
+    if not cytometer_settings_would_change(ws, cytometer, specs):
+        return []
     samples = group_by_cytometer(ws).get(cytometer, [])
+    plan = _planned_scales(samples, specs)
     # one undo step for the stored defaults and every scale written (the
     # set_scale calls inside the group push no step of their own)
     with controller.undo_group(f"cytometer settings ({cytometer})", "settings"):
@@ -135,19 +168,8 @@ def apply_cytometer_settings(controller, cytometer: str, specs: dict[str, dict])
         if not samples:
             controller.mark_modified()
             return []
-        for param, spec in specs.items():
-            holders = [s for s in samples if param in s.channel_names]
-            if not holders:
-                continue
-            top = max(_top(s, param) for s in holders)
-            scale = scale_from_spec(spec, top)
-            controller.set_scale(holders, param, scale)
-            comp_names: dict[str, list] = {}
-            for s in holders:
-                for cn in _comp_names_for(s, param):
-                    comp_names.setdefault(cn, []).append(s)
-            for cn, owners in comp_names.items():
-                controller.set_scale(owners, cn, scale)
+        for owners, name, scale in plan:
+            controller.set_scale(owners, name, scale)
     return samples
 
 
@@ -318,8 +340,9 @@ class CytometerDialog(QDialog):
     def apply(self):
         """Apply every cytometer viewed in this dialog (the current one first)."""
         order = [c for c in [self._current] + [c for c in self._specs if c != self._current] if c is not None]
+        order = [c for c in order if cytometer_settings_would_change(self.controller.workspace, c, self.specs(c))]
         if not order:
-            return
+            return  # nothing changed: no empty undo step
         label = f"cytometer settings ({order[0]})" if len(order) == 1 else "cytometer settings"
         with self.controller.undo_group(label, "settings"):  # one undo step for all
             for cyt in order:

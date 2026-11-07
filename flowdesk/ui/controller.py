@@ -193,7 +193,11 @@ class WorkspaceController(QObject):
         sections they touch: "samples" (sample list and order, names,
         keywords), "matrices", "settings", "layouts", "tables" (one name or a
         tuple). Inside `undo_group` a call adds no step of its own; it only
-        widens the open step when it needs more sections."""
+        widens the open step when it needs more sections. The widened
+        sections are read from the present state, so call it before changing
+        them; code that has already changed a section (an editor announcing
+        an in-place edit) writes its own earlier state into
+        undo_top_snapshot() instead, see SectionUndoRecorder."""
         if kind is None:
             kind = LEGACY_UNDO_KINDS.get(label, "gating")
         if self._undo_group_depth and self._undo:
@@ -261,12 +265,18 @@ class WorkspaceController(QObject):
 
     def _after_restore(self, changes: set[str]):
         """Re-point the ui state at the restored model and emit the signals
-        for what `changes` (from restore_snapshot) says changed."""
+        for what `changes` (from restore_snapshot) says changed. The tree
+        selection and the current group are reset only by a restore that can
+        invalidate them (samples, gating or groups changed); undoing a layout,
+        table, settings, scale or compensation edit keeps them."""
         groups = self.workspace.groups
         cur = self.current_group
-        if not any(g is cur for g in groups):
+        tree_changed = bool(changes & {"samples", "gating", "groups"})
+        group_moved = not any(g is cur for g in groups)
+        if group_moved:
             self.current_group = next((g for g in groups if g.id == cur.id), None) or next((g for g in groups if g.name == cur.name), groups[0])
-        self.selected = []
+        if tree_changed:
+            self.selected = []
         self.selected_groups = [g for g in self.selected_groups if any(g is x for x in groups)]
         self.mark_modified()
         if "samples" in changes:  # first: windows of samples that left close
@@ -285,8 +295,10 @@ class WorkspaceController(QObject):
             self.tablesChanged.emit()
         if "settings" in changes:
             self.settingsChanged.emit()
-        self.currentGroupChanged.emit(self.current_group)
-        self.selectionChanged.emit()
+        if tree_changed or group_moved:
+            self.currentGroupChanged.emit(self.current_group)
+        if tree_changed:
+            self.selectionChanged.emit()
 
     # --------------------------------------------------------------- samples
     def add_samples(self, paths: list[str | Path]) -> list[Sample]:

@@ -5,11 +5,15 @@ Name=FlowDesk
 GenericName=Flow Cytometry Analysis
 Comment=Gate, compensate and report flow cytometry (FCS) data
 # Exec/Icon are rewritten by `packaging/install_linux_desktop.sh` to absolute paths;
-# with `pip install` on PATH the plain names below work as-is.
+# with `pip install` on PATH the plain names below work as-is. %F passes every file
+# opened with FlowDesk (workspaces .fdw / .wsp, templates .fdwt / .wspt, FCS files).
 Exec=flowdesk %F
 Icon=flowdesk
 Terminal=false
 Categories=Science;Biology;Education;Qt;
 Keywords=FCS;cytometry;gating;FlowJo;
+# The x- types are defined by the shared-mime-info snippet in docs/INSTALL.md
+# ("File associations"); application/vnd.isac.fcs is the registered FCS type.
+MimeType=application/x-flowdesk-workspace;application/x-flowdesk-template;application/x-flowjo-workspace;application/x-flowjo-template;application/vnd.isac.fcs;
 StartupNotify=true
 StartupWMClass=FlowDesk

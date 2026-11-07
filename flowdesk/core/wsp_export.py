@@ -11,7 +11,15 @@ FlowJo only knows the parameters of the FCS files (and their compensated
 cluster ids) and derived parameters exist only in FlowDesk, so populations
 gated on them are left out together with their sub-populations (and boolean
 gates that use them); statistics, axes and transforms on such parameters are
-dropped as well. Every omission is reported in the warning list returned by
+dropped as well. Gate dimensions the FlowJo import could not name (kept
+under the `UNRESOLVED_DIMENSION` prefix) are left out the same way, and so are
+gate-less group-template nodes for which no member sample has a gate.
+
+A sample whose matrix is disabled or absent but whose gates use compensated
+("Comp-X") names gets an identity matrix, FlowJo's form of an uncompensated
+sample, so the names resolve to the raw channels as they do in FlowDesk.
+
+Every omission or substitution is reported in the warning list returned by
 `export_wsp`.
 """
 from __future__ import annotations
@@ -30,7 +38,7 @@ from .compensation import SpilloverMatrix
 from .gates import BooleanGate, EllipseGate, Gate, PolygonGate, RectangleGate
 from .model import GraphSettings, Group, Population, Sample, Workspace
 from .transforms import ArcsinhScale, LinearScale, LogicleScale, LogScale, Scale
-from .wsp_import import ALL_SAMPLES, COMPENSATION_ROLE, DATATYPE_NS, GATING_NS, TRANSFORMS_NS, XSI_NS
+from .wsp_import import ALL_SAMPLES, COMPENSATION_ROLE, DATATYPE_NS, GATING_NS, TRANSFORMS_NS, UNRESOLVED_DIMENSION, XSI_NS
 
 G = "{%s}" % GATING_NS
 T = "{%s}" % TRANSFORMS_NS
@@ -48,6 +56,8 @@ SCHEMA_LOCATION = (
     f"{DATATYPE_NS} {GATING_NS}/DataTypes.v2.0.xsd "
 )
 FLOWJO_VERSION = "10.10.0"
+# name of the identity matrix written for samples without active compensation
+UNCOMPENSATED = "Uncompensated"
 
 GRAPH_TYPE_OUT = {
     "pseudocolor": "Pseudocolor",
@@ -273,6 +283,57 @@ def fcs_parameter_names(sample: Sample, matrices=()) -> set[str] | None:
     return names
 
 
+def _strip_comp(name: str, prefix: str, suffix: str) -> str | None:
+    if prefix and not name.startswith(prefix):
+        return None
+    if suffix and not name.endswith(suffix):
+        return None
+    inner = name[len(prefix) : len(name) - len(suffix) if suffix else None]
+    return inner or None
+
+
+def uncompensated_matrix(sample: Sample, dims, matrices=()) -> tuple[SpilloverMatrix | None, list[str]]:
+    """(identity matrix, compensated names it resolves) for a sample whose
+    matrix is disabled or absent while gate dimensions `dims` use compensated
+    names; (None, []) when the sample is compensated or no such name is used.
+
+    FlowJo only has "Comp-X" parameters for samples with a matrix and writes
+    an identity matrix for uncompensated ones. The identity covers the
+    disabled matrix's parameters and every channel a compensated name refers
+    to, with the disabled matrix's prefix / suffix (else "Comp-", else that of
+    a workspace matrix the name fits)."""
+    if sample.comp is not None and sample.comp_enabled:
+        return None, []
+    channels = sample.channel_names
+    own = set(sample.computed) | set(sample.derived)
+    if sample.comp is not None:
+        styles = [(sample.comp.prefix, sample.comp.suffix)]
+    else:
+        styles = [("Comp-", "")] + [(m.prefix, m.suffix) for m in matrices if m is not None]
+    styles = [st for st in styles if st[0] or st[1]]  # an empty prefix and suffix names nothing
+    used: dict[tuple[str, str], dict[str, str]] = {}
+    for d in dims:
+        if not d or d in own or d in channels or d.startswith(UNRESOLVED_DIMENSION):
+            continue
+        for style in styles:
+            base = _strip_comp(d, *style)
+            if base is not None and (base in channels or not channels):
+                used.setdefault(style, {}).setdefault(base, d)
+                break
+    style = next((st for st in styles if st in used), None)
+    if style is None:
+        return None, []
+    bases = used[style]
+    matrix_params = list(sample.comp.params) if sample.comp is not None else []
+    if channels:
+        wanted = set(bases) | set(matrix_params)
+        params = [c for c in channels if c in wanted]
+    else:
+        params = list(dict.fromkeys(matrix_params + list(bases)))
+    m = SpilloverMatrix(UNCOMPENSATED, params, np.eye(len(params)), style[0], style[1])
+    return m, sorted(bases.values())
+
+
 def _under(path: str, roots) -> bool:
     return any(path == r or path.startswith(r + "/") for r in roots)
 
@@ -302,6 +363,8 @@ class _Writer:
         # (path, reason, n sub-populations) -> owners
         self.skips: dict[tuple[str, str, int], list[str]] = {}
         self.dropped_stats: dict[tuple[str, str], list[str]] = {}
+        # message -> samples written with an identity matrix (no active comp)
+        self.uncompensated: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------- filtering
     def begin_tree(self, root: Population, known, owner: str, members=None):
@@ -322,38 +385,46 @@ class _Writer:
                 continue
             bad = [d for d in gate.dims if not known(d)]
             if bad:
-                self.skipped.add(id(pop))
-                skipped_paths.append(pop.path)
-                reasons[id(pop)] = f"gated on {', '.join(bad)} (not an FCS parameter)"
-        # boolean gates combining a left-out population are left out too
-        changed = True
-        while changed and skipped_paths:
-            changed = False
-            for pop in root.walk(include_self=False):
-                if id(pop) in self.skipped or _under(pop.path, skipped_paths):
-                    continue
-                gate = pop.gate
-                if isinstance(gate, BooleanGate):
-                    bad = [r for r in gate.refs if _under(r, skipped_paths)]
-                    if bad:
-                        self.skipped.add(id(pop))
-                        skipped_paths.append(pop.path)
-                        reasons[id(pop)] = f"boolean gate on the left-out {', '.join(b.rsplit('/', 1)[-1] for b in bad)}"
-                        changed = True
+                self._skip(pop, f"gated on {', '.join(bad)} (not an FCS parameter)", skipped_paths, reasons)
+        self._skip_booleans(root, skipped_paths, reasons)
+        if members is not None and self._fill_placeholders(root, members, skipped_paths, reasons):
+            self._skip_booleans(root, skipped_paths, reasons)
         for pop in root.walk(include_self=False):
             if id(pop) in reasons:
                 n_sub = sum(1 for _ in pop.walk(include_self=False))
                 self.skips.setdefault((pop.path, reasons[id(pop)], n_sub), []).append(owner)
-        if members is not None:
-            self._fill_placeholders(root, members, skipped_paths)
 
-    def _fill_placeholders(self, root: Population, members, skipped_paths: list[str]):
+    def _skip(self, pop: Population, reason: str, skipped_paths: list[str], reasons: dict[int, str]):
+        self.skipped.add(id(pop))
+        skipped_paths.append(pop.path)
+        reasons[id(pop)] = reason
+
+    def _skip_booleans(self, root: Population, skipped_paths: list[str], reasons: dict[int, str]):
+        """Boolean gates combining a left-out population are left out too."""
+        changed = bool(skipped_paths)
+        while changed:
+            changed = False
+            for pop in root.walk(include_self=False):
+                if id(pop) in self.skipped or _under(pop.path, skipped_paths):
+                    continue
+                gate = pop.gate if pop.gate is not None else self.substitutes.get(id(pop))
+                if isinstance(gate, BooleanGate):
+                    bad = [r for r in gate.refs if _under(r, skipped_paths)]
+                    if bad:
+                        names = ", ".join(b.rsplit("/", 1)[-1] for b in bad)
+                        self._skip(pop, f"boolean gate on the left-out {names}", skipped_paths, reasons)
+                        changed = True
+
+    def _fill_placeholders(self, root: Population, members, skipped_paths: list[str], reasons: dict[int, str]) -> bool:
         """A group template can hold gate-less nodes that only carry the path
         to populations applied below them (e.g. cluster populations applied to
         a group whose template did not have their parent yet). FlowJo needs a
-        gate on every population: use the members' gate at that path, and leave
-        out placeholders with nothing exportable below them."""
+        gate on every population: use the members' gate at that path. A node
+        without a usable member gate is left out with its sub-populations (its
+        gate is unknown, so they cannot be placed correctly) and reported.
+        Returns whether any node was left out."""
         nodes = [p for p in root.walk(include_self=False) if not _under(p.path, skipped_paths)]
+        dropped = False
         for pop in reversed(nodes):  # children first
             if pop.gate is not None:
                 continue
@@ -363,16 +434,41 @@ class _Writer:
                 if hit is not None and hit.gate is not None:
                     gate = hit.gate
                     break
-            if gate is not None:
-                if isinstance(gate, BooleanGate):
-                    usable = not any(_under(r, skipped_paths) for r in gate.refs)
-                else:
-                    usable = all(self.known(d) for d in gate.dims)
-                if usable:
+            if gate is None:
+                reason = "without a gate in the group template (no member sample has one at this path)"
+            elif isinstance(gate, BooleanGate):
+                bad = [r for r in gate.refs if _under(r, skipped_paths)]
+                if not bad:
                     self.substitutes[id(pop)] = gate
                     continue
-            if not any(id(c) not in self.skipped for c in pop.children) and not pop.stats:
-                self.skipped.add(id(pop))
+                reason = f"without a gate in the group template (the members' boolean gate uses the left-out {', '.join(b.rsplit('/', 1)[-1] for b in bad)})"
+            else:
+                bad = [d for d in gate.dims if not self.known(d)]
+                if not bad:
+                    self.substitutes[id(pop)] = gate
+                    continue
+                reason = f"without a gate in the group template (the members' gate is on {', '.join(bad)}, not an FCS parameter)"
+            self._skip(pop, reason, skipped_paths, reasons)
+            dropped = True
+        return dropped
+
+    def exported(self, pop: Population):
+        """The populations below `pop` that are written, in tree order."""
+        for c in pop.children:
+            if id(c) not in self.skipped:
+                yield c
+                yield from self.exported(c)
+
+    def note_uncompensated(self, sample: Sample, covered: list[str]):
+        if sample.comp is not None:
+            state = f"compensation matrix {sample.comp.name!r} is disabled"
+        else:
+            state = "no compensation matrix"
+        msg = (
+            f"{state}: written with an identity matrix ({UNCOMPENSATED!r}) so that FlowJo reads "
+            f"{', '.join(covered)} as the uncompensated channel{'s' if len(covered) != 1 else ''}"
+        )
+        self.uncompensated.setdefault(msg, []).append(f"sample {sample.name}")
 
     def warnings(self) -> list[str]:
         """One line per left-out population; siblings left out for the same
@@ -393,6 +489,8 @@ class _Writer:
                 out.append(f"{parent or '/'}: {len(items)} populations ({names}) {reason} – not exported{sub} ({where})")
         for (path, label), owners in self.dropped_stats.items():
             out.append(f"{path or 'Ungated'}: statistic {label} not exported, FlowJo does not know its parameter ({_owner_text(owners)})")
+        for msg, owners in self.uncompensated.items():
+            out.append(f"{msg} ({_owner_text(owners)})")
         return out
 
     # --------------------------------------------------------------- writing
@@ -462,8 +560,8 @@ def _sample_known(sample: Sample, ws_foreign: set[str], matrices):
     def known(name: str) -> bool:
         if not name:
             return True
-        if name in own:  # computed / derived values shadow FCS channels
-            return False
+        if name in own or name.startswith(UNRESOLVED_DIMENSION):
+            return False  # computed / derived values shadow FCS channels; import placeholders
         return name in fcs if fcs is not None else name not in ws_foreign
 
     return known
@@ -479,6 +577,8 @@ def _group_known(ws: Workspace, ws_foreign: set[str]):
     def known(name: str) -> bool:
         if not name:
             return True
+        if name.startswith(UNRESOLVED_DIMENSION):
+            return False
         return name in union if union is not None else name not in ws_foreign
 
     return known
@@ -556,7 +656,7 @@ def build_tree(ws: Workspace, with_counts: bool = True, warnings: list | None = 
     slist = ET.SubElement(root, "SampleList")
     for sample in ws.samples:
         writer.begin_tree(sample.root, _sample_known(sample, ws_foreign, ws.matrices.values()), f"sample {sample.name}")
-        _sample_element(slist, sample, writer)
+        _sample_element(slist, sample, writer, ws.matrices.values())
 
     ET.SubElement(root, "TableEditor", {"title": "Table Editor", "current": ""})
     ET.SubElement(root, "LayoutEditor", {"title": "Layout Editor", "current": ""})
@@ -572,7 +672,7 @@ def build_tree(ws: Workspace, with_counts: bool = True, warnings: list | None = 
     return ET.ElementTree(root)
 
 
-def _sample_element(parent: ET.Element, sample: Sample, writer: _Writer):
+def _sample_element(parent: ET.Element, sample: Sample, writer: _Writer, matrices=()):
     sel = ET.SubElement(parent, "Sample")
     ET.SubElement(sel, "DataSet", {"uri": path_to_uri(sample.path), "sampleID": str(sample.id)})
     tel = ET.SubElement(sel, "Transformations")
@@ -587,6 +687,12 @@ def _sample_element(parent: ET.Element, sample: Sample, writer: _Writer):
         ET.SubElement(kel, "Keyword", {"name": _clean(k), "value": _clean(v)})
     if sample.comp is not None and sample.comp_enabled:
         sel.append(spillover_element(sample.comp, editable=False))
+    else:
+        dims = [d for pop in writer.exported(sample.root) if pop.gate is not None and not isinstance(pop.gate, BooleanGate) for d in pop.gate.dims]
+        identity, covered = uncompensated_matrix(sample, dims, matrices)
+        if identity is not None:
+            sel.append(spillover_element(identity, editable=False))
+            writer.note_uncompensated(sample, covered)
     count = sample.n_events if sample.loaded or sample.keywords else -1
     node = ET.SubElement(sel, "SampleNode", {**_node_attrs(sample.name, "", sample.root.expanded, count), "sampleID": str(sample.id)})
     node.append(writer.graph(sample.root.graph))
@@ -599,7 +705,8 @@ def export_wsp(ws: Workspace, path, with_counts: bool = True, warnings: list | N
 
     Returns the list of export warnings: populations, statistics and
     parameters that FlowJo cannot represent and were therefore left out
-    (gates on computed or derived parameters). When `warnings` is given, the
+    (gates on computed or derived parameters, gate-less group nodes) and
+    samples written with an identity matrix. When `warnings` is given, the
     messages are appended to it and that same list is returned."""
     out = warnings if warnings is not None else []
     tree = build_tree(ws, with_counts, out)

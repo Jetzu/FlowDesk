@@ -169,3 +169,34 @@ def test_new_duplicate_rename_delete(controller):
     assert "Renamed" in controller.workspace.matrices and d.name not in controller.workspace.matrices
     win.delete_matrix(confirm=False)
     assert "Renamed" not in controller.workspace.matrices
+
+
+def test_wizard_finish_is_one_undo_step(qapp, tmp_path):
+    """Storing the matrix and applying it to the group undo together."""
+    from .conftest import SYNTH_NAMES, SYNTH_STAINS, make_synthetic_events, write_fcs
+
+    ws = Workspace()
+    for i in range(2):
+        ws.add_sample(write_fcs(tmp_path / f"w{i}.fcs", make_synthetic_events(500, seed=40 + i)["events"], SYNTH_NAMES, SYNTH_STAINS))
+    c = WorkspaceController(ws)
+    before = [(s.comp.name if s.comp is not None else None, s.comp_enabled) for s in ws.samples]
+    wiz = CompensationWizard(c)
+    wiz.matrix = SpilloverMatrix("W", ["FITC-A", "PE-A"], np.array([[1.0, 0.1], [0.05, 1.0]]))
+    page = wiz.matrix_page
+    page.name_edit.setText("Wizard W")
+    page.group_combo.clear()
+    page.group_combo.addItem(next(g for g in ws.groups if g.role == "all").name)
+    assert page.apply_check.isChecked()
+    steps = len(c._undo)
+    wiz.accept()
+    assert len(c._undo) == steps + 1
+    assert "Wizard W" in ws.matrices
+    assert all(s.comp is not None and s.comp.name == "Wizard W" and s.comp_enabled for s in ws.samples)
+    c.undo()  # one Ctrl+Z reverts the whole Finish
+    assert "Wizard W" not in ws.matrices
+    assert [(s.comp.name if s.comp is not None else None, s.comp_enabled) for s in ws.samples] == before
+    assert not c.can_undo
+    c.redo()
+    assert "Wizard W" in ws.matrices
+    assert all(s.comp is not None and s.comp.name == "Wizard W" for s in ws.samples)
+    wiz.deleteLater()

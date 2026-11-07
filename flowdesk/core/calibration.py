@@ -8,7 +8,10 @@ and convert sample intensities to MESF units:
     MESF = 10**intercept * intensity**slope
 
 Non-positive intensities (compensated data spread below zero) are mapped
-sign-symmetrically, so the conversion stays monotonic over all values.
+sign-symmetrically (0 -> 0), so the conversion stays monotonic over all
+values. A calibration must increase with the intensity: a fit (or a stored
+calibration) with a non-positive slope - MESF values entered in the wrong
+order - is rejected with ValueError.
 
 The model's derived parameters cannot express a power law (they offer
 ratio / product / sum / difference / log10), so `apply_calibration` stores
@@ -176,7 +179,14 @@ def fit_calibration(peak_medians, mesf_values, exclude_blank: bool = False, use=
     lx, ly = np.log10(x[ok]), np.log10(y[ok])
     if np.ptp(lx) <= 0:
         raise ValueError("peak intensities must differ")
+    if np.ptp(ly) <= 0:
+        raise ValueError(f"{units} values must differ")
     slope, intercept = np.polyfit(lx, ly, 1)
+    if not slope > 0:
+        raise ValueError(
+            f"the {units} values decrease with the peak intensity (slope {slope:.3g}): "
+            f"enter them in the order of the peaks, from dim to bright"
+        )
     pred = slope * lx + intercept
     ss_res = float(((ly - pred) ** 2).sum())
     ss_tot = float(((ly - ly.mean()) ** 2).sum())
@@ -184,17 +194,38 @@ def fit_calibration(peak_medians, mesf_values, exclude_blank: bool = False, use=
     return CalibrationFit(float(slope), float(intercept), float(r2), param, [float(v) for v in x], [float(v) for v in y], [bool(v) for v in ok], units, source)
 
 
+def check_calibration(slope, intercept) -> tuple[float, float]:
+    """(slope, intercept) as floats; ValueError unless both are finite and the
+    slope is positive (the only monotonically increasing calibrations)."""
+    try:
+        slope, intercept = float(slope), float(intercept)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid calibration slope {slope!r} / intercept {intercept!r}") from None
+    if not (math.isfinite(slope) and math.isfinite(intercept)):
+        raise ValueError(f"calibration slope and intercept must be finite, got {slope} and {intercept}")
+    if slope <= 0:
+        raise ValueError(f"calibration slope must be positive, got {slope:g}")
+    return slope, intercept
+
+
 def mesf_from_intensity(values, fit: CalibrationFit) -> np.ndarray:
-    """10**intercept * |I|**slope with the sign of I."""
+    """10**intercept * |I|**slope with the sign of I (0 stays 0)."""
+    slope, intercept = check_calibration(fit.slope, fit.intercept)
     v = np.asarray(values, dtype=float)
+    a = np.abs(v)
     with np.errstate(over="ignore", invalid="ignore"):
-        return np.sign(v) * (10.0 ** fit.intercept) * np.abs(v) ** fit.slope
+        out = np.sign(v) * (10.0 ** intercept) * np.power(a, slope, where=a > 0, out=np.zeros_like(a))
+    return out
 
 
 def intensity_from_mesf(values, fit: CalibrationFit) -> np.ndarray:
+    """The inverse of mesf_from_intensity (0 stays 0)."""
+    slope, intercept = check_calibration(fit.slope, fit.intercept)
     m = np.asarray(values, dtype=float)
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        return np.sign(m) * (np.abs(m) / 10.0 ** fit.intercept) ** (1.0 / fit.slope)
+    a = np.abs(m) / 10.0 ** intercept
+    with np.errstate(over="ignore", invalid="ignore"):
+        out = np.sign(m) * np.power(a, 1.0 / slope, where=a > 0, out=np.zeros_like(a))
+    return out
 
 
 def calibration_to_dict(fit: CalibrationFit) -> dict:
@@ -215,8 +246,9 @@ def calibration_to_dict(fit: CalibrationFit) -> dict:
 def calibration_from_dict(d: dict) -> CalibrationFit:
     if "slope" not in d or "intercept" not in d:
         raise ValueError("not a calibration")
+    slope, intercept = check_calibration(d["slope"], d["intercept"])
     return CalibrationFit(
-        float(d["slope"]), float(d["intercept"]), float(d.get("r2", float("nan"))), str(d.get("param", "")),
+        slope, intercept, float(d.get("r2", float("nan"))), str(d.get("param", "")),
         [float(v) for v in d.get("intensities", [])], [float(v) for v in d.get("mesf", [])],
         [bool(v) for v in d.get("used", [])], str(d.get("units", UNITS)), str(d.get("source", "")),
     )
@@ -281,6 +313,7 @@ def apply_calibration(sample, fit: CalibrationFit, param: str | None = None, nam
     param = param or fit.param
     if not param:
         raise ValueError("calibration has no parameter")
+    check_calibration(fit.slope, fit.intercept)
     if not sample.ensure_loaded():
         raise ValueError(f"{sample.name}: data not available")
     if param not in sample.parameter_names():

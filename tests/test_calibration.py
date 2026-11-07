@@ -104,6 +104,69 @@ def test_conversion_roundtrip_and_dict():
         cal.calibration_from_dict({"param": "x"})
 
 
+def test_mesf_values_in_the_wrong_order_are_rejected():
+    """A MESF calibration increases with the intensity. Values typed in the
+    reverse order of the peaks used to give slope -1 and NaN MESF for every
+    event at intensity 0 (0 ** -1 = inf, sign(0) * inf = NaN)."""
+    with pytest.raises(ValueError, match="order"):
+        cal.fit_calibration([100.0, 1000.0, 10000.0], [1000.0, 100.0, 10.0])
+    with pytest.raises(ValueError, match="order"):
+        cal.fit_calibration(peak_intensities(), KIT_MESF[::-1])
+    with pytest.raises(ValueError, match="differ"):  # flat: slope 0 cannot be inverted
+        cal.fit_calibration([100.0, 1000.0], [500.0, 500.0])
+    # the right order still fits
+    assert cal.fit_calibration(peak_intensities(), KIT_MESF).slope == pytest.approx(SLOPE)
+
+
+@pytest.mark.parametrize("slope", [-1.0, 0.0, float("nan"), float("inf")])
+def test_stored_calibrations_must_increase(tmp_path, slope):
+    d = {"kind": "mesf-calibration", "param": "FITC-A", "slope": slope, "intercept": 0.3}
+    with pytest.raises(ValueError):
+        cal.calibration_from_dict(d)
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(d))  # NaN / Infinity round-trip through Python's json
+    with pytest.raises(ValueError):
+        cal.load_calibration(path)
+    fit = cal.CalibrationFit(slope, 0.3, 1.0, "FITC-A")
+    with pytest.raises(ValueError):
+        cal.mesf_from_intensity([0.0, 1.0], fit)
+    with pytest.raises(ValueError):
+        cal.intensity_from_mesf([0.0, 1.0], fit)
+
+
+@pytest.mark.parametrize("slope,intercept", [(0.5, 1.0), (1.05, 0.3), (2.0, -1.0)])
+def test_zero_intensity_converts_to_zero_mesf(slope, intercept):
+    fit = cal.CalibrationFit(slope, intercept, 1.0, "X")
+    x = np.array([0.0, -0.0, 5.0, -5.0, 1e-30, np.nan])
+    with np.errstate(all="raise"):  # no divide-by-zero / invalid warnings
+        m = cal.mesf_from_intensity(x, fit)
+        back = cal.intensity_from_mesf(m, fit)
+    k = 10.0 ** intercept
+    expected = [0.0, 0.0, k * 5.0 ** slope, -k * 5.0 ** slope, k * 1e-30 ** slope, np.nan]
+    np.testing.assert_allclose(m, expected, rtol=1e-12, atol=0)
+    np.testing.assert_allclose(back, x, rtol=1e-12, atol=0)  # NaN stays NaN
+    assert cal.mesf_from_intensity(0.0, fit) == 0.0 and cal.intensity_from_mesf(0.0, fit) == 0.0
+
+
+def test_apply_calibration_keeps_zero_events_finite(tmp_path):
+    rng = np.random.default_rng(3)
+    raw = rng.lognormal(7, 1, 400)
+    raw[:50] = 0.0  # clipped negatives / an unused detector
+    raw[50:80] *= -1
+    events = np.column_stack([rng.normal(60000, 3000, raw.size), raw]).astype(np.float32)
+    ws = Workspace()
+    write_fcs(tmp_path / "zeros.fcs", events, [Channel(1, "FSC-A"), Channel(2, "FITC-A")])
+    s = ws.add_sample(tmp_path / "zeros.fcs")
+    fit = cal.fit_calibration(peak_intensities(), KIT_MESF, param="FITC-A")
+    name = cal.apply_calibration(s, fit)
+    mesf = s.data(name).astype(float)
+    assert np.isfinite(mesf).all()
+    assert np.all(mesf[:50] == 0.0) and np.all(mesf[50:80] < 0)
+    with pytest.raises(ValueError):
+        cal.apply_calibration(s, cal.CalibrationFit(-1.0, 0.0, 1.0, "FITC-A"), name="FITC-A bad")
+    assert "FITC-A bad" not in s.parameter_names()
+
+
 def test_save_load_file(tmp_path):
     fit = cal.fit_calibration(peak_intensities(), KIT_MESF, param="FITC-A", source="beads.fcs")
     path = cal.save_calibration(tmp_path / "cal.json", fit)

@@ -7,14 +7,15 @@ Coordinates: one scene unit is one page point (1/72 inch). The persisted model
 is flowdesk.core.layouts.Layout / LayoutItem; every edit made on the canvas is
 written back into those objects and announced through
 controller.notify_layouts() (coalesced with a short timer while dragging).
-Every such announcement also records an undo step ("edit layout"), see
-SectionUndoRecorder.
+Every such announcement also records an undo step ("edit layout"): the
+notifications of one interaction (a drag, a resize, a held arrow key) on the
+same items are one step, which ends on mouse release / focus out, see
+SectionUndoRecorder and LayoutEditorWindow.schedule_notify().
 """
 from __future__ import annotations
 
 import json
 import math
-import time
 from collections import OrderedDict
 
 from PySide6.QtCore import QMarginsF, QPointF, QRectF, QSizeF, Qt, QTimer
@@ -149,11 +150,15 @@ class SectionUndoRecorder:
     controller.begin_change() *before* a change. The recorder keeps the
     section as it was after the last recorded change (the baseline); record()
     pushes one undo step that brings back that baseline plus the present
-    gating state (unchanged by an editor). Steps recorded with coalesce=True
-    within COALESCE_SECONDS of the previous coalescing step of the same
-    recorder merge into it, so one drag is one undo step."""
+    gating state (unchanged by an editor).
 
-    COALESCE_SECONDS = 1.0
+    Coalescing: a step recorded with coalesce=True opens a burst; later
+    coalescing records with the same `key` (the editor's name for what is
+    being edited, e.g. a set of (item id, property) pairs) merge into it while
+    it is still the top undo step, until end_burst() (mouse release, focus
+    out), reset() or a record that does not merge closes the burst. So one
+    drag is one undo step however long it takes, and two edits are two steps
+    however quickly they follow each other."""
 
     def __init__(self, controller, section: str, label: str):
         self.controller = controller
@@ -161,8 +166,8 @@ class SectionUndoRecorder:
         self.label = label
         self._baseline: list[dict] | None = None
         self._pushed: dict | None = None
-        self._pushed_coalescing = False
-        self._time = 0.0
+        self._burst_open = False
+        self._burst_key = None
         self.reset()
 
     def _state(self) -> list[dict]:
@@ -172,8 +177,15 @@ class SectionUndoRecorder:
         """Take the present state as the one the next step returns to (after
         undo / redo, a replaced workspace or a change made elsewhere)."""
         self._baseline = self._state()
+        self.end_burst()
 
-    def record(self, coalesce: bool = False) -> bool:
+    def end_burst(self):
+        """The interaction that coalescing records belonged to is over: the
+        next change is a step of its own."""
+        self._burst_open = False
+        self._burst_key = None
+
+    def record(self, coalesce: bool = False, key=None) -> bool:
         """Call after a change, before announcing it. Returns whether a new
         undo step was pushed."""
         c = self.controller
@@ -182,25 +194,35 @@ class SectionUndoRecorder:
         if before is None or before == current:
             return False
         if getattr(c, "_undo_group_depth", 0):
-            # inside an open undo group: only make sure it covers the section
+            # inside an open undo group: the group's step must bring back the
+            # section as it was before this change. begin_change() would widen
+            # the step from the present (already edited) state, so the
+            # baseline is written into the step instead.
+            from ..core.serialization import snapshot_kind
+
+            top = c.undo_top_snapshot()
+            had = top is not None and self.section in snapshot_kind(top)
             c.begin_change(self.label, kind=self.section)
+            top = c.undo_top_snapshot()
+            if not had and top is not None:
+                top[self.section] = before
+            self.end_burst()
             return False
-        now = time.monotonic()
         if (
             coalesce
-            and self._pushed_coalescing
+            and self._burst_open
             and self._pushed is not None
             and c.undo_top_snapshot() is self._pushed
-            and now - self._time < self.COALESCE_SECONDS
+            and key == self._burst_key
         ):
-            self._time = now  # same burst: the open step already returns to before it
-            return False
+            return False  # same burst: the open step already returns to before it
         from ..core.serialization import gating_snapshot
 
         snap = gating_snapshot(c.workspace, self.section)
         snap[self.section] = before
         c.push_undo(self.label, snap)
-        self._pushed, self._pushed_coalescing, self._time = snap, coalesce, now
+        self._pushed = snap
+        self._burst_open, self._burst_key = coalesce, (key if coalesce else None)
         return True
 
 
@@ -490,7 +512,7 @@ class PlotGraphicsItem(QGraphicsItem):
             p = self.pos()
             if (p.x(), p.y()) != (self.item.x, self.item.y):
                 self.item.x, self.item.y = p.x(), p.y()
-                self.editor.schedule_notify()
+                self.editor.schedule_notify((self.item.id, "geometry"))
         return super().itemChange(change, value)
 
     def hoverMoveEvent(self, event):
@@ -527,7 +549,7 @@ class PlotGraphicsItem(QGraphicsItem):
             self._resize_handle = None
             self._resize_start = None
             self.update()
-            self.editor.schedule_notify()
+            self.editor.schedule_notify((self.item.id, "geometry"))
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -627,7 +649,7 @@ class TextGraphicsItem(QGraphicsTextItem):
         if text != self.item.text or h != self.item.h:
             self.item.text = text
             self.item.h = h
-            self.editor.schedule_notify()
+            self.editor.schedule_notify((self.item.id, "text"))
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.editor.snap_to_grid:
@@ -637,7 +659,7 @@ class TextGraphicsItem(QGraphicsTextItem):
             p = self.pos()
             if (p.x(), p.y()) != (self.item.x, self.item.y):
                 self.item.x, self.item.y = p.x(), p.y()
-                self.editor.schedule_notify()
+                self.editor.schedule_notify((self.item.id, "geometry"))
         return super().itemChange(change, value)
 
     def mouseDoubleClickEvent(self, event):
@@ -649,6 +671,7 @@ class TextGraphicsItem(QGraphicsTextItem):
         super().focusOutEvent(event)
         if self.editing:
             self.finish_editing()
+            self.editor.end_edit_burst()  # the text edit is one undo step of its own
 
     def keyPressEvent(self, event):
         if self.editing and event.key() == Qt.Key.Key_Escape:
@@ -665,6 +688,9 @@ class TextGraphicsItem(QGraphicsTextItem):
 
 
 # ---------------------------------------------------------------------- view
+ARROW_KEYS = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down)
+
+
 class LayoutView(QGraphicsView):
     def __init__(self, editor: "LayoutEditorWindow", scene: QGraphicsScene):
         super().__init__(scene)
@@ -724,6 +750,19 @@ class LayoutView(QGraphicsView):
             return
         super().wheelEvent(event)
 
+    def mousePressEvent(self, event):
+        self.editor.end_edit_burst()  # a new interaction starts a new undo step
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self.editor.end_edit_burst()  # the drag / resize is over: one undo step
+
+    def keyReleaseEvent(self, event):
+        super().keyReleaseEvent(event)
+        if not event.isAutoRepeat() and event.key() in ARROW_KEYS:
+            self.editor.end_edit_burst()
+
     def keyPressEvent(self, event):
         focus = self.scene().focusItem()
         editing = isinstance(focus, TextGraphicsItem) and focus.editing
@@ -731,7 +770,9 @@ class LayoutView(QGraphicsView):
             self.editor.delete_selected()
             event.accept()
             return
-        if not editing and event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+        if not editing and event.key() in ARROW_KEYS:
+            if not event.isAutoRepeat():
+                self.editor.end_edit_burst()  # each press is a step; a held key is one
             step = GRID if self.editor.snap_to_grid else (10.0 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1.0)
             dx = {Qt.Key.Key_Left: -step, Qt.Key.Key_Right: step}.get(event.key(), 0.0)
             dy = {Qt.Key.Key_Up: -step, Qt.Key.Key_Down: step}.get(event.key(), 0.0)
@@ -760,6 +801,7 @@ class LayoutEditorWindow(QMainWindow):
         self._notify_timer.setSingleShot(True)
         self._notify_timer.setInterval(150)
         self._notify_timer.timeout.connect(lambda: self._emit_layouts(coalesce=True))
+        self._pending_keys: set = set()  # what the pending notification covers
         self.undo_recorder = SectionUndoRecorder(controller, "layouts", "edit layout")
 
         self.scene = QGraphicsScene(self)
@@ -863,7 +905,12 @@ class LayoutEditorWindow(QMainWindow):
         layout = layout or self._layout
         return layout.page_size if layout is not None else PAGE_SIZES["A4"]
 
-    def schedule_notify(self):
+    def schedule_notify(self, key=None):
+        """Announce an in-place edit shortly (one notification per timer
+        period while dragging). `key` names what was edited, e.g. (item id,
+        "geometry"): the notifications of one interaction with the same keys
+        are one undo step, which end_edit_burst() closes."""
+        self._pending_keys.add(key)
         self._notify_timer.start()
 
     def flush_notify(self):
@@ -871,13 +918,23 @@ class LayoutEditorWindow(QMainWindow):
             self._notify_timer.stop()
             self._emit_layouts(coalesce=True)
 
+    def end_edit_burst(self):
+        """The interaction is over (mouse released, text edit finished):
+        announce what is pending and make the next edit an undo step of its
+        own."""
+        self.flush_notify()
+        self.undo_recorder.end_burst()
+
     def _notify_now(self):
         self._notify_timer.stop()
         self._emit_layouts()
 
     def _emit_layouts(self, coalesce: bool = False):
-        # one undo step per edit; drags (timer-driven) merge into one
-        self.undo_recorder.record(coalesce)
+        # one undo step per edit; the timer-driven notifications of one drag
+        # (same items) merge into one
+        key = frozenset(self._pending_keys) if coalesce else None
+        self._pending_keys.clear()
+        self.undo_recorder.record(coalesce, key)
         self._suppress = True
         try:
             self.controller.notify_layouts()
@@ -890,10 +947,13 @@ class LayoutEditorWindow(QMainWindow):
             return
         # undo / redo or a change made elsewhere: the model is the truth now
         self._notify_timer.stop()
+        self._pending_keys.clear()
         self.undo_recorder.reset()
         self.refresh()
 
     def _on_workspace_replaced(self):
+        self._notify_timer.stop()
+        self._pending_keys.clear()
         self.undo_recorder.reset()
         self._layout = None
         self.cache.invalidate()
@@ -970,7 +1030,7 @@ class LayoutEditorWindow(QMainWindow):
     def _batch_group_changed(self, name: str):
         if self._layout is not None and name and self._layout.batch_group != name:
             self._layout.batch_group = name
-            self.schedule_notify()
+            self.schedule_notify((self._layout.id, "batch_group"))
 
     # --------------------------------------------------------------- scene
     def _rebuild_scene(self):

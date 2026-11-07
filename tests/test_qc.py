@@ -297,3 +297,141 @@ def test_without_time_parameter(qc_sample):
     assert qc.apply_qc(cells, r)[0].count == r.n_good
     with pytest.raises(ValueError):
         qc.qc_for_population(cells, "NoSuchTime")
+
+
+# ------------------------------------------------- dynamic range: no false saturation
+def _write_with_unused_channel(path, n=30000, seed=0, saturated=25):
+    """FSC-A / SSC-A / FITC-A, an unused all-zero PE-A detector and Time;
+    `saturated` FSC-A events sit at the detector maximum 262143."""
+    rng = np.random.default_rng(seed)
+    t = np.sort(rng.uniform(0, 1000, n))
+    fsc = rng.normal(80000, 6000, n)
+    fsc[rng.choice(n, saturated, replace=False)] = 262143.0
+    events = np.column_stack([fsc, rng.normal(40000, 5000, n), rng.lognormal(np.log(5000), 0.3, n), np.zeros(n), t]).astype(np.float32)
+    write_fcs(path, events, [Channel(1, "FSC-A"), Channel(2, "SSC-A"), Channel(3, "FITC-A"), Channel(4, "PE-A"), Channel(5, "Time", range=1024)])
+    return path, n, saturated
+
+
+def test_constant_channel_is_not_flagged_as_saturated(tmp_path):
+    path, n, saturated = _write_with_unused_channel(tmp_path / "unused.fcs")
+    ws = Workspace()
+    s = ws.add_sample(path)
+    assert s.ensure_loaded()
+    assert "PE-A" in qc.default_qc_parameters(s, "Time")  # the unused detector is checked by default
+    r = qc.qc_for_population(s.root, "Time", checks=("range",))
+    assert r.range_counts["PE-A"] == 0
+    assert r.range_counts["FSC-A"] == saturated  # real saturation is still found
+    assert r.percent_removed["range"] == pytest.approx(100.0 * saturated / n)
+    assert "PE-A" in r.notes and "constant" in r.notes["PE-A"]
+    # the same through qc_summary / dynamic_range_check, also for two-valued parameters
+    zeros = np.zeros(1000)
+    two = np.where(np.arange(1000) % 2 == 0, 0.0, 1.0)
+    dr = qc.dynamic_range_check({"Unused": zeros, "Binary": two}, min_pile=3, check_low=True)
+    assert dr.counts == {"Unused": 0, "Binary": 0} and not dr.flags.any()
+    assert "constant" in dr.notes["Unused"] and "two values" in dr.notes["Binary"]
+
+
+def test_pileup_above_max_fraction_is_reported_not_removed():
+    rng = np.random.default_rng(2)
+    v = rng.normal(80000, 6000, 10000)
+    v[:4000] = 262143.0  # 40 % at the detector maximum: more than max_fraction (20 %)
+    dr = qc.dynamic_range_check({"FSC-A": v}, {"FSC-A": (None, 262144.0)})
+    assert dr.flags.sum() == 0 and dr.counts["FSC-A"] == 0
+    note = dr.notes["FSC-A"]
+    assert "upper limit 262144 ignored" in note and "pile-up at the data maximum" in note and "40%" in note
+    # without metadata the pile-up alone is guarded the same way
+    dr2 = qc.dynamic_range_check({"FSC-A": v})
+    assert dr2.counts["FSC-A"] == 0 and "pile-up" in dr2.notes["FSC-A"]
+    # below max_fraction the saturated events are removed, exactly those
+    w = rng.normal(80000, 6000, 10000)
+    w[:1000] = 262143.0  # 10 %
+    dr3 = qc.dynamic_range_check({"FSC-A": w}, {"FSC-A": (None, 262144.0)})
+    assert dr3.counts["FSC-A"] == 1000 and dr3.flags[:1000].all() and not dr3.flags[1000:].any()
+    assert "FSC-A" not in dr3.notes
+
+
+# ------------------------------------------------------- binning of small populations
+def test_bin_count_follows_event_count():
+    # at most the requested bins, ~50 events per bin, never fewer than 10 bins
+    assert qc.auto_bin_count(100000, 100) == 100
+    assert qc.auto_bin_count(2000, 100) == 40
+    assert qc.auto_bin_count(30, 100) == 10
+    assert qc.auto_bin_count(100000, 50) == 50
+    assert qc.auto_bin_count(30, 5) == 5  # fewer than 10 requested on purpose
+    assert qc.auto_bin_count(30, 100, events_per_bin=0) == 100
+    t = np.sort(np.random.default_rng(0).uniform(0, 100, 2000))
+    r = qc.qc_summary(t, {}, checks=("rate",))
+    assert r.n_bins == 40 and r.settings["n_bins"] == 40 and r.settings["n_bins_requested"] == 100
+    assert qc.flow_rate_check(t).counts.size == 40
+    assert qc.qc_summary(t, {}, checks=("rate",), events_per_bin=0).n_bins == 100
+
+
+@pytest.mark.parametrize("n", [10, 30, 60])
+def test_tiny_population_rate_is_not_tested(n):
+    for seed in range(10):
+        t = np.sort(np.random.default_rng(seed).uniform(0, 100, n))
+        r = qc.qc_summary(t, {}, checks=("rate",))
+        assert r.percent_removed["rate"] == 0.0 and r.n_good == n
+        assert r.bins_tested("rate") == 0 and "not tested" in r.notes["Flow rate"]
+        assert qc.result_table(r)[0][5] == "not tested"
+
+
+def test_small_uniform_population_keeps_its_events():
+    # a constant flow rate has nothing to remove; before, Poisson noise of
+    # 100 bins with a handful of events each removed up to half of them
+    for n, expected_bins in ((300, 10), (1000, 20)):  # 50 events per bin, at least 10 bins
+        removed = []
+        for seed in range(30):
+            rng = np.random.default_rng(seed)
+            t = np.sort(rng.uniform(0, 100, n))
+            vals = {"A": rng.normal(0.4, 0.08, n), "B": rng.normal(0.6, 0.08, n)}
+            r = qc.qc_summary(t, vals, checks=("rate", "signal"))
+            assert r.n_bins == expected_bins and r.bins_tested("rate") == expected_bins
+            removed.append(r.percent_removed["total"])
+        assert np.mean(removed) < 1.0 and np.max(removed) <= 20.0
+
+
+def test_small_population_artefacts_are_still_found():
+    rng = np.random.default_rng(4)
+    n = 1000
+    t = np.sort(rng.uniform(0, 100, n))
+    clogged = t[(t < 40) | (t > 70)]  # no events for 30 % of the run
+    r = qc.qc_summary(clogged, {}, checks=("rate",))
+    assert r.n_bins == clogged.size // 50
+    in_gap = (r.edges[:-1] >= 40) & (r.edges[1:] <= 70)  # bins lying wholly in the clog
+    assert in_gap.sum() >= 3 and r.bin_flags["rate"][in_gap].all()
+    v = rng.normal(0.5, 0.08, n)
+    shifted = (t >= 40) & (t < 70)
+    v[shifted] += 0.15
+    r2 = qc.qc_summary(t, {"A": v}, checks=("signal",))
+    assert (~r2.good[shifted]).mean() >= 0.9 and r2.good[(t < 35) | (t > 75)].mean() >= 0.95
+
+
+def test_constant_time_channel_is_not_tested():
+    rng = np.random.default_rng(1)
+    for n in (50, 5000):
+        r = qc.qc_summary(np.full(n, 3.0), {"A": rng.normal(0.5, 0.05, n)}, checks=("rate", "signal"))
+        assert r.percent_removed["total"] == 0.0
+        assert r.bins_tested("rate") == 0 and r.bins_tested("signal") == 0
+        assert "distinct time values" in r.notes["Flow rate"] and "distinct time values" in r.notes["Signal stability"]
+    rc = qc.flow_rate_check(np.full(5000, 3.0))
+    assert not rc.tested and not rc.flags.any()
+
+
+def test_signal_check_reports_bins_tested():
+    rng = np.random.default_rng(6)
+    for n, expected_bins in ((300, 10), (150, 10)):
+        t = np.sort(rng.uniform(0, 100, n))
+        r = qc.qc_summary(t, {"A": rng.normal(0.5, 0.05, n)}, checks=("signal",))
+        assert r.n_bins == expected_bins
+        # independent count of the bins holding the 20 events a median needs
+        per_bin = np.histogram(t, bins=expected_bins, range=(t.min(), t.max()))[0]
+        enough = int((per_bin >= 20).sum())
+        tested = enough if enough >= 3 else 0
+        assert r.bins_tested("signal") == tested
+        assert r.summary()["bins_tested"]["signal"] == tested
+        row = qc.result_table(r)[0]
+        assert row[0] == "Signal stability"
+        assert row[5] == ("not tested" if tested == 0 else f"removed; {tested} of {expected_bins} bins tested")
+        if tested == 0:
+            assert "not tested" in r.notes["Signal stability"]

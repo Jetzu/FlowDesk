@@ -5,6 +5,7 @@ Build with ``python packaging/build.py`` (or ``pyinstaller packaging/flowdesk.sp
 repository root). Output: dist/FlowDesk/ (FlowDesk.exe on Windows, FlowDesk on Linux) and,
 on macOS, dist/FlowDesk.app.
 """
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -16,11 +17,37 @@ PKG = ROOT / "packaging"
 sys.path.insert(0, str(ROOT))
 from flowdesk import __version__  # noqa: E402
 
-# Heavy optional libraries that may be installed in the venv: bundle them only if the FlowDesk
-# sources actually import them (so an "analysis" extra is picked up automatically when used).
-OPTIONAL_LIBS = ["umap", "openTSNE", "pynndescent", "sklearn", "numba", "llvmlite", "joblib", "tqdm"]
+# Analysis libraries that FlowDesk imports lazily (scikit-learn: k-means, kNN graphs, the t-SNE
+# fallback; openTSNE; umap-learn), each with the runtime dependencies it needs. FlowDesk never
+# imports those dependencies itself, so they are not detected from the sources: they come with
+# their entry library. An entry library is bundled when the FlowDesk sources import it and it is
+# installed (so the "analysis" extra is picked up automatically); the dependencies of the entry
+# libraries that are not bundled are excluded, so that unrelated packages in the build
+# environment do not end up in the app.
+ANALYSIS_LIBS = {
+    "sklearn": ["joblib", "threadpoolctl"],
+    "openTSNE": ["sklearn", "joblib", "threadpoolctl"],
+    "umap": ["sklearn", "joblib", "threadpoolctl", "pynndescent", "numba", "llvmlite", "tqdm"],
+}
 _src = "\n".join(p.read_text(encoding="utf-8", errors="ignore") for p in (ROOT / "flowdesk").rglob("*.py"))
-_unused = [m for m in OPTIONAL_LIBS if not re.search(rf"^\s*(import|from)\s+{m}\b", _src, re.M)]
+
+
+def _imported_by_flowdesk(module):
+    return re.search(rf"^\s*(import|from)\s+{re.escape(module)}\b", _src, re.M) is not None
+
+
+def _installed(module):
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+BUNDLED_LIBS = [m for m in ANALYSIS_LIBS if _imported_by_flowdesk(m) and _installed(m)]
+_keep = set(BUNDLED_LIBS).union(*(ANALYSIS_LIBS[m] for m in BUNDLED_LIBS))
+_unused = sorted(set(ANALYSIS_LIBS).union(*ANALYSIS_LIBS.values()) - _keep)
+print(f"FlowDesk spec: bundling {', '.join(BUNDLED_LIBS) or 'no analysis libraries'}"
+      f"; excluding {', '.join(_unused) or 'nothing'}")
 
 QT_EXCLUDES = [
     f"PySide6.{m}"
@@ -46,6 +73,10 @@ hiddenimports = (
      "PySide6.QtSvg", "PySide6.QtPrintSupport"]
     + collect_submodules("flowdesk")
 )
+if "openTSNE" in BUNDLED_LIBS:
+    # its Cython modules import openTSNE._matrix_mul (and the bundled annoy) at C level,
+    # which the module graph does not see
+    hiddenimports += collect_submodules("openTSNE")
 
 if sys.platform == "win32":
     ICON = str(PKG / "icon.ico")
@@ -146,6 +177,10 @@ if sys.platform == "darwin":
                 {"CFBundleTypeName": "FCS Data File", "CFBundleTypeExtensions": ["fcs"],
                  "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate"},
                 {"CFBundleTypeName": "FlowJo Workspace", "CFBundleTypeExtensions": ["wsp"],
+                 "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate"},
+                {"CFBundleTypeName": "FlowDesk Workspace Template", "CFBundleTypeExtensions": ["fdwt"],
+                 "CFBundleTypeRole": "Editor", "LSHandlerRank": "Owner"},
+                {"CFBundleTypeName": "FlowJo Workspace Template", "CFBundleTypeExtensions": ["wspt"],
                  "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate"},
             ],
         },

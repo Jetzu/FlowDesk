@@ -129,6 +129,56 @@ def test_undefined_statistics(tree, tmp_path):
     assert math.isnan(compute_statistic("Freq. of Total", missing.root))
 
 
+def test_statistics_skip_events_a_tool_did_not_compute(tree):
+    """Computed parameters (t-SNE, UMAP, cluster ids, MESF...) are NaN for the
+    events a tool did not run on (tools subsample to max_events): statistics
+    are taken over the computed events only; Count still counts the gate."""
+    s, pop, m = tree["sample"], tree["fitc"], tree["m_fitc"]
+    rng = np.random.default_rng(11)
+    n = tree["ev"].shape[0]
+    values = rng.lognormal(1.0, 0.8, n) * np.where(rng.random(n) < 0.1, -1.0, 1.0)
+    done = rng.random(n) < 0.5
+    emb = np.where(done, values, np.nan)
+    emb[tree["m_pe"]] = np.nan  # PE+ (inside FITC+): the tool ran on none of its events
+    s.add_computed("emb", emb, {"tool": "test"})
+    # reference: the stored float32 values of FITC+ events, NaN-aware numpy
+    full = emb.astype(np.float32).astype(np.float64)[m]
+    v = full[np.isfinite(full)]
+    assert 100 < v.size < m.sum() and np.isnan(full).sum() > 100
+    med = np.nanmedian(full)
+    mad = np.nanmedian(np.abs(full - med))
+    expected = {
+        "Mean": np.nanmean(full),
+        "Median": med,
+        "Geometric Mean": np.exp(np.mean(np.log(v[v > 0]))),
+        "SD": np.nanstd(full, ddof=1),
+        "CV": 100 * np.nanstd(full, ddof=1) / np.nanmean(full),
+        "Robust SD": 1.4826 * mad,
+        "Robust CV": 100 * 1.4826 * mad / med,
+        "Min": np.nanmin(full),
+        "Max": np.nanmax(full),
+        "Sum": np.nansum(full),
+    }
+    for name, ref in expected.items():
+        got = compute_statistic(name, pop, "emb")
+        assert math.isfinite(got), name
+        assert got == pytest.approx(ref, rel=1e-9), name
+    for q in (5, 50, 97.5):
+        assert compute_statistic("Percentile", pop, "emb", q) == pytest.approx(np.nanpercentile(full, q))
+    assert compute_statistic("Count", pop, "emb") == m.sum()
+    # Mode: 256-bin display-space histogram of the computed events
+    scale = s.scale("emb")
+    hist, edges = np.histogram(np.clip(scale.forward(v), 0, 1), bins=256, range=(0, 1))
+    k = int(np.argmax(hist))
+    assert compute_statistic("Mode", pop, "emb") == pytest.approx(scale.inverse_scalar((edges[k] + edges[k + 1]) / 2))
+    # no computed event at all: NaN, not an exception
+    pe = tree["pe"]
+    assert pe.count > 0
+    for name in ("Mean", "Median", "Geometric Mean", "Mode", "SD", "CV", "Robust SD", "Robust CV", "Min", "Max", "Percentile", "Sum"):
+        assert math.isnan(compute_statistic(name, pe, "emb", 50)), name
+    assert compute_statistic("Count", pe, "emb") == tree["m_pe"].sum()
+
+
 def test_format_value():
     assert format_value("Count", 12.6) == "13"
     assert format_value("Freq. of Parent", 12.3456) == "12.3"

@@ -665,3 +665,204 @@ def test_identity_matrix_comp_names_alias_raw_channels(tmp_path):
     assert pop.count == int((events[:, 0] >= 1000).sum())
     s.set_compensation(ident, False)  # disabled matrix: same alias
     assert np.array_equal(s.data("Comp-PE-A"), s.data("PE-A"))
+
+
+# ======================================================= computed parameters on disk
+def _computed_workspace(tmp_path, n=500):
+    """One sample with three computed parameters ("tSNE 1" and "tSNE_1" sanitise
+    to the same file name) and a gate on "tSNE 1", saved as exp.fdw."""
+    ws = Workspace()
+    s = ws.add_sample(make_file(tmp_path, "a.fcs", seed=3, n=n))
+    s.ensure_loaded()
+    rng = np.random.default_rng(11)
+    values = {name: rng.random(n).astype(np.float32) for name in ("tSNE 1", "tSNE_1", "CON")}
+    for name, v in values.items():
+        s.add_computed(name, v, {"tool": "test"})
+    s.root.add_child(Population("hi", RectangleGate(["tSNE 1"], [0.5], [None])))
+    fdw = tmp_path / "exp.fdw"
+    save_workspace(ws, fdw)
+    return ws, s, values, fdw
+
+
+def test_computed_parameters_round_trip_as_distinct_arrays(tmp_path):
+    ws, s, values, fdw = _computed_workspace(tmp_path)
+    ws2 = load_workspace(fdw)
+    t = ws2.samples[0]
+    assert ws2.load_warnings == [] and t.load_warnings == []
+    assert list(t.computed) == ["tSNE 1", "tSNE_1", "CON"]
+    for name, v in values.items():
+        assert np.array_equal(t.computed[name], v)
+    assert not np.array_equal(t.computed["tSNE 1"], t.computed["tSNE_1"])
+    assert t.root.find("/hi").count == int((values["tSNE 1"] >= 0.5).sum())
+
+
+@pytest.mark.parametrize("new_n", [300, 800])
+def test_replaced_fcs_file_drops_stale_computed_arrays(tmp_path, new_n):
+    """Findings 6/7: the FCS file next to the workspace was replaced by one with
+    a different event count; the saved arrays cannot belong to it."""
+    ws, s, values, fdw = _computed_workspace(tmp_path)
+    make_file(tmp_path, "a.fcs", seed=4, n=new_n)
+    ws2 = load_workspace(fdw)
+    t = ws2.samples[0]
+    t.ensure_loaded()
+    assert t.n_events == new_n
+    assert t.computed == {} and t.computed_info == {}
+    assert not {"tSNE 1", "tSNE_1", "CON"} & set(t.parameter_names())
+    assert t.root.find("/hi").count == 0  # empty like a gate on a missing parameter, no ValueError
+    assert t.root.find("/hi").mask().shape == (new_n,)
+    assert len(t.load_warnings) == 3 and all("500" in w and str(new_n) in w for w in t.load_warnings)
+    assert any("'tSNE 1'" in w for w in ws2.load_warnings) and all(w.startswith("a.fcs: ") for w in ws2.load_warnings)
+
+
+def test_ensure_loaded_drops_computed_arrays_that_do_not_fit_the_file(tmp_path):
+    """The workspace was opened while the FCS file was away (arrays kept, nothing
+    to compare with); the file that turns up later has other events."""
+    ws, s, values, fdw = _computed_workspace(tmp_path)
+    (tmp_path / "a.fcs").rename(tmp_path / "away.fcs")
+    ws2 = load_workspace(fdw)
+    t = ws2.samples[0]
+    assert list(t.computed) == ["tSNE 1", "tSNE_1", "CON"] and t.load_warnings == []
+    make_file(tmp_path, "a.fcs", seed=5, n=650)
+    assert t.ensure_loaded()
+    assert t.computed == {} and len(t.load_warnings) == 3
+    assert "'tSNE 1' was dropped" in t.load_warnings[0] and "650" in t.load_warnings[0]
+    assert t.root.find("/hi").count == 0
+    # an array that does not fit the events never reaches a gate either
+    t.computed["late"] = np.zeros(10, dtype=np.float32)
+    late = t.root.add_child(Population("late", RectangleGate(["late"], [None], [1.0])))
+    with pytest.raises(KeyError):
+        t.data("late")
+    assert late.count == 0 and late.mask().shape == (650,)
+
+
+def test_population_mask_treats_mismatched_computed_values_as_missing(sample):
+    sample.ensure_loaded()
+    n = sample.n_events
+    sample.add_computed("c", np.arange(n, dtype=np.float32))
+    pop = sample.root.add_child(Population("c-high", RectangleGate(["c"], [n / 2], [None])))
+    assert pop.count == n - int(np.ceil(n / 2))
+    # a stale array swapped in behind the model's back (as the loader used to)
+    sample.computed["c"] = np.arange(n + 7, dtype=np.float32)
+    pop.invalidate()
+    assert pop.count == 0
+    # other ValueErrors are bugs and still surface
+    class Broken(RectangleGate):
+        def evaluate(self, acc):
+            raise ValueError("boom")
+
+    bad = sample.root.add_child(Population("bad", Broken(["FSC-A"], [0], [None])))
+    with pytest.raises(ValueError, match="boom"):
+        bad.mask()
+
+
+def test_truncated_fcs_file_keeps_its_computed_arrays(tmp_path):
+    """$TOT promises more events than the DATA segment holds: the reader keeps
+    the events present, and the arrays computed for them must survive a reload
+    (the old check against the saved $TOT dropped them)."""
+    ev = make_synthetic_events(n=400, seed=6)["events"]
+    path = write_fcs(tmp_path / "t.fcs", ev, SYNTH_NAMES, SYNTH_STAINS, extra_keywords={"$TOT": "500"})
+    ws = Workspace()
+    s = ws.add_sample(path)
+    s.ensure_loaded()
+    assert s.n_events == 400 and s.keywords["$TOT"] == "500"
+    v = np.linspace(0, 1, 400, dtype=np.float32)
+    s.add_computed("UMAP 1", v)
+    save_workspace(ws, tmp_path / "t.fdw")
+    ws2 = load_workspace(tmp_path / "t.fdw")
+    t = ws2.samples[0]
+    t.ensure_loaded()
+    assert np.array_equal(t.computed["UMAP 1"], v) and t.load_warnings == [] and ws2.load_warnings == []
+
+
+def test_missing_or_unreadable_computed_data_is_reported(tmp_path):
+    """Finding 16: the .fdw was renamed / copied without its .fdw.data folder."""
+    ws, s, values, fdw = _computed_workspace(tmp_path)
+    renamed = tmp_path / "exp final.fdw"
+    shutil.copy(fdw, renamed)
+    ws2 = load_workspace(renamed)
+    t = ws2.samples[0]
+    assert t.computed == {} and t.load_error is None
+    assert len(ws2.load_warnings) == 3
+    for name, w in zip(("tSNE 1", "tSNE_1", "CON"), ws2.load_warnings):
+        assert w.startswith("a.fcs: ") and repr(name) in w and "exp final.fdw.data" in w and "missing" in w
+    assert t.load_warnings == [w[len("a.fcs: "):] for w in ws2.load_warnings]
+    # one file deleted, one corrupted: only those two are reported
+    data_dir = tmp_path / "exp.fdw.data"
+    files = json.loads(fdw.read_text())["samples"][0]["computed"]
+    (data_dir / files["tSNE_1"]["file"]).unlink()
+    (data_dir / files["CON"]["file"]).write_bytes(b"not an npy file")
+    ws3 = load_workspace(fdw)
+    t3 = ws3.samples[0]
+    assert list(t3.computed) == ["tSNE 1"] and np.array_equal(t3.computed["tSNE 1"], values["tSNE 1"])
+    assert len(ws3.load_warnings) == 2
+    assert "'tSNE_1'" in ws3.load_warnings[0] and "missing" in ws3.load_warnings[0]
+    assert "'CON'" in ws3.load_warnings[1] and "unreadable" in ws3.load_warnings[1]
+    # warnings are load-time state, never written to the file
+    save_workspace(ws3, tmp_path / "again.fdw")
+    assert "load_warnings" not in (tmp_path / "again.fdw").read_text()
+
+
+def test_save_removes_data_files_nothing_references(tmp_path, monkeypatch):
+    """Finding 35: arrays of removed computed parameters do not linger."""
+    import flowdesk.core.serialization as ser
+
+    ws, s, values, fdw = _computed_workspace(tmp_path)
+    data_dir = tmp_path / "exp.fdw.data"
+    names = lambda: sorted(p.name for p in data_dir.iterdir())  # noqa: E731
+    assert names() == ["sample1_0_tSNE_1.npy", "sample1_1_tSNE_1.npy", "sample1_2_CON.npy"]
+    (data_dir / "notes.txt").write_text("mine")  # not ours: never touched
+    s.remove_computed("CON")
+    save_workspace(ws, fdw)
+    assert names() == ["notes.txt", "sample1_0_tSNE_1.npy", "sample1_1_tSNE_1.npy"]
+    # a save that fails before the workspace file is written keeps every file
+    s.remove_computed("tSNE_1")
+
+    def failing_dump(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ser.json, "dump", failing_dump)
+    with pytest.raises(OSError):
+        save_workspace(ws, fdw)
+    monkeypatch.undo()
+    assert names() == ["notes.txt", "sample1_0_tSNE_1.npy", "sample1_1_tSNE_1.npy"]
+    save_workspace(ws, fdw)
+    assert names() == ["notes.txt", "sample1_0_tSNE_1.npy"]
+    ws2 = load_workspace(fdw)
+    assert list(ws2.samples[0].computed) == ["tSNE 1"] and ws2.load_warnings == []
+    # once nothing is left the folder goes (here after the foreign file is removed)
+    (data_dir / "notes.txt").unlink()
+    s.remove_computed("tSNE 1")
+    save_workspace(ws, fdw)
+    assert not data_dir.exists()
+
+
+def test_restore_keeps_renamed_population_objects(tmp_path):
+    """Finding 10: children are matched by id first, so undoing a rename brings
+    back the name on the same objects (name matching only as a fallback)."""
+    ws, s1, s2 = _rich_workspace(tmp_path, tmp_path)
+    cells = s1.find_population("/Cells")
+    kids = list(cells.children)
+    lymph = ws.group_by_name("Donors").root.find("/Lymph")
+    count = cells.count
+    snap = gating_snapshot(ws)
+    cells.name = "Renamed"
+    lymph.name = "Lymph renamed"
+    restore_snapshot(ws, snap)
+    assert s1.root.children[0] is cells and cells.name == "Cells" and cells.parent is s1.root
+    assert cells.children == kids and all(k.parent is cells for k in kids)
+    assert cells.count == count and cells.sample is s1
+    assert ws.group_by_name("Donors").root.children[0] is lymph and lymph.name == "Lymph"
+    # a child replaced by a clone (new id, same name) is still matched by name
+    snap = gating_snapshot(ws)
+    clone = cells.clone(deep=True)
+    s1.root.remove_child(cells)
+    s1.root.add_child(clone, 0)
+    restore_snapshot(ws, snap)
+    assert s1.root.children[0] is clone and clone.id == cells.id
+    # swapped names: ids decide which object gets which name
+    a, b = clone.children[0], clone.children[1]
+    a_name, b_name = a.name, b.name
+    snap = gating_snapshot(ws)
+    a.name, b.name = "tmp", a_name
+    restore_snapshot(ws, snap)
+    assert (a.name, b.name) == (a_name, b_name)

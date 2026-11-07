@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from flowdesk.core import analysis as A
+from flowdesk.core.compensation import SpilloverMatrix
 from flowdesk.core.fcs import Channel, write_fcs
 from flowdesk.core.gates import BooleanGate, PolygonGate, RectangleGate
 from flowdesk.core.layouts import Layout, LayoutItem, TableColumn, TableDef
@@ -24,7 +25,7 @@ from flowdesk.core.serialization import load_workspace, save_workspace
 from flowdesk.core.templates import apply_template, build_template, load_template, save_template
 from flowdesk.core.transforms import LinearScale, LogicleScale
 from flowdesk.core.wsp_export import export_wsp
-from flowdesk.core.wsp_import import flowjo_counts, import_wsp
+from flowdesk.core.wsp_import import UNRESOLVED_DIMENSION, flowjo_counts, import_wsp
 
 REAL_DIR = Path("/Users/lukasgerstung/Desktop/Desktop Staubsauger/recompensated T cell panel")
 REAL_WSP = REAL_DIR / "19-Aug-2025.wsp"
@@ -213,15 +214,88 @@ def test_import_gates_on_unknown_parameters_become_empty_populations(tmp_path):
         assert pop is not None, path
         assert pop.count == 0, path  # never "ungated": that would copy the parent's events
     assert s2.root.find("/Cells").count == s.root.find("/Cells").count
-    assert s2.root.find("/Cells/new dimension").gate.dims == ["fratio_1"]
+    assert s2.root.find("/Cells/new dimension").gate.dims == [UNRESOLVED_DIMENSION + "fratio_1"]
     joined = "\n".join(report.warnings)
     assert "CD4/CD8 is a FlowJo derived parameter (not imported)" in joined
     assert "APC-A is not a parameter of the FCS file" in joined
     assert "'fratio_1' is a transformed (ratio / new) dimension" in joined
+    assert "fratio_1 is not a parameter" not in joined  # reported once, by the gate
     assert "FlowJo derived parameters are not imported: Unused ratio" in joined
     # exporting it again leaves the unusable populations out instead of failing
     warnings = export_wsp(ws2, tmp_path / "re.wsp")
     assert any("ratio high" in w for w in warnings) and any("missing channel" in w for w in warnings)
+    assert any("/Cells/new dimension: gated on" in w for w in warnings)
+    names = {v for el in ET.parse(tmp_path / "re.wsp").getroot().iter() if el.tag.endswith("fcs-dimension") for k, v in el.attrib.items() if k.endswith("name")}
+    assert names == {"FSC-A", "SSC-A"}
+
+
+def _raw_fcs(path: Path, n: int, seed: int) -> np.ndarray:
+    """Write an FCS file like `_fcs` and return its events (float32)."""
+    rng = np.random.default_rng(seed)
+    events = np.column_stack(
+        [rng.normal(50000, 10000, n), rng.normal(30000, 8000, n), rng.lognormal(6, 1.2, n), rng.lognormal(5, 1.0, n)]
+    ).astype(np.float32)
+    write_fcs(path, events, CHANNELS, {})
+    return events
+
+
+def _comp_gate_workspace(tmp_path: Path, matrix: SpilloverMatrix, enabled: bool):
+    """One sample with `matrix` (enabled or not) and gates on the compensated
+    names Comp-FITC-A / Comp-PE-A. Returns (ws, events)."""
+    data = tmp_path / "data"
+    data.mkdir()
+    events = _raw_fcs(data / "s.fcs", 2000, 31)
+    ws = Workspace()
+    s = ws.add_sample(data / "s.fcs")
+    s.ensure_loaded()
+    s.set_compensation(matrix, enabled)
+    cells = s.root.add_child(Population("Cells", RectangleGate(["FSC-A"], [45000.0], [None])))
+    cells.add_child(Population("CD4+", RectangleGate(["Comp-FITC-A"], [400.0], [None])))
+    cells.add_child(Population("CD8 low", RectangleGate(["Comp-PE-A"], [None], [150.0])))
+    return ws, events
+
+
+def test_import_identity_matrix_comp_gates_count_without_false_warning(tmp_path):
+    """FlowJo writes identity matrices for uncompensated samples with gates on
+    Comp- names; those gates read the raw channels and are not reported."""
+    ws, ev = _comp_gate_workspace(tmp_path, SpilloverMatrix("Acquisition-defined", ["FITC-A", "PE-A"], np.eye(2)), True)
+    out = tmp_path / "ident.wsp"
+    assert export_wsp(ws, out) == []
+    ws2, report = import_wsp(out)
+    assert report.warnings == []
+    s2 = ws2.samples[0]
+    assert s2.comp is not None and s2.comp.is_identity
+    cells = ev[:, 0] >= 45000
+    assert s2.root.find("/Cells").count == int(cells.sum())
+    assert s2.root.find("/Cells/CD4+").count == int((cells & (ev[:, 2] >= 400)).sum()) > 0
+    assert s2.root.find("/Cells/CD8 low").count == int((cells & (ev[:, 3] <= 150)).sum()) > 0
+
+
+def test_import_disabled_identity_matrix_and_unavailable_comp_parameter(tmp_path):
+    ws, ev = _comp_gate_workspace(tmp_path, SpilloverMatrix("ident", ["FITC-A", "PE-A"], np.eye(2)), False)
+    base = tmp_path / "base.wsp"
+    export_wsp(ws, base)
+    # a gate on a compensated parameter whose channel the file does not have
+    gating = "http://www.isac-net.org/std/Gating-ML/v2.0/gating"
+    dt = "http://www.isac-net.org/std/Gating-ML/v2.0/datatypes"
+    tree = ET.parse(base)
+    cells_el = tree.getroot().find("SampleList/Sample/SampleNode/Subpopulations/Population")
+    parent_gid = cells_el.find("Gate").get(f"{{{gating}}}id")
+    pop = ET.SubElement(cells_el.find("Subpopulations"), "Population", {"name": "APC bright", "count": "5"})
+    gate = ET.SubElement(pop, "Gate", {f"{{{gating}}}id": "ID990001", f"{{{gating}}}parent_id": parent_gid})
+    rect = ET.SubElement(gate, f"{{{gating}}}RectangleGate", {"eventsInside": "1"})
+    dim = ET.SubElement(rect, f"{{{gating}}}dimension", {f"{{{gating}}}min": "100"})
+    ET.SubElement(dim, f"{{{dt}}}fcs-dimension", {f"{{{dt}}}name": "Comp-APC-A"})
+    odd = tmp_path / "odd.wsp"
+    tree.write(odd, encoding="UTF-8", xml_declaration=True)
+
+    ws2, report = import_wsp(odd)
+    s2 = ws2.samples[0]
+    cells = ev[:, 0] >= 45000
+    assert s2.root.find("/Cells/CD4+").count == int((cells & (ev[:, 2] >= 400)).sum()) > 0
+    assert s2.root.find("/Cells/CD8 low").count == int((cells & (ev[:, 3] <= 150)).sum()) > 0
+    assert s2.root.find("/Cells/APC bright").count == 0
+    assert report.warnings == ["Comp-APC-A is not a parameter of the FCS file: 1 population(s) gated on it stay empty (/Cells/APC bright) in s.fcs"]
 
 
 # ------------------------------------------------------------- 3. templates
@@ -293,6 +367,25 @@ def test_template_recreates_calibrated_parameters(tmp_path):
     pop = x.root.find("/Cells/MESF high")
     expected = int(((x.data("FITC-A") * 5.0 >= 5000.0) & x.root.find("/Cells").mask()).sum())
     assert pop.count == pytest.approx(expected, abs=2) and pop.count > 0
+
+
+def test_template_skips_calibrations_nothing_is_gated_on(tmp_path):
+    from flowdesk.core import calibration as cal
+
+    ws = _workspace(tmp_path)
+    a = ws.samples[0]
+    fit = cal.fit_calibration([100.0, 1000.0, 10000.0], [500.0, 5000.0, 50000.0], param="FITC-A")
+    name = cal.apply_calibration(a, fit, "FITC-A")
+    cal.store_calibration(ws, fit, "FITC-A")
+    tpl = build_template(ws)
+    assert "FITC-A" in tpl["settings"]["calibrations"]  # stored, but no gate uses it
+
+    ws2 = Workspace()
+    (tmp_path / "new").mkdir()
+    x = ws2.add_sample(_fcs(tmp_path / "new" / "x.fcs", 500, 21))
+    report = apply_template(ws2, tpl)
+    assert report["calibrated"] == 0
+    assert name not in x.computed and x.root.find("/Cells") is not None
 
 
 # ------------------------------------------------------ 4. layout / table
@@ -522,6 +615,74 @@ def test_layout_edits_are_undo_steps(app, tmp_path):
         ctl.undo()
         ctl.undo()
         assert len(layout.items) == 1 and a.root.find("/Cells") is not None
+    finally:
+        editor.flush_notify()
+        editor.hide()
+        editor.deleteLater()
+
+
+def test_layout_edits_coalesce_per_item_and_interaction(app, tmp_path):
+    """Finding 11: only the notifications of one interaction on the same items
+    merge into one undo step; the step ends on mouse release / focus out, not
+    after a wall-clock window, so quick successive edits stay separate."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    from flowdesk.ui.controller import WorkspaceController
+    from flowdesk.ui.layout_editor import LayoutEditorWindow
+
+    ws = _workspace(tmp_path)
+    ctl = WorkspaceController(ws)
+    editor = LayoutEditorWindow(ctl)
+    editor.show()
+    app.processEvents()
+    try:
+        layout = editor.current_layout()
+        layout.items[:] = [LayoutItem(x=0.0, y=0.0), LayoutItem(x=100.0, y=300.0), LayoutItem(kind="text", text="hello", x=50.0, y=500.0)]
+        ctl.layoutsChanged.emit()  # rebuilt from the model, which is the baseline
+        a, b, t = layout.items
+        ga, gb, gt = (editor.scene_item(i) for i in (a, b, t))
+        steps = len(ctl._undo)
+        # one drag of a, several timer flushes: one step
+        for x in (10.0, 20.0, 30.0):
+            ga.setPos(x, 0.0)
+            editor.flush_notify()
+        assert len(ctl._undo) == steps + 1
+        # dragging b right after (no release seen in between): a step of its own
+        gb.setPos(110.0, 300.0)
+        editor.flush_notify()
+        assert len(ctl._undo) == steps + 2
+        # finishing a text edit (focus out) is one more
+        gt.start_editing()
+        gt.setPlainText("world")
+        gt.clearFocus()
+        app.processEvents()
+        assert t.text == "world" and len(ctl._undo) == steps + 3
+        # picking the batch group is one more
+        other = next(g.name for g in ws.groups if g.name != editor.group_combo.currentText())
+        editor.group_combo.setCurrentText(other)
+        editor.flush_notify()
+        assert layout.batch_group == other and len(ctl._undo) == steps + 4
+        # two drags of the same item separated by a mouse release: two steps
+        gb.setPos(120.0, 300.0)
+        editor.flush_notify()
+        QTest.mouseRelease(editor.view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(5, 5))
+        gb.setPos(130.0, 300.0)
+        editor.flush_notify()
+        assert len(ctl._undo) == steps + 6
+        expected = [
+            (130.0, 30.0, "world", other),  # present
+            (120.0, 30.0, "world", other),
+            (110.0, 30.0, "world", other),
+            (110.0, 30.0, "world", None),
+            (110.0, 30.0, "hello", None),
+            (100.0, 30.0, "hello", None),
+            (100.0, 0.0, "hello", None),
+        ]
+        assert (b.x, a.x, t.text, layout.batch_group) == expected[0]
+        for state in expected[1:]:
+            ctl.undo()
+            assert (b.x, a.x, t.text, layout.batch_group) == state
     finally:
         editor.flush_notify()
         editor.hide()

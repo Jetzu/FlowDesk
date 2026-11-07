@@ -239,7 +239,6 @@ def test_louvain_recovers_planted_partition():
     assert adjusted_rand_score(truth, labels) == 1.0
     # ids 1..m, largest community first
     assert list(np.bincount(labels)[1:]) == [60, 50, 40, 30]
-    assert A.modularity(adj, labels) == pytest.approx(A.modularity(adj, truth))
     # deterministic for a seed, dense input accepted, other seeds agree too
     np.testing.assert_array_equal(A.louvain(adj, 1.0, seed=0), labels)
     assert adjusted_rand_score(truth, A.louvain(adj, 1.0, seed=7)) == 1.0
@@ -254,6 +253,147 @@ def test_louvain_recovers_planted_partition():
     # lower resolution merges communities; no edges -> singletons
     assert len(np.unique(A.louvain(adj, 0.01, 0))) < 4
     assert list(A.louvain(np.zeros((3, 3)))) == [1, 2, 3]
+
+
+def _two_triangles():
+    """Triangles 0-1-2 and 3-4-5 joined by the edge 2-3 (6 nodes, 7 edges)."""
+    adj = np.zeros((6, 6))
+    for i, j in [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5), (2, 3)]:
+        adj[i, j] = adj[j, i] = 1.0
+    return adj
+
+
+def test_modularity_hand_computed():
+    adj = _two_triangles()
+    split = [0, 0, 0, 1, 1, 1]
+    # 2m = 14; inside weight (both directions) 2 * 6 = 12; community degrees 7 and 7
+    assert A.modularity(adj, split) == pytest.approx(12 / 14 - (7**2 + 7**2) / 14**2)  # 5/14
+    assert A.modularity(adj, split) == pytest.approx(5 / 14)
+    assert A.modularity(adj, split, resolution=0.5) == pytest.approx(12 / 14 - 0.5 * 98 / 196)  # 17/28
+    assert A.modularity(adj, split, resolution=0.5) == pytest.approx(0.607142857)
+    # all singletons: nothing inside, -sum k_i^2 / (2m)^2 with degrees 2, 2, 3, 3, 2, 2
+    assert A.modularity(adj, np.arange(6)) == pytest.approx(-(4 + 4 + 9 + 9 + 4 + 4) / 196)
+    assert A.modularity(adj, np.zeros(6)) == pytest.approx(0.0)  # one community: 14/14 - 1
+    # weighted path 0 -(2)- 1 -(1)- 2, split {0, 1} | {2}: 2m = 6, degrees 2, 3, 1
+    path = np.array([[0, 2, 0], [2, 0, 1], [0, 1, 0]], dtype=float)
+    assert A.modularity(path, [0, 0, 1]) == pytest.approx(4 / 6 - (5**2 + 1**2) / 36)  # -1/18
+    # Louvain finds the two triangles
+    labels = A.louvain(adj, 1.0, seed=0)
+    assert {frozenset(np.flatnonzero(labels == k)) for k in np.unique(labels)} == {frozenset({0, 1, 2}), frozenset({3, 4, 5})}
+
+
+def _dense_modularity(adj, comm, resolution=1.0):
+    """Q = 1/2m sum_ij (A_ij - gamma k_i k_j / 2m) delta(c_i, c_j), straight from the definition."""
+    k = adj.sum(axis=1)
+    m2 = k.sum()
+    same = np.asarray(comm)[:, None] == np.asarray(comm)[None, :]
+    return float((adj - resolution * np.outer(k, k) / m2)[same].sum() / m2)
+
+
+def test_louvain_local_moving_reaches_a_local_optimum():
+    """After the local moving phase no single node can raise modularity by
+    joining a neighbouring community (random weighted graphs with self-loops,
+    as in aggregated Louvain levels)."""
+    import scipy.sparse as sp
+
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        n = int(rng.integers(30, 70))
+        adj = (rng.random((n, n)) < 0.15) * rng.random((n, n))
+        adj = np.triu(adj, 1)
+        adj = adj + adj.T
+        adj[np.diag_indices(n)] = (rng.random(n) < 0.3) * rng.random(n)
+        for resolution in (1.0, 0.5):
+            comm, _moves = A._louvain_local_moving(sp.csr_matrix(adj), resolution, np.random.default_rng(seed))
+            q0 = _dense_modularity(adj, comm, resolution)
+            for i in range(n):
+                for c in set(comm[np.flatnonzero(adj[i] > 0)]) - {comm[i]}:
+                    moved = comm.copy()
+                    moved[i] = c
+                    assert _dense_modularity(adj, moved, resolution) <= q0 + 1e-10, (seed, resolution, i, c)
+
+
+def _cancel_after(n_polls):
+    """should_cancel that turns True at its n-th call (and counts the calls)."""
+    calls = [0]
+
+    def should_cancel():
+        calls[0] += 1
+        return calls[0] >= n_polls
+
+    return should_cancel, calls
+
+
+def _blobs(n=400, d=4, seed=0):
+    rng = np.random.default_rng(seed)
+    return np.vstack([rng.normal(c, 1.0, (n, d)) for c in rng.normal(0, 6, (3, d))])
+
+
+@pytest.mark.parametrize("engine", ["openTSNE", "scikit-learn"])
+def test_tsne_cancelled_inside_the_fit(monkeypatch, engine):
+    if engine == "openTSNE" and not A.has_opentsne():
+        pytest.skip("openTSNE not installed")
+    if engine == "scikit-learn":
+        monkeypatch.setattr(A, "has_opentsne", lambda: False)
+    X = _blobs(150)
+    # one poll happens before the fit and one after it: a third poll can only
+    # come from inside the optimisation
+    stop, calls = _cancel_after(3)
+    with pytest.raises(A.Cancelled):
+        A.fit_tsne(X, perplexity=20, iterations=5000, seed=0, should_cancel=stop)
+    assert calls[0] >= 3
+    if engine == "scikit-learn":
+        # the per-iteration hook does not change scikit-learn's result
+        plain, _ = A.fit_tsne(X[:120], perplexity=20, iterations=250, seed=0)
+        polled, _ = A.fit_tsne(X[:120], perplexity=20, iterations=250, seed=0, should_cancel=lambda: False)
+        np.testing.assert_array_equal(plain, polled)
+
+
+@pytest.mark.skipif(not A.has_umap(), reason="umap-learn not installed")
+def test_umap_cancelled_during_the_epochs():
+    X = _blobs(150)
+    stop, calls = _cancel_after(3)  # before the fit, then the epoch progress
+    with pytest.raises(A.Cancelled):
+        A.fit_umap(X, n_neighbors=10, seed=0, should_cancel=stop)
+    assert calls[0] == 3
+    a, _ = A.fit_umap(X, n_neighbors=10, seed=0)
+    b, _ = A.fit_umap(X, n_neighbors=10, seed=0, should_cancel=lambda: False)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_clusterings_cancelled_inside_the_fit():
+    X = _blobs(300)
+    for fn in (
+        lambda stop: A.run_kmeans(X, 5, seed=0, should_cancel=stop),  # between initialisations
+        lambda stop: A.run_flowsom(X, (5, 5), 3, iterations=20, seed=0, should_cancel=stop),  # per SOM iteration
+        lambda stop: A.run_phenograph(X, k=15, seed=0, should_cancel=stop),  # graph chunks / Louvain levels
+    ):
+        stop, calls = _cancel_after(2)
+        with pytest.raises(A.Cancelled):
+            fn(stop)
+    stop, calls = _cancel_after(4)
+    with pytest.raises(A.Cancelled):
+        A.run_kmeans(X, 5, seed=0, should_cancel=stop)
+    assert calls[0] == 4  # one poll per initialisation
+    stop, calls = _cancel_after(7)
+    with pytest.raises(A.Cancelled):
+        A.train_som(X, (4, 4), iterations=10, should_cancel=stop)
+    assert calls[0] == 7
+    stop, calls = _cancel_after(2)
+    with pytest.raises(A.Cancelled):
+        A.louvain(A.knn_jaccard_graph(X, 10), 1.0, 0, should_cancel=stop)
+
+
+def test_kmeans_matches_sklearn_n_init_10():
+    """Running the ten initialisations one by one (to poll should_cancel)
+    gives scikit-learn's KMeans(n_init=10) result."""
+    from sklearn.cluster import KMeans
+
+    for seed in range(4):
+        X = _blobs(200, seed=seed)
+        for k in (2, 3, 6):
+            expected = A._renumber(KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(X))
+            np.testing.assert_array_equal(A.run_kmeans(X, k, seed), expected)
 
 
 def test_knn_jaccard_graph_weights():

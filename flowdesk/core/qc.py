@@ -24,10 +24,22 @@ FlowJo users run before gating:
   A whole segment is flagged when its level differs from the run median by
   more than ``z`` single-bin noise SDs and ``min_effect``.  This catches long
   shifted stretches that inflate the MAD and escape the per-bin test.
+* The number of time bins follows the event count: at most the requested
+  number, about ``events_per_bin`` (50) events per bin, but at least 10 bins.
+  The noise of a bin is never taken as smaller than its counting noise
+  (Poisson SD of the median bin count for the rate, sampling SD of the bin
+  median / trimmed mean for the signal), so sparse bins are not flagged for
+  chance fluctuations.  The rate check needs on average at least 10 (and
+  z²) events per bin and three distinct time values; below that it is
+  reported as not tested, as are signal bins with fewer than
+  ``min_bin_events`` events.
 * **Dynamic range** - per event: values at / above the detector maximum
   (``$PnR`` - 1) and values piled up exactly at the data maximum (saturated
   events); optionally also events piled up at the data minimum (clipped),
-  as PeacoQC's ``RemoveMargins`` does.
+  as PeacoQC's ``RemoveMargins`` does.  A constant (e.g. an unused detector
+  exported as zeros) or two-valued parameter has no pile-up test, and a
+  limit or pile-up that would remove more than ``max_fraction`` of the
+  events is reported in the notes instead of applied.
 
 `qc_summary` combines them into a per-event "good" mask, a per-bin table and
 the percentage removed by every check; `qc_time_ranges` converts a mask into
@@ -49,6 +61,10 @@ CHECK_LABELS = {"rate": "Flow rate", "signal": "Signal stability", "range": "Dyn
 MODES = ("flag", "time")
 
 _MAD_K = 1.4826
+MIN_BINS = 10  # adaptive binning never goes below this (unless fewer are requested)
+EVENTS_PER_BIN = 50  # target events per time bin
+MIN_RATE_EVENTS = 10  # mean events per bin the flow-rate check needs
+_FLOOR_SAMPLE = 20000  # values used to estimate a parameter's spread for the noise floor
 _NON_QC_PREFIXES = ("TIME", "EVENT", "INDEX", "SAMPLEID", "HDR-T", "DELTATIME", "SORT", "REGIONCLASSIFICATION", "BEAD")
 _TIME_ALIASES = ("HDR-T",)  # MACSQuant
 
@@ -71,6 +87,25 @@ def _diff_noise(x: np.ndarray) -> float:
     if x.size < 3:
         return 0.0
     return _MAD_K * float(np.median(np.abs(np.diff(x)))) / math.sqrt(2.0)
+
+
+def auto_bin_count(n_events: int, n_bins: int = 100, events_per_bin: int = EVENTS_PER_BIN, min_bins: int = MIN_BINS) -> int:
+    """Number of time bins for `n_events` events: at most `n_bins`, about
+    `events_per_bin` events per bin, at least `min_bins` (or `n_bins` when
+    fewer are requested). events_per_bin <= 0 keeps `n_bins`."""
+    n = max(1, int(n_bins))
+    if events_per_bin is None or int(events_per_bin) <= 0:
+        return n
+    return max(1, min(n, max(int(min_bins), int(n_events) // int(events_per_bin))))
+
+
+def _distinct_at_least_3(t: np.ndarray) -> bool:
+    """True when the finite values of `t` take at least three distinct values."""
+    t = t[np.isfinite(t)]
+    if t.size < 3:
+        return False
+    lo, hi = float(t.min()), float(t.max())
+    return hi > lo and bool(((t > lo) & (t < hi)).any())
 
 
 def bin_events(time, n_bins: int = 100, edges=None) -> tuple[np.ndarray, np.ndarray]:
@@ -148,16 +183,21 @@ class SeriesFlags:
     segments: list[tuple[int, int, float, bool]] = field(default_factory=list)  # start, stop, level, flagged
 
 
-def flag_series(x, z: float = 3.0, min_effect: float = 0.0, changepoints: bool = True, cp_threshold: float | None = None) -> SeriesFlags:
-    """Flag bins of a series that deviate from its median (NaN = untested)."""
+def flag_series(x, z: float = 3.0, min_effect: float = 0.0, changepoints: bool = True, cp_threshold: float | None = None, noise_floor: float = 0.0) -> SeriesFlags:
+    """Flag bins of a series that deviate from its median (NaN = untested).
+
+    noise_floor: the known sampling SD of a single bin (counting noise); the
+    robust spread and the change-point noise estimates are never taken as
+    smaller, so a series of few, sparse bins is not flagged by chance."""
     x = np.asarray(x, dtype=float)
     flags = np.zeros(x.shape, dtype=bool)
     valid = np.isfinite(x)
     v = x[valid]
     if v.size < 3:
         return SeriesFlags(flags)
+    floor = float(noise_floor) if noise_floor is not None and math.isfinite(float(noise_floor)) and noise_floor > 0 else 0.0
     center, spread = _robust(v)
-    spread = max(spread, 1e-12 * max(1.0, abs(center)))
+    spread = max(spread, floor, 1e-12 * max(1.0, abs(center)))
     threshold = max(z * spread, float(min_effect))
     dev = v - center
     out = np.abs(dev) > threshold
@@ -172,7 +212,7 @@ def flag_series(x, z: float = 3.0, min_effect: float = 0.0, changepoints: bool =
     fv = (np.abs(dev) > 1.5 * threshold) | (out & support)
     segments: list[tuple[int, int, float, bool]] = []
     if changepoints and v.size >= 6:
-        noise = _diff_noise(v) or spread
+        noise = max(_diff_noise(v), floor) or spread
         clip = max(6.0 * spread, 3.0 * float(min_effect))
         clipped = np.clip(v, center - clip, center + clip)
         thr = cp_threshold if cp_threshold is not None else max(4.0, z + 1.0)
@@ -180,7 +220,7 @@ def flag_series(x, z: float = 3.0, min_effect: float = 0.0, changepoints: bool =
         if len(segs) > 1:
             levels = [float(np.median(v[a:b])) for a, b in segs]
             resid = np.concatenate([v[a:b] - lvl for (a, b), lvl in zip(segs, levels)])
-            within = _MAD_K * float(np.median(np.abs(resid))) or noise
+            within = max(_MAD_K * float(np.median(np.abs(resid))), floor) or noise
             # a segment counts when its level is off by more than z noise SDs
             # of a single bin (the noise without the level shifts) - slow
             # drift inside the noise is tolerated - and by min_effect
@@ -211,19 +251,53 @@ class RateCheck:
     spread: float
     threshold: float
     event_bins: np.ndarray
+    tested: bool = True  # False: too few events per bin / time values to test the rate
+    note: str = ""
 
 
-def flow_rate_check(time, n_bins: int = 100, z: float = 3.0, min_rate_change: float = 0.1, ramp: bool = True, changepoints: bool = True, edges=None) -> RateCheck:
+def rate_untested_reason(time, n_bins: int, z: float = 3.0) -> str:
+    """Why a flow-rate check over `n_bins` bins would be uninformative ("" if
+    it is not): fewer than three distinct time values, or on average fewer
+    than max(MIN_RATE_EVENTS, z^2) events per bin (below z^2 even a full stop
+    of the flow stays within the counting noise)."""
+    t = np.asarray(time, dtype=float)
+    if not _distinct_at_least_3(t):
+        return "fewer than 3 distinct time values"
+    need = max(float(MIN_RATE_EVENTS), float(z) ** 2)
+    per_bin = int(np.isfinite(t).sum()) / max(1, int(n_bins))
+    if per_bin < need:
+        return f"{per_bin:.1f} events per time bin (needs {need:g})"
+    return ""
+
+
+def flow_rate_check(time, n_bins: int = 100, z: float = 3.0, min_rate_change: float = 0.1, ramp: bool = True, changepoints: bool = True, edges=None,
+                    events_per_bin: int = EVENTS_PER_BIN) -> RateCheck:
     """Events per time bin; flags bins whose rate deviates from the median rate
-    by more than z robust SDs (and min_rate_change x median), plus the bins at
-    the start / end of the acquisition while the rate ramps."""
-    edges, idx = bin_events(time, n_bins, edges)
+    by more than z robust SDs (never less than the Poisson SD of the median
+    bin count) and min_rate_change x median, plus the bins at the start / end
+    of the acquisition while the rate ramps.
+
+    Without explicit edges at most `n_bins` bins are used, about
+    `events_per_bin` events each (at least MIN_BINS). Too few events per bin
+    or fewer than three distinct time values leave the check untested
+    (`tested` False, nothing flagged, the reason in `note`)."""
+    t = np.asarray(time, dtype=float)
+    if edges is None:
+        n_bins = auto_bin_count(int(np.isfinite(t).sum()), n_bins, events_per_bin)
+    edges, idx = bin_events(t, n_bins, edges)
     n = edges.size - 1
-    counts = np.bincount(idx[idx >= 0], minlength=n).astype(float)
+    binned = idx >= 0
+    counts = np.bincount(idx[binned], minlength=n).astype(float)
     width = np.diff(edges)
     rates = np.where(width > 0, counts / np.where(width > 0, width, 1.0), 0.0)
     center = float(np.median(rates)) if n else 0.0
-    sf = flag_series(rates, z, min_rate_change * abs(center), changepoints)
+    reason = rate_untested_reason(t[binned], n, z)
+    if reason:
+        none = np.zeros(n, dtype=bool)
+        return RateCheck(edges, counts, rates, none, none.copy(), center, float("nan"), float("nan"), idx, False, reason)
+    pos = width > 0
+    poisson = math.sqrt(max(float(np.median(counts)), 1.0)) / float(np.median(width[pos])) if pos.any() else 0.0
+    sf = flag_series(rates, z, min_rate_change * abs(center), changepoints, noise_floor=poisson)
     flags = sf.flags.copy()
     ramp_flags = np.zeros(n, dtype=bool)
     if ramp and n >= 4 and math.isfinite(sf.threshold):
@@ -238,7 +312,7 @@ def flow_rate_check(time, n_bins: int = 100, z: float = 3.0, min_rate_change: fl
                 else:
                     break
         flags |= ramp_flags
-    return RateCheck(edges, counts, rates, flags, ramp_flags, sf.center, sf.spread, sf.threshold, idx)
+    return RateCheck(edges, counts, rates, flags, ramp_flags, sf.center, sf.spread, sf.threshold, idx, True, "")
 
 
 @dataclass
@@ -251,6 +325,17 @@ class SignalCheck:
     thresholds: dict[str, float]
     event_bins: np.ndarray
     statistics: dict[str, str] = field(default_factory=dict)  # "median" or "trimmed mean"
+    tested: dict[str, int] = field(default_factory=dict)  # per parameter: bins whose statistic was tested
+
+    @property
+    def bins_tested(self) -> int:
+        """Bins in which at least one parameter was tested."""
+        n = self.edges.size - 1
+        any_tested = np.zeros(n, dtype=bool)
+        for name, med in self.medians.items():
+            if self.tested.get(name, 0):
+                any_tested |= np.isfinite(med)
+        return int(any_tested.sum())
 
 
 STATISTICS = ("auto", "median", "mean")
@@ -305,25 +390,63 @@ def bin_medians(values, idx: np.ndarray, n_bins: int, min_events: int = 20, stat
     return out
 
 
-def signal_stability_check(time, values_by_param: dict, n_bins: int = 100, z: float = 3.0, min_shift: float = 0.02, changepoints: bool = True, min_bin_events: int = 20, edges=None, statistic: str = "auto") -> SignalCheck:
+def statistic_noise(values, idx: np.ndarray, n_bins: int, statistic: str = "median", min_events: int = 20) -> float:
+    """Sampling SD of one bin's statistic for a bin of median size: 1.2533 x
+    robust SD / sqrt(n) for the median, winsorized SD / (0.8 sqrt(n)) for the
+    10 % trimmed mean. n is the median event count of the bins holding at
+    least min_events events; 0 when no bin does."""
+    v = np.asarray(values, dtype=float)
+    ok = (idx >= 0) & np.isfinite(v)
+    if not ok.any():
+        return 0.0
+    counts = np.bincount(idx[ok], minlength=n_bins)
+    counts = counts[counts >= max(1, min_events)]
+    if counts.size == 0:
+        return 0.0
+    m = float(np.median(counts))
+    x = v[ok]
+    if x.size > _FLOOR_SAMPLE:
+        x = x[:: int(math.ceil(x.size / _FLOOR_SAMPLE))]
+    if statistic in ("trimmed mean", "mean"):
+        lo, hi = np.percentile(x, [100 * TRIM, 100 * (1 - TRIM)])
+        sd = float(np.std(np.clip(x, lo, hi)))
+        return sd / ((1.0 - 2.0 * TRIM) * math.sqrt(m))
+    sd = _MAD_K * float(np.median(np.abs(x - np.median(x))))
+    if sd <= 0:
+        sd = float(np.std(x))
+    return 1.2533 * sd / math.sqrt(m)
+
+
+def signal_stability_check(time, values_by_param: dict, n_bins: int = 100, z: float = 3.0, min_shift: float = 0.02, changepoints: bool = True, min_bin_events: int = 20, edges=None, statistic: str = "auto",
+                           events_per_bin: int = EVENTS_PER_BIN) -> SignalCheck:
     """Per bin and parameter the median of the display-space (0..1) values;
     a bin is flagged when any parameter's median deviates from the run median
-    by more than z robust SDs (and min_shift display units) or lies in a
-    change-point segment whose level shifted by more than min_shift."""
-    edges, idx = bin_events(time, n_bins, edges)
+    by more than z robust SDs (never less than the sampling SD of a bin
+    median) and min_shift display units, or lies in a change-point segment
+    whose level shifted by more than that. Bins with fewer than
+    min_bin_events events are not tested (`tested` counts the tested bins
+    per parameter; a series of fewer than three tested bins is not tested at
+    all). Without explicit edges the bin count adapts as in flow_rate_check."""
+    t = np.asarray(time, dtype=float)
+    if edges is None:
+        n_bins = auto_bin_count(int(np.isfinite(t).sum()), n_bins, events_per_bin)
+    edges, idx = bin_events(t, n_bins, edges)
     n = edges.size - 1
-    medians, flags, centers, thresholds, stats = {}, {}, {}, {}, {}
+    medians, flags, centers, thresholds, stats, tested = {}, {}, {}, {}, {}, {}
     any_flags = np.zeros(n, dtype=bool)
     for name, values in values_by_param.items():
         stats[name] = location_statistic(values, statistic)
         med = bin_medians(values, idx, n, min_bin_events, stats[name])
-        sf = flag_series(med, z, min_shift, changepoints)
+        floor = statistic_noise(values, idx, n, stats[name], min_bin_events)
+        sf = flag_series(med, z, min_shift, changepoints, noise_floor=floor)
+        k = int(np.isfinite(med).sum())
         medians[name] = med
         flags[name] = sf.flags
         centers[name] = sf.center
         thresholds[name] = sf.threshold
+        tested[name] = k if k >= 3 else 0
         any_flags |= sf.flags
-    return SignalCheck(edges, medians, flags, any_flags, centers, thresholds, idx, stats)
+    return SignalCheck(edges, medians, flags, any_flags, centers, thresholds, idx, stats, tested)
 
 
 @dataclass
@@ -346,6 +469,10 @@ def _limits(spec) -> tuple[float | None, float | None]:
     return None, (float(top) if top is not None and math.isfinite(float(top)) else None)
 
 
+def _add_note(notes: dict, name: str, text: str):
+    notes[name] = f"{notes[name]}; {text}" if notes.get(name) else text
+
+
 def dynamic_range_check(values_by_param: dict, scales: dict | None = None, min_pile: int = 3, check_low: bool = False, max_fraction: float = 0.2) -> RangeCheck:
     """Flag events at the detector maximum or minimum (saturated / clipped).
 
@@ -354,8 +481,11 @@ def dynamic_range_check(values_by_param: dict, scales: dict | None = None, min_p
     (lo, hi) pair; parameters without one only use pile-up detection.
     An event is flagged when it lies at or above hi - 1 (hi = $PnR), at or
     below lo, or sits with at least `min_pile` events exactly on the data
-    maximum (or minimum, when check_low). A limit that would remove more than
-    `max_fraction` of the events is taken as wrong metadata and ignored."""
+    maximum (or minimum, when check_low). A limit or pile-up that would
+    remove more than `max_fraction` of the events is taken as wrong metadata
+    (or not a detector artefact) and ignored with a note. A parameter with
+    fewer than three distinct values (e.g. an unused detector exported as
+    zeros) has no pile-up test: its maximum is not saturation."""
     scales = scales or {}
     flags = None
     counts: dict[str, int] = {}
@@ -377,25 +507,30 @@ def dynamic_range_check(values_by_param: dict, scales: dict | None = None, min_p
             if over.mean() <= max_fraction:
                 own |= over
             else:
-                notes[name] = f"upper limit {hi:g} ignored ({100 * over.mean():.0f}% of events above it)"
+                _add_note(notes, name, f"upper limit {hi:g} ignored ({100 * over.mean():.0f}% of events above it)")
                 hi = None
         if lo is not None and check_low:
             under = finite & (v <= lo)
             if under.mean() <= max_fraction:
                 own |= under
             else:
-                notes[name] = f"lower limit {lo:g} ignored"
+                _add_note(notes, name, f"lower limit {lo:g} ignored ({100 * under.mean():.0f}% of events below it)")
                 lo = None
         vmax, vmin = float(v[finite].max()), float(v[finite].min())
-        tol = 1e-6 * max(1.0, abs(vmax))
-        at_max = finite & (v >= vmax - tol)
-        if at_max.sum() >= min_pile:
-            own |= at_max
-        if check_low:
-            tol = 1e-6 * max(1.0, abs(vmin))
-            at_min = finite & (v <= vmin + tol)
-            if at_min.sum() >= min_pile:
-                own |= at_min
+        at_max = finite & (v >= vmax - 1e-6 * max(1.0, abs(vmax)))
+        at_min = finite & (v <= vmin + 1e-6 * max(1.0, abs(vmin)))
+        if at_max[finite].all():
+            _add_note(notes, name, f"constant ({vmax:g}): no pile-up check")
+        elif (at_max | at_min)[finite].all():
+            _add_note(notes, name, f"two values only ({vmin:g}, {vmax:g}): no pile-up check")
+        else:
+            for side, pile, value in (("maximum", at_max, vmax), ("minimum", at_min if check_low else None, vmin)):
+                if pile is None or pile.sum() < min_pile:
+                    continue
+                if pile.mean() <= max_fraction:
+                    own |= pile
+                else:
+                    _add_note(notes, name, f"pile-up at the data {side} {value:g} ignored ({100 * pile.mean():.0f}% of events)")
         counts[name] = int(own.sum())
         used[name] = (lo, hi)
         flags |= own
@@ -431,6 +566,8 @@ class QCResult:
     population_path: str | None = None
     time_param: str | None = None
     sample_id: int | None = None
+    # time bins each time-based check actually tested ("rate", "signal"); 0 = not tested
+    check_bins: dict[str, int] = field(default_factory=dict)
 
     @property
     def n_events(self) -> int:
@@ -447,6 +584,12 @@ class QCResult:
     @property
     def params(self) -> list[str]:
         return list(self.medians.keys())
+
+    def bins_tested(self, check: str) -> int | None:
+        """Time bins the rate / signal check tested (None for other checks)."""
+        if check not in ("rate", "signal") or check not in self.checks:
+            return None
+        return int(self.check_bins.get(check, self.n_bins))
 
     def flagged_by(self, i: int) -> list[str]:
         return [k for k, f in self.bin_flags.items() if f[i]]
@@ -473,6 +616,7 @@ class QCResult:
             "percent_removed": dict(self.percent_removed),
             "flagged_bins": int(self.flagged_bins.sum()),
             "bins": self.n_bins,
+            "bins_tested": {k: self.bins_tested(k) for k in self.checks if k in ("rate", "signal")},
             "intervals": len(self.intervals),
         }
 
@@ -505,19 +649,24 @@ def qc_time_ranges(mask, time) -> list[tuple[float, float]]:
 def qc_summary(time, signal_values: dict | None = None, range_values: dict | None = None, limits: dict | None = None, *,
                checks=CHECKS, n_bins: int = 100, z: float = 3.0, rate_z: float | None = None, signal_z: float | None = None,
                min_rate_change: float = 0.1, min_shift: float = 0.02, changepoints: bool = True, ramp: bool = True,
-               min_bin_events: int = 20, min_pile: int = 3, check_low: bool = False, statistic: str = "auto") -> QCResult:
+               min_bin_events: int = 20, min_pile: int = 3, check_low: bool = False, statistic: str = "auto",
+               events_per_bin: int = EVENTS_PER_BIN) -> QCResult:
     """Run the selected checks and combine them.
 
     time: per-event acquisition time. signal_values: display-space values per
     parameter for the signal check. range_values: data-unit values per
     parameter for the dynamic-range check (defaults to signal_values) with
-    `limits` per parameter (see dynamic_range_check)."""
+    `limits` per parameter (see dynamic_range_check). n_bins is the largest
+    number of time bins; fewer are used when there are less than
+    events_per_bin events per bin (at least MIN_BINS; events_per_bin 0 keeps
+    n_bins). `check_bins` reports the bins the rate / signal checks tested,
+    `notes` why a check could not test."""
     t = np.asarray(time, dtype=float)
     n_ev = t.size
     checks = tuple(c for c in CHECKS if c in tuple(checks))
     signal_values = signal_values or {}
     range_values = range_values if range_values is not None else signal_values
-    edges, idx = bin_events(t, n_bins)
+    edges, idx = bin_events(t, auto_bin_count(int(np.isfinite(t).sum()), n_bins, events_per_bin))
     nb = edges.size - 1
     counts = np.bincount(idx[idx >= 0], minlength=nb).astype(float)
     width = np.diff(edges)
@@ -528,6 +677,7 @@ def qc_summary(time, signal_values: dict | None = None, range_values: dict | Non
     notes: dict[str, str] = {}
     rate_center = rate_threshold = float("nan")
     statistics: dict[str, str] = {}
+    check_bins: dict[str, int] = {}
     binned = idx >= 0
 
     def events_in(flags_per_bin: np.ndarray) -> np.ndarray:
@@ -540,6 +690,9 @@ def qc_summary(time, signal_values: dict | None = None, range_values: dict | Non
         rc = flow_rate_check(t, z=rate_z if rate_z is not None else z, min_rate_change=min_rate_change, ramp=ramp, changepoints=changepoints, edges=edges)
         bin_flags["rate"] = rc.flags
         rate_center, rate_threshold = rc.center, rc.threshold
+        check_bins["rate"] = nb if rc.tested else 0
+        if not rc.tested:
+            notes[CHECK_LABELS["rate"]] = f"not tested ({rc.note})"
         bad = events_in(rc.flags)
         percent["rate"] = float(100.0 * bad.mean()) if n_ev else 0.0
         time_bad |= bad
@@ -547,6 +700,17 @@ def qc_summary(time, signal_values: dict | None = None, range_values: dict | Non
         sc = signal_stability_check(t, signal_values, z=signal_z if signal_z is not None else z, min_shift=min_shift, changepoints=changepoints, min_bin_events=min_bin_events, edges=edges, statistic=statistic)
         medians = sc.medians
         statistics = sc.statistics
+        check_bins["signal"] = k = sc.bins_tested
+        if k == 0:
+            if not signal_values:
+                why = "no parameters"
+            elif not _distinct_at_least_3(t):
+                why = "fewer than 3 distinct time values"
+            else:
+                why = f"fewer than 3 time bins with {min_bin_events} events"
+            notes[CHECK_LABELS["signal"]] = f"not tested ({why})"
+        elif k < nb:
+            notes[CHECK_LABELS["signal"]] = f"{k} of {nb} time bins tested (a bin needs {min_bin_events} events)"
         for name, f in sc.flags.items():
             bin_flags[f"signal:{name}"] = f
         bad = events_in(sc.any_flags)
@@ -573,14 +737,14 @@ def qc_summary(time, signal_values: dict | None = None, range_values: dict | Non
     good = time_good & range_good
     percent["total"] = float(100.0 * (1.0 - good.mean())) if n_ev else 0.0
     settings = {
-        "checks": list(checks), "n_bins": int(nb), "z": float(z),
+        "checks": list(checks), "n_bins": int(nb), "n_bins_requested": int(n_bins), "events_per_bin": int(events_per_bin or 0), "z": float(z),
         "rate_z": float(rate_z if rate_z is not None else z), "signal_z": float(signal_z if signal_z is not None else z),
         "min_rate_change": float(min_rate_change), "min_shift": float(min_shift), "changepoints": bool(changepoints),
         "ramp": bool(ramp), "min_bin_events": int(min_bin_events), "min_pile": int(min_pile), "check_low": bool(check_low),
         "params": list(signal_values.keys()), "statistic": statistic, "statistics": dict(statistics),
     }
     return QCResult(good, time_good, range_good, edges, counts, rates, bin_flags, flagged_bins, medians, percent, range_counts,
-                    qc_time_ranges(time_good, t), checks, settings, rate_center, rate_threshold, notes)
+                    qc_time_ranges(time_good, t), checks, settings, rate_center, rate_threshold, notes, check_bins=check_bins)
 
 
 # =============================================================================
@@ -784,13 +948,25 @@ TABLE_HEADER = ["Bin", "t start", "t end", "Events", "Rate", "Flagged by", "% Re
 GROUP_HEADER = ["Sample", "Population", "Events", "Kept", "% Removed", "% Rate", "% Signal", "% Range", "Flagged Bins", "Clean Intervals", "Note"]
 
 
+def check_status(result: QCResult, key: str) -> str:
+    """"removed", or for the time-based checks how many bins were tested
+    ("removed; 8 of 10 bins tested" / "not tested")."""
+    k = result.bins_tested(key)
+    if k is None:
+        return "removed"
+    if k == 0:
+        return "not tested"
+    return f"removed; {k} of {result.n_bins} bins tested"
+
+
 def result_table(result: QCResult) -> list[list]:
-    """Rows for TABLE_HEADER: one per check (removed events and %), then one per bin."""
+    """Rows for TABLE_HEADER: one per check (removed events and %, and for
+    the rate / signal checks the number of time bins tested), then one per bin."""
     rows: list[list] = []
     n = result.n_events
     for key in result.checks:
         pct = result.percent_removed.get(key, 0.0)
-        rows.append([CHECK_LABELS[key], "", "", int(round(pct * n / 100.0)), "", "removed", pct])
+        rows.append([CHECK_LABELS[key], "", "", int(round(pct * n / 100.0)), "", check_status(result, key), pct])
     rows.append(["Total", "", "", n - result.n_good, "", "removed", result.percent_removed.get("total", 0.0)])
     for r in result.bin_rows():
         rows.append([r["bin"], r["t_start"], r["t_end"], r["events"], r["rate"], r["flagged_by"], ""])

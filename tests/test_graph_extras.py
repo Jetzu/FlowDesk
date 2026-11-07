@@ -265,3 +265,99 @@ def test_plot_fonts_are_pixel_sized(app):
     f = plot_font(11, RenderOptions(font_dpi=72.0))
     assert f.pixelSize() == 11
     assert plot_font(9, RenderOptions()).pixelSize() == 12  # 96 dpi basis (layout editor)
+
+
+def test_graph_window_after_undo_redo_detaches_its_population(app, tmp_path):
+    """A window whose population left the tree (undo / redo) closes instead of
+    showing the root under the old title; replaced nodes are followed."""
+    import shiboken6
+
+    from flowdesk.ui.controller import WorkspaceController
+    from flowdesk.ui.graph_window import GraphWindow
+
+    paths = [write_fcs(tmp_path / f"u{i}.fcs", make_synthetic_events(600, seed=20 + i)["events"], SYNTH_NAMES, SYNTH_STAINS) for i in range(2)]
+    c = WorkspaceController()
+    c.add_samples(paths)
+    s0, s1 = c.workspace.samples
+    fsc, ssc = np.asarray(s0.data("FSC-A")), np.asarray(s0.data("SSC-A"))
+    lo = [float(np.percentile(fsc, 20)), float(np.percentile(ssc, 20))]
+    hi = [float(np.percentile(fsc, 90)), float(np.percentile(ssc, 90))]
+    inside = int(np.count_nonzero((fsc >= lo[0]) & (fsc <= hi[0]) & (ssc >= lo[1]) & (ssc <= hi[1])))
+    assert 0 < inside < len(fsc)
+
+    def gate():
+        return RectangleGate(["FSC-A", "SSC-A"], list(lo), list(hi))
+
+    def open_on(pop):
+        gw = GraphWindow(c, s0, pop)
+        closed = []
+        gw.closed.connect(lambda w: closed.append(w))
+        gw.show()
+        app.processEvents()
+        return gw, closed
+
+    def gone(gw, closed):
+        app.processEvents()
+        return bool(closed) and (not shiboken6.isValid(gw) or not gw.isVisible())
+
+    # undo of the gate's creation: the window closes (it used to show "Ungated" events as "Cells")
+    cells = c.add_population(s0.root, Population("Cells", gate()))
+    assert cells.count == inside
+    gw, closed = open_on(cells)
+    c.undo()
+    assert s0.root.find("/Cells") is None
+    assert gone(gw, closed)
+
+    # redo of a deletion closes the window of the deleted gate
+    c.redo()
+    cells = s0.root.find("/Cells")
+    c.delete_populations([cells])
+    c.undo()
+    gw, closed = open_on(s0.root.find("/Cells"))
+    c.redo()
+    assert gone(gw, closed)
+    c.undo()
+
+    # undo of a paste closes the window of the pasted copy
+    c.paste_populations([s0.root.find("/Cells").clone()], s0.root)
+    gw, closed = open_on(s0.root.find("/Cells 2"))
+    c.undo()
+    assert s0.root.find("/Cells 2") is None
+    assert gone(gw, closed)
+
+    # a rename updates the title; its undo rebuilds the node under the old name
+    # (same id) and the window follows it instead of closing
+    cells = s0.root.find("/Cells")
+    gw, closed = open_on(cells)
+    c.rename_population(cells, "Lymph")
+    app.processEvents()
+    assert gw.windowTitle().endswith("– Lymph")
+    c.undo()
+    app.processEvents()
+    restored = s0.root.find("/Cells")
+    assert not closed and restored is not None
+    assert gw.population is restored and gw.plot.population is restored
+    assert gw.windowTitle().endswith("– Cells")
+    assert gw.population.count == inside
+
+    # a group edit replaces the node by a copy at the same path: followed too
+    c.gate_changed(restored, c.current_group)
+    app.processEvents()
+    replaced = s0.root.find("/Cells")
+    assert replaced is not restored and not closed
+    assert gw.population is replaced and gw.population.count == inside
+    assert gw.windowTitle().endswith("– Cells")
+
+    # an overlay whose population is detached by undo is dropped
+    other = c.add_population(s1.root, Population("Other", gate()))
+    gw.plot.set_overlays([(s1, other), (s1, s1.root)])
+    c.undo()
+    app.processEvents()
+    assert s1.root.find("/Other") is None
+    assert gw.plot.overlays == [(s1, s1.root)]
+    gw.stats_action.setChecked(True)
+    gw._refresh_stats()
+    labels = [gw.stats_table.item(i, 0).text() for i in range(gw.stats_table.rowCount())]
+    assert labels == ["Cells", f"{s1.name} / Ungated"]
+    gw.close()
+    c.workspace.modified = False

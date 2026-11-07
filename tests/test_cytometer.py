@@ -95,3 +95,38 @@ def test_install_adds_band_and_menu(app):
     finally:
         win.controller.workspace.modified = False
         win.close()
+
+
+def test_reapplying_identical_settings_pushes_no_undo_step(controller):
+    from flowdesk.ui.cytometer import CytometerDialog, apply_cytometer_settings
+
+    c = controller
+    aurora = [s for s in c.workspace.samples if s.keywords.get("$CYT") == "Aurora"]
+    a = {"FSC-A": {"kind": "arcsinh", "decades": 5.0, "neg": 0.0}, "FITC-A": {"kind": "logicle", "width_basis": -500.0, "decades": 4.2, "neg": 0.0}}
+    b = {"FSC-A": {"kind": "linear", "min": 0.0}}
+    n = len(c._undo)
+    assert apply_cytometer_settings(c, "Aurora", a) == aurora
+    apply_cytometer_settings(c, "Aurora", b)
+    assert len(c._undo) == n + 2
+    c.undo()  # back to "a"; "b" waits on the redo stack
+    assert c.can_redo and all(s.scale("FSC-A").kind == "arcsinh" for s in aurora)
+    c.workspace.modified = False
+    # identical again: no empty step, the pending redo survives, nothing marked modified
+    assert apply_cytometer_settings(c, "Aurora", {k: dict(v) for k, v in a.items()}) == []
+    assert len(c._undo) == n + 1 and c.can_redo and not c.workspace.modified
+    dlg = CytometerDialog(c)
+    dlg.select("Aurora")
+    assert dlg.specs("Aurora")["FSC-A"]["kind"] == "arcsinh"
+    dlg._specs = {"Aurora": {k: dict(v) for k, v in a.items()}}
+    dlg.apply()  # the dialog's own undo group is not opened for nothing either
+    assert len(c._undo) == n + 1 and c.can_redo
+    c.redo()
+    assert all(s.scale("FSC-A").kind == "linear" for s in aurora)
+    c.undo()
+    # one sample's scale differs from the stored defaults: that is a change
+    c.set_scale([aurora[0]], "FSC-A", LinearScale(0.0, 1000.0))
+    n2 = len(c._undo)
+    apply_cytometer_settings(c, "Aurora", a)
+    assert len(c._undo) == n2 + 1
+    sc = aurora[0].scale("FSC-A")
+    assert sc.kind == "arcsinh" and sc.M == pytest.approx(5.0)

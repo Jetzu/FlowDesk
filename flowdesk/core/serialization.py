@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import json
 import os
+import re
 from pathlib import Path, PurePath, PureWindowsPath
 
 from .compensation import SpilloverMatrix
@@ -132,21 +133,66 @@ def sample_from_dict(d: dict, base_dir: Path | None, data_dir: Path | None = Non
     if not sample.keywords:
         sample.load_header()
     if d.get("computed") and data_dir is not None:
-        import numpy as np
-
-        for name, entry in d["computed"].items():
-            f = data_dir / entry.get("file", "")
-            if f.exists():
-                try:
-                    arr = np.load(f).astype(np.float32)
-                except (OSError, ValueError):
-                    continue
-                total = int(float(sample.keywords.get("$TOT", 0) or 0))
-                if arr.ndim != 1 or (total and arr.shape[0] != total):
-                    continue  # the FCS file was replaced; a stale array would break every mask
-                sample.computed[name] = arr
-                sample.computed_info[name] = dict(entry.get("info", {}))
+        _load_computed(sample, d["computed"], data_dir)
     return sample
+
+
+def _event_total(keywords: dict) -> int | None:
+    try:
+        n = int(float(keywords.get("$TOT", 0) or 0))
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _load_computed(sample: Sample, entries: dict, data_dir: Path):
+    """Read the computed-parameter arrays of `sample` from `data_dir`. What
+    cannot be restored is reported in sample.load_warnings: a missing data
+    folder or file, an unreadable array, or one that cannot belong to the FCS
+    file now on disk. The final check against the events actually read is
+    Sample.ensure_loaded's (a truncated file has fewer events than $TOT)."""
+    import numpy as np
+
+    from .fcs import FCSError, FCSFile
+
+    saved_total = _event_total(sample.keywords)
+    file_total = None
+    if sample.path.exists():
+        # the saved keywords describe the file the arrays were computed for;
+        # the header of the file now on disk says whether it is still that one
+        try:
+            file_total = _event_total(FCSFile.read_keywords(sample.path)[1])
+        except (OSError, FCSError, ValueError):
+            file_total = None
+    replaced = file_total is not None and saved_total is not None and file_total != saved_total
+    folder = data_dir.name
+    for name, entry in entries.items():
+        fname = entry.get("file", "") if isinstance(entry, dict) else ""
+        f = data_dir / fname if fname else None
+        if f is None or not f.is_file():
+            if f is None:
+                reason = "the workspace names no data file for it"
+            elif not data_dir.is_dir():
+                reason = f"the data folder {folder} is missing"
+            else:
+                reason = f"{folder}/{fname} is missing"
+            sample.load_warnings.append(f"computed parameter {name!r} was not loaded: {reason}")
+            continue
+        try:
+            arr = np.load(f, allow_pickle=False).astype(np.float32)
+        except (OSError, ValueError, EOFError) as exc:
+            sample.load_warnings.append(f"computed parameter {name!r} was not loaded: {folder}/{fname} is unreadable ({exc})")
+            continue
+        if arr.ndim != 1:
+            sample.load_warnings.append(f"computed parameter {name!r} was not loaded: {folder}/{fname} does not hold one value per event")
+            continue
+        if file_total is not None and (arr.shape[0] > file_total or (replaced and arr.shape[0] != file_total)):
+            sample.load_warnings.append(
+                f"computed parameter {name!r} was dropped: {sample.path.name} has {file_total} events, the saved values are for {arr.shape[0]}"
+            )
+            continue
+        sample.computed[name] = arr
+        sample.computed_info[name] = dict(entry.get("info", {}) or {})
 
 
 # ------------------------------------------------------------------------ groups
@@ -210,8 +256,40 @@ def workspace_from_dict(d: dict, base_dir: Path | None = None, data_dir: Path | 
     ws.matrices = {k: SpilloverMatrix.from_dict(v) for k, v in d.get("matrices", {}).items()}
     ws.layouts = [Layout.from_dict(l) for l in d.get("layouts", [])]
     ws.tables = [TableDef.from_dict(t) for t in d.get("tables", [])]
+    ws.load_warnings = [f"{s.name}: {w}" for s in ws.samples for w in s.load_warnings]
     ws.modified = False
     return ws
+
+
+_DATA_FILE = re.compile(r"sample-?\d+_\d+_.*\.npy")  # the names sample_to_dict writes
+
+
+def _prune_data_dir(data_dir: Path, data: dict):
+    """Delete the computed-parameter files in `data_dir` that the workspace
+    dict `data` (just written) does not reference, and the folder once it is
+    empty. Only files named like the ones save_workspace writes are touched."""
+    if not data_dir.is_dir():
+        return
+    keep = {
+        entry.get("file")
+        for sd in data.get("samples", [])
+        for entry in (sd.get("computed") or {}).values()
+        if isinstance(entry, dict)
+    }
+    try:
+        files = list(data_dir.iterdir())
+    except OSError:
+        return
+    for f in files:
+        if f.name not in keep and _DATA_FILE.fullmatch(f.name) and f.is_file():
+            try:
+                f.unlink()
+            except OSError:
+                pass  # in use (Windows) or read-only: left for the next save
+    try:
+        data_dir.rmdir()  # only succeeds once the folder is empty
+    except OSError:
+        pass
 
 
 def save_workspace(ws: Workspace, path: Path | str):
@@ -220,11 +298,18 @@ def save_workspace(ws: Workspace, path: Path | str):
     data = workspace_to_dict(ws, path.parent, data_dir)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=1)
+    # only after the workspace file was written: a failed save keeps the
+    # files the previous one references
+    _prune_data_dir(data_dir_for(path), data)
     ws.path = path
     ws.modified = False
 
 
 def load_workspace(path: Path | str) -> Workspace:
+    """Read a .fdw file. Problems that did not prevent opening it (computed
+    parameters whose <name>.fdw.data folder or files are missing, unreadable or
+    belong to a different FCS file) are listed in the returned workspace's
+    load_warnings (and per sample in Sample.load_warnings)."""
     path = Path(path)
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -354,7 +439,8 @@ def gating_snapshot(ws: Workspace, kind=None) -> dict:
 def extend_snapshot(ws: Workspace, snap: dict, kind) -> dict:
     """Add the sections of `kind` that `snap` lacks, read from the present
     state (a nested change inside one undo step needing more than the outer
-    change recorded)."""
+    change recorded). Call it before those sections change: what it reads is
+    what undo brings back."""
     missing = snapshot_sections(kind) - snapshot_kind(snap)
     if not missing:
         return snap
@@ -369,9 +455,34 @@ def extend_snapshot(ws: Workspace, snap: dict, kind) -> dict:
     return snap
 
 
+def _match_children(children: list[Population], dicts: list[dict]) -> list[Population | None]:
+    """For each child dict the present child it restores, or None: the child
+    with the same id first (a renamed population stays the same object), then,
+    for dicts no id matched, an unclaimed child with the same name (a group
+    gate edit replaces member populations by clones with new ids)."""
+    by_id: dict = {}
+    for c in children:
+        by_id.setdefault(c.id, []).append(c)
+    claimed: set[int] = set()
+    out: list[Population | None] = [None] * len(dicts)
+    for k, cd in enumerate(dicts):
+        same = by_id.get(cd.get("id"))
+        if same:
+            out[k] = same.pop(0)
+            claimed.add(id(out[k]))
+    for k, cd in enumerate(dicts):
+        if out[k] is None:
+            name = cd.get("name")
+            c = next((c for c in children if id(c) not in claimed and c.name == name), None)
+            if c is not None:
+                out[k] = c
+                claimed.add(id(c))
+    return out
+
+
 def _merge_population(pop: Population, d: dict):
-    """Make `pop` and its subtree match `d` in place. Children whose name (and
-    so whose path) exists in both are kept as the same objects."""
+    """Make `pop` and its subtree match `d` in place. Children are kept as the
+    same objects when their id (or, failing that, their name) exists in both."""
     pop.id = d.get("id", pop.id)
     if pop.parent is not None:
         pop.name = d.get("name", pop.name)
@@ -390,20 +501,17 @@ def _merge_population(pop: Population, d: dict):
         stats.append(st if st is not None and _equal(st.to_dict(), sd) else StatNode.from_dict(sd))
     pop.stats = stats
     pop.expanded = bool(d.get("expanded", True))
-    pool: dict[str, list[Population]] = {}
-    for c in pop.children:
-        pool.setdefault(c.name, []).append(c)
+    dicts = d.get("children", [])
     children = []
-    for cd in d.get("children", []):
-        same = pool.get(cd.get("name"))
-        if same:
-            child = same.pop(0)
+    for child, cd in zip(_match_children(pop.children, dicts), dicts):
+        if child is not None:
             _merge_population(child, cd)
         else:
             child = population_from_dict(cd)
         children.append(child)
-    for rest in pool.values():
-        for c in rest:
+    kept = {id(c) for c in children}
+    for c in pop.children:
+        if id(c) not in kept:
             c.parent = None
     pop.children = children
     for c in children:
@@ -528,9 +636,9 @@ def _restore_by_id(objs: list, dicts: list[dict], from_dict) -> list:
 def restore_snapshot(ws: Workspace, snap: dict, current: dict | None = None) -> set[str]:
     """Bring `ws` back to the state recorded in `snap`, in place: Sample,
     Group, Layout and TableDef objects keep their identity, and so does every
-    Population whose path exists before and after. `current` is a snapshot of
-    the present state with the same sections (taken here when omitted; undo
-    passes its redo snapshot). Returns what changed, a subset of {"samples",
+    Population whose id (or, failing that, path) exists before and after.
+    `current` is a snapshot of the present state with the same sections
+    (taken here when omitted; undo passes its redo snapshot). Returns what changed, a subset of {"samples",
     "gating", "scales", "compensation", "groups", "matrices", "settings",
     "layouts", "tables"} ("samples": list/order, names, keywords, derived or
     computed parameters)."""

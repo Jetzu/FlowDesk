@@ -127,6 +127,7 @@ class CellCycleResult:
 
 
 CELL_CYCLE_MODELS = {"dean_jett_fox": "Dean-Jett-Fox", "watson": "Watson Pragmatic"}
+MIN_CELL_CYCLE_BINS = 32  # the Cell Cycle dialog's minimum too
 _MODEL_ALIASES = {
     "dean_jett_fox": "dean_jett_fox", "djf": "dean_jett_fox", "deanjettfox": "dean_jett_fox", "dean": "dean_jett_fox",
     "watson": "watson", "watson_pragmatic": "watson", "pragmatic": "watson",
@@ -239,8 +240,18 @@ def fit_cell_cycle(
     self-convolution of the singlet distribution); the fit then covers the
     whole histogram. %G1/%S/%G2M are percentages of the cycling singlets;
     percent_debris / percent_aggregates are percentages of all modelled events.
+    Raises ValueError for fewer than 50 finite events, fewer than
+    MIN_CELL_CYCLE_BINS bins or a non-finite range.
     """
     model = cell_cycle_model_key(model)
+    try:
+        nbins = int(bins)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"bins must be an integer, got {bins!r}") from None
+    if nbins < MIN_CELL_CYCLE_BINS:
+        # coarser histograms put a whole G1 peak (CV of a few %) into one or two bins: the
+        # peak search fails or the fit collapses onto G2/M
+        raise ValueError(f"at least {MIN_CELL_CYCLE_BINS} histogram bins are needed for a cell-cycle fit, got {nbins}")
     v = _finite(values)
     n = int(v.size)
     if n < 50:
@@ -250,9 +261,11 @@ def fit_cell_cycle(
         hi = float(np.percentile(v, 99.9)) * 1.1
     else:
         lo, hi = map(float, range)
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise ValueError(f"the fit range must be finite, got {range!r}")
     if hi <= lo:
         hi = lo + 1.0
-    counts, edges = np.histogram(v, bins=int(bins), range=(lo, hi))
+    counts, edges = np.histogram(v, bins=nbins, range=(lo, hi))
     counts = counts.astype(float)
     centers = 0.5 * (edges[:-1] + edges[1:])
     width = float(edges[1] - edges[0])
@@ -456,6 +469,9 @@ def _watson_pragmatic(centers, counts, width, fit_range, p, plateau, deb, na, it
             h2 = max(float(rest[w2].mean()), 0.0)
         agg = agg_of()
     s_curve = np.where(region, np.clip(gaussian_filter1d(rest, 1.0), 0.0, None), 0.0)
+    # %S is the area of the S curve that is drawn and exported (the raw residual sum also
+    # counts the negative residuals under the peaks, which the clipped curve does not show)
+    ns = float(s_curve.sum())
     return n1, ns, n2, mu, s1, s2, m2 / mu, g1, s_curve, g2, (agg if na > 0 else None), ok, msg
 
 

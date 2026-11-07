@@ -5,7 +5,7 @@ import csv
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSettings, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSettings, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from .. import APP_NAME, __version__
 from ..core.gates import BooleanGate
 from ..core.model import Group, Population, Sample, StatNode, Workspace
-from ..core.serialization import EXTENSION, load_workspace, save_workspace
+from ..core.serialization import EXTENSION, data_dir_for, load_workspace, save_workspace
 from ..core.stats import compute_statistic, format_value
 from .compensation import CompensationWindow, CompensationWizard
 from .controller import POPULATION_MIME, WorkspaceController
@@ -41,6 +41,42 @@ from .ribbon import Ribbon
 from .table_editor import TableEditorWindow
 
 SAMPLES_MIME = "application/x-flowdesk-samples"
+
+# Worker threads still running when the user chose "Quit anyway". Qt aborts the
+# process when a running QThread is destroyed, so they are detached from the
+# closing window and kept referenced here; flowdesk.app.main leaves through
+# os._exit while any of them still runs.
+_ABANDONED_THREADS: list = []
+
+
+def abandoned_threads() -> list:
+    """The detached worker threads that are still running."""
+    out = []
+    for t in _ABANDONED_THREADS:
+        try:
+            if t.isRunning():
+                out.append(t)
+        except RuntimeError:  # C++ object already gone
+            pass
+    return out
+
+
+def _abandon_threads(threads) -> None:
+    for t in threads:
+        _ABANDONED_THREADS.append(t)  # keep the wrapper (and so the C++ thread) alive
+        t.setParent(None)
+
+
+def _workspace_load_warnings(ws) -> list[str]:
+    """What load_workspace could not restore (computed parameters whose data
+    folder or files are missing ...), one message per problem."""
+    found = [str(w) for w in (getattr(ws, "load_warnings", None) or [])]
+    for s in getattr(ws, "samples", []):  # samples add more once their events are read
+        for w in getattr(s, "load_warnings", None) or []:
+            msg = f"{s.name}: {w}"
+            if msg not in found:
+                found.append(msg)
+    return found
 
 from .style import modifier_html as _modifier_html  # noqa: E402
 
@@ -629,21 +665,37 @@ class MainWindow(QMainWindow):
 
     def _install_extensions(self):
         import importlib
-        import traceback
 
         self.extensions: dict[str, object] = {}
+        self.extension_errors: dict[str, str] = {}  # module -> why it is not available
         for modname in self.EXTENSION_MODULES:
             try:
                 module = importlib.import_module(modname)
-            except ImportError:
+            except ModuleNotFoundError as exc:
+                if exc.name != modname:  # the module exists but one of its imports is missing
+                    self._extension_failed(modname, exc)
+                continue
+            except Exception as exc:  # noqa: BLE001 - SyntaxError, AttributeError, NameError ... at import
+                self._extension_failed(modname, exc)
                 continue
             install = getattr(module, "install", None)
             if install is None:
                 continue
             try:
                 self.extensions[modname] = install(self)
-            except Exception:  # pragma: no cover - defensive
-                traceback.print_exc()
+            except Exception as exc:  # noqa: BLE001 - defensive
+                self._extension_failed(modname, exc)
+        if self.extension_errors:
+            names = ", ".join(m.rsplit(".", 1)[-1] for m in self.extension_errors)
+            self.statusBar().showMessage(f"Some tools could not be loaded ({names}); see the console for details", 15000)
+
+    def _extension_failed(self, modname: str, exc: BaseException):
+        import sys
+        import traceback
+
+        print(f"FlowDesk: the optional module {modname} could not be loaded:", file=sys.stderr)
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        self.extension_errors[modname] = f"{type(exc).__name__}: {exc}"
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -932,6 +984,74 @@ class MainWindow(QMainWindow):
         missing = [s.name for s in ws.samples if s.load_error]
         if missing:
             QMessageBox.warning(self, "Missing files", "These sample files were not found:\n" + "\n".join(missing[:15]) + ("\n…" if len(missing) > 15 else ""))
+        warnings = _workspace_load_warnings(ws)
+        if warnings and self._ask_locate_computed_data(p, warnings):
+            self._locate_computed_data(p)
+
+    @staticmethod
+    def _bullet_list(lines: list[str], limit: int = 15) -> str:
+        return "\n".join(f"• {w}" for w in lines[:limit]) + (f"\n… and {len(lines) - limit} more" if len(lines) > limit else "")
+
+    def _ask_locate_computed_data(self, path: Path, warnings: list[str]) -> bool:
+        """Tell the user which computed parameters were not restored; True when
+        they want to locate the data folder."""
+        folder = data_dir_for(path).name
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Computed parameters not loaded")
+        box.setText(f"Some computed parameters (t-SNE, UMAP, clusters …) of “{path.name}” could not be loaded.")
+        box.setInformativeText(
+            f"They are stored in the folder “{folder}” next to the workspace file, which may have been renamed, "
+            "moved or not copied along. Populations gated on them show no events until the folder is found.\n\n"
+            + self._bullet_list(warnings)
+        )
+        locate = box.addButton("Locate Folder…", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Continue Without Them", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(locate)
+        box.exec()
+        return box.clickedButton() is locate
+
+    def _load_with_data_dir(self, path: Path, data_dir: Path) -> Workspace:
+        """Read the workspace at `path` taking its computed arrays from `data_dir`."""
+        import inspect
+
+        try:
+            takes_dir = "data_dir" in inspect.signature(load_workspace).parameters
+        except (TypeError, ValueError):
+            takes_dir = False
+        if takes_dir:
+            return load_workspace(path, data_dir=data_dir)
+        from ..core.serialization import workspace_from_dict
+
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("format") != "flowdesk-workspace":
+            raise ValueError("not a FlowDesk workspace file")
+        ws = workspace_from_dict(data, path.parent, data_dir)
+        ws.path = path
+        return ws
+
+    def _locate_computed_data(self, path: Path) -> bool:
+        """Let the user pick the .fdw.data folder of `path` and re-open the
+        workspace with the arrays from there. Returns True when it was re-opened."""
+        expected = data_dir_for(path).name
+        folder = QFileDialog.getExistingDirectory(self, f"Locate the folder “{expected}”", str(path.parent))
+        if not folder:
+            return False
+        try:
+            ws = self._load_with_data_dir(path, Path(folder))
+        except Exception as exc:  # noqa: BLE001 - reported to the user
+            QMessageBox.critical(self, "Open failed", f"Could not open {path.name}:\n{exc}")
+            return False
+        self.controller.set_workspace(ws)
+        # saving writes the arrays to <name>.fdw.data next to the workspace again
+        self.controller.mark_modified()
+        remaining = _workspace_load_warnings(ws)
+        if remaining:
+            QMessageBox.warning(self, "Computed parameters not loaded", f"Still not loaded from “{Path(folder).name}”:\n" + self._bullet_list(remaining))
+        else:
+            self.statusBar().showMessage(f"Computed parameters loaded from {Path(folder).name}; save to store them next to {path.name}", 8000)
+        return True
 
     def save_workspace(self) -> bool:
         ws = self.controller.workspace
@@ -1568,10 +1688,47 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 pass
 
+    # how long closing waits for running analyses to stop before asking
+    WORKER_STOP_TIMEOUT_MS = 2000
+
+    def stop_background_work(self, timeout_ms: int | None = None) -> list:
+        """Cancel the analyses running in worker threads (every extension's
+        stop_all(), then any QThread still running below this window) and wait
+        up to `timeout_ms` for them to stop. Returns the threads still running."""
+        import time
+        import traceback
+
+        timeout_ms = self.WORKER_STOP_TIMEOUT_MS if timeout_ms is None else timeout_ms
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        for ext in list(getattr(self, "extensions", {}).values()):
+            stop = getattr(ext, "stop_all", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:  # noqa: BLE001 - closing must go on
+                    traceback.print_exc()
+        running = [t for t in self.findChildren(QThread) if t.isRunning()]
+        for t in running:
+            if hasattr(t, "cancelled"):
+                t.cancelled = True  # the analysis workers' cancellation flag
+            t.requestInterruption()
+            t.quit()
+        for t in running:
+            t.wait(max(0, int((deadline - time.monotonic()) * 1000)))
+        return [t for t in running if t.isRunning()]
+
     def closeEvent(self, event):
         if not self.maybe_save():
             event.ignore()
             return
+        still_running = self.stop_background_work()
+        if still_running:
+            res = QMessageBox.question(self, "Quit", "An analysis is still running. Quit anyway?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if res != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            # destroying a running QThread aborts the process: keep them alive past the window
+            _abandon_threads(still_running)
         settings = QSettings("FlowDesk", "FlowDesk")
         settings.setValue("main/geometry", self.saveGeometry())
         settings.setValue("main/splitter", self.splitter.sizes())

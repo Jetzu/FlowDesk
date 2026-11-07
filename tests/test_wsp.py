@@ -12,6 +12,9 @@ from flowdesk.core.gates import BooleanGate, EllipseGate, PolygonGate, Rectangle
 from flowdesk.core.model import Criterion, Group, Population, Sample, StatNode, Workspace
 from flowdesk.core.transforms import ArcsinhScale, LinearScale, LogicleScale, LogScale
 from flowdesk.core.wsp_export import export_wsp
+from flowdesk.core.wsp_import import DATATYPE_NS as DATATYPE
+from flowdesk.core.wsp_import import GATING_NS as GATING
+from flowdesk.core.wsp_import import TRANSFORMS_NS as TRANSFORMS
 from flowdesk.core.wsp_import import flowjo_counts, import_wsp
 
 DESK = Path("/Users/lukasgerstung/Desktop/Desktop Staubsauger")
@@ -270,3 +273,138 @@ def test_uri_resolution_by_basename(synthetic: Workspace, tmp_path: Path):
     assert ws.samples[0].path == synthetic.samples[0].path
     ws, report = import_wsp(moved / "moved.wsp")
     assert report.samples_missing == 1 and report.warnings
+
+
+# ------------------------------------------- uncompensated / placeholder export
+def _events_sample(tmp_path: Path, name: str = "s.fcs", seed: int = 3):
+    rng = np.random.default_rng(seed)
+    n = 3000
+    ev = np.column_stack([rng.uniform(0, 250000, n), rng.uniform(0, 250000, n), rng.lognormal(7, 2, n), rng.lognormal(6, 2, n)]).astype(np.float32)
+    path = tmp_path / name
+    _write_fcs(path, ["FSC-A", "SSC-A", "FITC-A", "PE-A"], ev)
+    s = Sample(path, 1)
+    s.load_header()
+    return s, ev
+
+
+def _sample_matrix_el(path: Path) -> ET.Element | None:
+    sel = ET.parse(path).getroot().find("SampleList/Sample")
+    return next((c for c in sel if c.tag.endswith("spilloverMatrix")), None)
+
+
+@pytest.mark.parametrize("state", ["disabled", "absent"])
+def test_export_writes_identity_matrix_for_comp_gates_without_active_matrix(state, tmp_path: Path):
+    s, ev = _events_sample(tmp_path)
+    if state == "disabled":
+        s.set_compensation(SpilloverMatrix("Panel", ["FITC-A", "PE-A"], np.array([[1.0, 0.25], [0.05, 1.0]])), False)
+    else:
+        s.set_compensation(None)
+    ws = Workspace()
+    ws.samples.append(s)
+    s.root.add_child(Population("FITC+", RectangleGate(["Comp-FITC-A"], [2000.0], [None])))
+    out = tmp_path / "out.wsp"
+    warnings = export_wsp(ws, out)
+    # FlowJo's form of an uncompensated sample: an identity matrix whose
+    # Comp- parameters are the raw channels
+    el = _sample_matrix_el(out)
+    assert el is not None and el.get("prefix") == "Comp-" and el.get("name") == "Uncompensated"
+    params = [p.get(f"{{{DATATYPE}}}name") for p in el.find(f"{{{DATATYPE}}}parameters")]
+    assert params == (["FITC-A", "PE-A"] if state == "disabled" else ["FITC-A"])
+    for row in el.iter(f"{{{TRANSFORMS}}}spillover"):
+        for c in row:
+            same = c.get(f"{{{DATATYPE}}}parameter") == row.get(f"{{{DATATYPE}}}parameter")
+            assert float(c.get(f"{{{TRANSFORMS}}}value")) == (1.0 if same else 0.0)
+    assert len(warnings) == 1
+    assert "identity matrix" in warnings[0] and "Comp-FITC-A" in warnings[0] and "(sample s.fcs)" in warnings[0]
+    assert ("'Panel' is disabled" if state == "disabled" else "no compensation matrix") in warnings[0]
+    ws2, report = import_wsp(out)
+    assert report.warnings == []
+    s2 = ws2.samples[0]
+    assert s2.comp.is_identity and s2.comp_enabled
+    assert s2.root.find("/FITC+").count == int((ev[:, 2] >= 2000).sum()) > 0
+    # a compensated sample keeps its own matrix and gets no such warning
+    s.set_compensation(SpilloverMatrix("Panel", ["FITC-A", "PE-A"], np.array([[1.0, 0.25], [0.05, 1.0]])), True)
+    assert export_wsp(ws, out) == [] and _sample_matrix_el(out).get("name") == "Panel"
+
+
+def test_export_leaves_out_gate_less_group_placeholders(tmp_path: Path):
+    s, ev = _events_sample(tmp_path)
+    ws = Workspace()
+    ws.samples.append(s)
+    s.root.add_child(Population("Cells", RectangleGate(["FSC-A"], [50000.0], [None])))
+    g = Group("G2", "custom")
+    g.sample_ids.add(s.id)
+    ws.groups.append(g)
+    # the template has neither /Cells nor /Gone: both become gate-less nodes;
+    # the member has a gate for /Cells only
+    ws.apply_population_to_group(g, "/Cells", Population("Big", RectangleGate(["SSC-A"], [100000.0], [None])))
+    ws.apply_population_to_group(g, "/Gone", Population("X", RectangleGate(["FITC-A"], [500.0], [None])))
+    g.root.add_child(Population("Empty"))
+    g.root.add_child(Population("X or Big", BooleanGate("or", ["/Gone/X", "/Cells/Big"])))
+    assert g.root.find("/Cells").gate is None and g.root.find("/Gone").gate is None
+    out = tmp_path / "out.wsp"
+    warnings = export_wsp(ws, out)
+    root = ET.parse(out).getroot()
+    group_el = next(n for n in root.find("Groups") if n.get("name") == "G2")
+    pops = list(group_el.iter("Population"))
+    assert [p.get("name") for p in pops] == ["Cells", "Big"]
+    assert all(p.find("Gate") is not None for p in pops)
+    assert warnings == [
+        "/: 2 populations (Gone, Empty) without a gate in the group template (no member sample has one at this path) – not exported with 1 sub-population (group G2)",
+        "/X or Big: boolean gate on the left-out X – not exported (group G2)",
+    ]
+    ws2, report = import_wsp(out)
+    assert report.warnings == []
+    t = ws2.group_by_name("G2").root
+    assert [c.name for c in t.children] == ["Cells"] and [c.name for c in t.find("/Cells").children] == ["Big"]
+    _gate_equal(t.find("/Cells").gate, s.root.find("/Cells").gate)
+    # the sample itself keeps everything it had
+    assert ws2.samples[0].root.find("/Cells/Big").count == int(((ev[:, 0] >= 50000) & (ev[:, 1] >= 100000)).sum())
+
+
+def test_export_never_writes_import_placeholder_dimensions(tmp_path: Path):
+    """A new-dimension gate of a sample whose file and keywords are missing
+    must not come back as an FCS parameter named after the placeholder."""
+    s, _ = _events_sample(tmp_path, "gone.fcs")
+    ws = Workspace()
+    ws.samples.append(s)
+    s.root.add_child(Population("Cells", RectangleGate(["FSC-A"], [1.0], [None])))
+    base = tmp_path / "base.wsp"
+    export_wsp(ws, base)
+    s.path.unlink()
+    tree = ET.parse(base)
+    wroot = tree.getroot()
+    kel = wroot.find("SampleList/Sample/Keywords")
+    for k in list(kel):
+        kel.remove(k)
+
+    def add(container: ET.Element, name: str, dim_child: ET.Element):
+        sub = container.find("Subpopulations")
+        if sub is None:
+            sub = ET.SubElement(container, "Subpopulations")
+        pop = ET.SubElement(sub, "Population", {"name": name})
+        gate = ET.SubElement(pop, "Gate", {f"{{{GATING}}}id": f"ID{abs(hash(name)) % 10**8}"})
+        rect = ET.SubElement(gate, f"{{{GATING}}}RectangleGate", {"eventsInside": "1"})
+        ET.SubElement(rect, f"{{{GATING}}}dimension", {f"{{{GATING}}}min": "1"}).append(dim_child)
+
+    ratio = lambda: ET.Element(f"{{{DATATYPE}}}new-dimension", {f"{{{DATATYPE}}}transformation-ref": "Tr_Ratio_1"})
+    add(wroot.find("SampleList/Sample/SampleNode"), "ratio", ratio())
+    add(wroot.find("SampleList/Sample/SampleNode"), "unnamed", ET.Element(f"{{{DATATYPE}}}other"))
+    add(wroot.find("Groups/GroupNode"), "group ratio", ratio())
+    odd = tmp_path / "odd.wsp"
+    tree.write(odd, encoding="UTF-8", xml_declaration=True)
+
+    ws2, report = import_wsp(odd)
+    s2 = ws2.samples[0]
+    assert not s2.channels and report.samples_missing == 1
+    assert s2.root.find("/ratio").count == 0
+    out = tmp_path / "again.wsp"
+    warnings = export_wsp(ws2, out)
+    names = {v for el in ET.parse(out).getroot().iter() if el.tag.endswith("fcs-dimension") for k, v in el.attrib.items() if k.endswith("name")}
+    assert names == {"FSC-A"}
+    joined = "\n".join(warnings)
+    for path in ("/ratio", "/unnamed", "/group ratio"):
+        assert f"{path}: gated on" in joined, path
+    ws3, _ = import_wsp(out)
+    assert [p.path for p in ws3.samples[0].populations()] == ["/Cells"]
+    assert ws3.groups[0].root.find("/group ratio") is None

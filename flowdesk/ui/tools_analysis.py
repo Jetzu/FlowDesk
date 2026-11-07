@@ -17,7 +17,7 @@ import io
 from dataclasses import dataclass, field
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QDeadlineTimer, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QComboBox,
@@ -139,7 +139,7 @@ def compute_dimreduction(populations, params, method="tsne", max_events=5000, op
     options = dict(options or {})
     if progress:
         progress("Collecting events…")
-    X, index = A.prepare_matrix([p.sample for p in populations], [p.path for p in populations], params, max_events, seed)
+    X, index = A.prepare_matrix([p.sample for p in populations], [p.path for p in populations], params, max_events, seed, should_cancel=should_cancel)
     _check(should_cancel)
     if progress:
         progress(f"Running {DIM_METHODS[method][0]} on {X.shape[0]} events…")
@@ -151,10 +151,10 @@ def compute_dimreduction(populations, params, method="tsne", max_events=5000, op
             model["components"] = model["components"] + [[0.0] * X.shape[1]]
         options["explained_variance"] = [float(v) for v in A.pca_explained_variance(X, 2)]
     elif method == "tsne":
-        emb, session = A.fit_tsne(X, options.get("perplexity", 30), options.get("iterations", 500), seed)
+        emb, session = A.fit_tsne(X, options.get("perplexity", 30), options.get("iterations", 500), seed, should_cancel=should_cancel)
         model = {"kind": "tsne", "engine": "openTSNE" if session is not None else "scikit-learn"}
     elif method == "umap":
-        emb, session = A.fit_umap(X, options.get("n_neighbors", 15), options.get("min_dist", 0.1), seed)
+        emb, session = A.fit_umap(X, options.get("n_neighbors", 15), options.get("min_dist", 0.1), seed, should_cancel=should_cancel)
         model = {"kind": "umap"}
     else:
         raise ValueError(f"unknown method {method}")
@@ -162,9 +162,40 @@ def compute_dimreduction(populations, params, method="tsne", max_events=5000, op
     return DimResult(method, list(params), index, emb, list(populations), options, model, session)
 
 
+def _check_result_rows(ws: Workspace, index, samples, columns: dict) -> None:
+    """Raise ValueError (before anything is changed or an undo step recorded)
+    unless `index` matches `ws`: every entry must name, by id, one of
+    `samples` (compared by identity: ids restart at 1 in every workspace, so a
+    result of another workspace would otherwise land on unrelated samples),
+    the rows must exist and every column must have one value per row."""
+    if not index:
+        raise ValueError("the result covers no events")
+    total = A.index_size(index)
+    for name, values in columns.items():
+        if len(values) != total:
+            raise ValueError(f"{name} has {len(values)} values for {total} events")
+    by_id = {s.id: s for s in ws.samples}
+    allowed = {id(s) for s in samples}
+    for sid, rows in index:
+        sample = by_id.get(sid)
+        if sample is None or id(sample) not in allowed:
+            raise ValueError("the samples this result was computed on are no longer in the workspace")
+        if not sample.ensure_loaded():
+            raise ValueError(f"{sample.name}: {sample.load_error or 'file not found'}")
+        rows = np.asarray(rows)
+        if rows.size and (int(rows.min()) < 0 or int(rows.max()) >= sample.n_events):
+            raise ValueError(f"{sample.name}: the result's event rows do not match the sample")
+
+
 def apply_dimreduction(target, result: DimResult) -> list[str]:
-    """Write the embedding back as computed parameters; returns their names."""
+    """Write the embedding back as computed parameters; returns their names.
+    Raises ValueError, without changing anything, when the result does not
+    belong to the target's workspace."""
     controller, ws = _split(target)
+    emb = np.asarray(result.embedding)
+    if emb.ndim != 2 or emb.shape[1] < 2:
+        raise ValueError("the embedding needs two columns")
+    _check_result_rows(ws, result.index, [p.sample for p in result.populations], {"embedding": emb})
     names = A.unique_names(ws, DIM_METHODS[result.method][1])
     info = {"tool": DIM_METHODS[result.method][0], "parameters": list(result.params), "events": A.index_size(result.index), "populations": _unique_paths(result.populations), **{k: v for k, v in result.options.items()}}
     if controller is not None:
@@ -212,19 +243,19 @@ def compute_clustering(populations, params, method="flowsom", max_events=None, o
     options = dict(options or {})
     if progress:
         progress("Collecting events…")
-    X, index = A.prepare_matrix([p.sample for p in populations], [p.path for p in populations], params, max_events, seed)
+    X, index = A.prepare_matrix([p.sample for p in populations], [p.path for p in populations], params, max_events, seed, should_cancel=should_cancel)
     _check(should_cancel)
     if progress:
         progress(f"Running {CLUSTER_METHODS[method][0]} on {X.shape[0]} events…")
     if method == "kmeans":
-        labels = A.run_kmeans(X, int(options.get("k", 10)), seed)
+        labels = A.run_kmeans(X, int(options.get("k", 10)), seed, should_cancel=should_cancel)
         model = A.kmeans_model(X, labels)
     elif method == "flowsom":
         grid = tuple(options.get("grid", (10, 10)))
-        labels, codes, meta = A.run_flowsom(X, grid, int(options.get("n_metaclusters", 10)), int(options.get("iterations", 10)), seed)
+        labels, codes, meta = A.run_flowsom(X, grid, int(options.get("n_metaclusters", 10)), int(options.get("iterations", 10)), seed, should_cancel=should_cancel)
         model = A.flowsom_model(codes, meta)
     elif method == "phenograph":
-        labels = A.run_phenograph(X, int(options.get("k", 30)), seed, float(options.get("resolution", 1.0)))
+        labels = A.run_phenograph(X, int(options.get("k", 30)), seed, float(options.get("resolution", 1.0)), should_cancel=should_cancel)
         model = {"kind": "phenograph"}
     else:
         raise ValueError(f"unknown method {method}")
@@ -250,8 +281,11 @@ def _cluster_group(controller, ws, paths: list[str], populations):
 
 def apply_clustering(target, result: ClusterResult) -> tuple[str, list[str]]:
     """Write cluster ids as a computed parameter and create one population per
-    cluster below the analysed population(s). Returns (param, population names)."""
+    cluster below the analysed population(s). Returns (param, population names).
+    Raises ValueError, without changing anything, when the result does not
+    belong to the target's workspace."""
     controller, ws = _split(target)
+    _check_result_rows(ws, result.index, [p.sample for p in result.populations], {"labels": np.asarray(result.labels)})
     name = A.unique_names(ws, [CLUSTER_METHODS[result.method][1]])[0]
     info = {"tool": CLUSTER_METHODS[result.method][0], "parameters": list(result.params), "events": A.index_size(result.index), "min": 0.0, "max": float(result.labels.max()) + 1.0, "populations": _unique_paths(result.populations)}
     info.update({k: (list(v) if isinstance(v, tuple) else v) for k, v in result.options.items()})
@@ -301,8 +335,13 @@ def run_clustering(target, method="flowsom", populations=None, params=None, max_
 
 def apply_projection(target, projection: A.Projection) -> list[str]:
     """Store a computed projection (see analysis.apply_projection) and notify
-    the controller. Returns the projected parameter names."""
+    the controller. Returns the projected parameter names. Raises ValueError,
+    without changing anything, when the projection's target samples are not
+    in the target's workspace."""
     controller, ws = _split(target)
+    if not projection.columns:
+        raise ValueError("the projection has no values")
+    _check_result_rows(ws, projection.index, projection.targets, projection.columns)
     tool = projection.result.tool
     if controller is not None:
         controller.begin_change(f"Project onto {tool}")  # parameters, scales and (for clusterings) populations
@@ -365,7 +404,9 @@ class _Worker(QThread):
 
     A QThread subclass owned by the dialog (not a parentless QObject moved to a
     thread): Qt deletes it with the dialog, so nothing is torn down from the
-    wrong thread at interpreter shutdown.
+    wrong thread at interpreter shutdown. The outcome is kept on the worker
+    (`result`, `error`, `was_cancelled`) and handled by the dialog when the
+    thread has finished.
     """
 
     done_result = Signal(object)
@@ -377,32 +418,106 @@ class _Worker(QThread):
         self.fn = fn
         self.kwargs = kwargs
         self.cancelled = False
+        self.result = None
+        self.error: str | None = None
+        self.was_cancelled = False
 
     def run(self):
         try:
             result = self.fn(**self.kwargs, progress=self.progress.emit, should_cancel=lambda: self.cancelled)
         except Cancelled:
+            self.was_cancelled = True
             self.failed.emit("")
         except Exception as exc:  # noqa: BLE001 - reported to the user
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.failed.emit(self.error)
         else:
+            self.result = result
             self.done_result.emit(result)
 
 
-# ===================================================================== dialogs
+class _ProgressDialog(QProgressDialog):
+    """Busy indicator of a running computation.
+
+    Cancel (the button, Escape or the window's close button) only asks the
+    worker to stop: unlike a plain QProgressDialog, which hides itself, the
+    dialog stays up (window-modal) showing "Cancelling…" until `finish()` is
+    called once the worker thread has ended."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__("Starting…", "Cancel", 0, 0, parent)
+        self.cancelling = False
+        self._finished = False
+        try:  # Qt connects canceled() to cancel(), which hides and resets the dialog
+            self.canceled.disconnect(self.cancel)
+        except (RuntimeError, TypeError):  # pragma: no cover
+            pass
+        self.canceled.connect(self.show_cancelling)
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setMinimumDuration(0)
+        self.setAutoClose(False)
+        self.setAutoReset(False)
+
+    def show_cancelling(self):
+        if self._finished:
+            return
+        self.cancelling = True
+        self.setLabelText("Cancelling… (waiting for the computation to stop)")
+        button = self.findChild(QPushButton)
+        if button is not None:
+            button.setEnabled(False)
+
+    def reject(self):  # Escape
+        if self._finished:
+            super().reject()
+        elif not self.cancelling:
+            self.canceled.emit()
+
+    def closeEvent(self, event):
+        if self._finished:
+            event.accept()
+            return
+        event.ignore()
+        if not self.cancelling:
+            self.canceled.emit()
+
+    def finish(self):
+        """Close for good (the worker has stopped) and delete later."""
+        self._finished = True
+        QProgressDialog.cancel(self)  # hides and stops the pending show timer
+        self.hide()
+        self.deleteLater()
+
+
 class _ThreadedDialog(QDialog):
     """Runs `compute_fn()(**compute_kwargs())` in a worker thread with a
     progress dialog, then `apply(result)` in the GUI thread. Subclasses
-    provide `run_button` and the four hooks."""
+    provide `run_button` and the four hooks.
+
+    A run is bound to the workspace object and the Sample objects it started
+    on (`_bind_samples`): when it finishes in another workspace, or a sample
+    is gone, the result is discarded with a message instead of being written
+    by sample id onto whatever samples now have those ids. Replacing the
+    workspace cancels the run and closes the dialog. The dialog is deleted
+    when closed; closing it while the worker runs cancels the worker and
+    defers the close until the thread has stopped (the GUI thread never
+    waits for more than ~100 ms)."""
 
     title = "Analysis"
+    CLOSE_WAIT_MS = 100  # longest the GUI thread waits for a cancelled worker
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.last_result = None
         self._thread: QThread | None = None
         self._worker: _Worker | None = None
-        self._progress: QProgressDialog | None = None
+        self._progress: _ProgressDialog | None = None
+        self._pending_done: int | None = None
+        self._bound_workspace: Workspace | None = None
+        self._bound_samples: list = []
+        self._discard_reason = ""
 
     # subclasses
     def compute_fn(self):
@@ -417,83 +532,173 @@ class _ThreadedDialog(QDialog):
     def _validate(self, kwargs) -> bool:
         return True
 
+    def _bind_samples(self, kwargs) -> list:
+        """The Sample objects a run with these arguments reads and writes."""
+        return []
+
+    # controller / workspace
+    def _watch_controller(self, controller):
+        signal = getattr(controller, "workspaceReplaced", None)
+        if signal is not None:
+            signal.connect(self._on_workspace_replaced)
+
+    def _current_workspace(self) -> Workspace:
+        return _split(self.controller)[1]
+
+    def _status(self, text: str):
+        signal = getattr(self.controller, "statusMessage", None)
+        if signal is not None:
+            signal.emit(text)
+
+    def _on_workspace_replaced(self):
+        if self._worker is not None:
+            self._discard_reason = "the workspace was replaced"
+            self._worker.cancelled = True
+            if self._progress is not None:
+                self._progress.show_cancelling()
+        self.reject()
+
+    def _binding_problem(self) -> str:
+        """Why the finished run must not be applied ("" when it may)."""
+        ws = self._current_workspace()
+        if self._bound_workspace is not None and ws is not self._bound_workspace:
+            return "the workspace was replaced while it was running"
+        present = {id(s) for s in ws.samples}
+        gone = [s.name for s in self._bound_samples if id(s) not in present]
+        if gone:
+            return f"{', '.join(dict.fromkeys(gone))} {'was' if len(set(gone)) == 1 else 'were'} removed from the workspace while it was running"
+        return ""
+
+    def _release_binding(self):
+        self._bound_workspace = None
+        self._bound_samples = []
+        self._discard_reason = ""
+
+    # running
+    @property
+    def running(self) -> bool:
+        return self._worker is not None
+
     def run_now(self):
         """Run synchronously (no thread, no progress dialog)."""
         kwargs = self.compute_kwargs()
         result = self.compute_fn()(**kwargs)
         self.last_result = result
         self.apply(result)
+        self.last_result = None  # do not keep the matrix / fitted model alive
         return result
 
     def start(self):
+        if self._worker is not None:
+            return
         kwargs = self.compute_kwargs()
         if not self._validate(kwargs):
             return
+        self._bound_workspace = self._current_workspace()
+        self._bound_samples = list(self._bind_samples(kwargs))
+        self._discard_reason = ""
+        self.last_result = None
         self.run_button.setEnabled(False)
         self._worker = _Worker(self.compute_fn(), kwargs, self)
         self._thread = self._worker
-        self._worker.done_result.connect(self._finished)
-        self._worker.failed.connect(self._failed)
         self._worker.progress.connect(self._on_progress)
-        self._progress = QProgressDialog("Starting…", "Cancel", 0, 0, self)
-        self._progress.setWindowTitle(self.title)
-        self._progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self._progress.setMinimumDuration(0)
+        # handled once the thread has ended (not on the result signal, which
+        # comes while run() is still returning)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._progress = _ProgressDialog(self.title, self)
         self._progress.canceled.connect(self._cancel)
         self._progress.show()
-        self._thread.start()
+        self._worker.start()
 
     def _on_progress(self, text: str):
-        if self._progress is not None:
+        if self._progress is not None and not self._progress.cancelling:
             self._progress.setLabelText(text)
 
     def _cancel(self):
         if self._worker is not None:
             self._worker.cancelled = True
-            if self._progress is not None:
-                self._progress.setLabelText("Cancelling after the current step…")
 
     def _close_progress(self):
         if self._progress is not None:
-            self._progress.canceled.disconnect(self._cancel)
-            self._progress.close()
+            self._progress.finish()
             self._progress = None
 
-    def _settle_thread(self):
-        # the worker emits its result just before run() returns; make sure the
-        # thread has fully stopped before anything else happens
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.wait(10000)
+    def request_stop(self):
+        """Ask the running worker (if any) to stop, without waiting."""
+        if self._worker is not None:
+            self._worker.cancelled = True
+            self._worker.requestInterruption()
+            if self._progress is not None:
+                self._progress.show_cancelling()
 
-    def _finished(self, result):
-        self._settle_thread()
-        cancelled = self._worker is not None and self._worker.cancelled
-        self._close_progress()
-        self.run_button.setEnabled(True)
-        if cancelled:
+    def stop_worker(self, timeout_ms: int | None = CLOSE_WAIT_MS) -> bool:
+        """Cancel the running worker and wait for its thread at most
+        `timeout_ms` (None: until it stops). True when no worker is left
+        running; the result of the cancelled run is discarded. When it does not
+        stop in time it finishes in the background and is handled then."""
+        worker = self._worker
+        if worker is None:
+            return True
+        self.request_stop()
+        stopped = worker.wait() if timeout_ms is None else worker.wait(max(0, int(timeout_ms)))
+        if stopped:
+            self._on_worker_finished()
+        return stopped
+
+    def _on_worker_finished(self):
+        worker = self._worker
+        if worker is None:  # already handled (stop_worker)
             return
-        self.last_result = result
+        worker.wait()  # finished() was emitted: the thread is ending, returns at once
+        self._worker = self._thread = None
+        self._close_progress()
+        worker.deleteLater()
+        closing = self._pending_done is not None
+        if not closing:
+            self.run_button.setEnabled(True)
         try:
-            self.apply(result)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, self.title, f"Could not store the results:\n{exc}")
-            return
-        self.accept()
-
-    def _failed(self, message: str):
-        self._settle_thread()
-        self._close_progress()
-        self.run_button.setEnabled(True)
-        if message:
-            QMessageBox.warning(self, self.title, message)
+            if worker.cancelled or worker.was_cancelled or closing:
+                if self._discard_reason:
+                    self._status(f"{self.title} cancelled: {self._discard_reason}")
+            elif worker.error is not None:
+                QMessageBox.warning(self, self.title, worker.error)
+            else:
+                problem = self._binding_problem()
+                if problem:
+                    QMessageBox.warning(self, self.title, f"The {self.title} result was not stored: {problem}.")
+                else:
+                    self.last_result = worker.result
+                    try:
+                        self.apply(worker.result)
+                    except Exception as exc:  # noqa: BLE001
+                        QMessageBox.warning(self, self.title, f"Could not store the results:\n{exc}")
+                    else:
+                        self.last_result = None
+                        self._release_binding()
+                        self.accept()
+                        return
+        finally:
+            worker.result = None
+        self._release_binding()
+        if self._pending_done is not None:
+            r, self._pending_done = self._pending_done, None
+            QDialog.done(self, r)
 
     def done(self, r):
-        if self._thread is not None and self._thread.isRunning():
-            if self._worker is not None:
-                self._worker.cancelled = True
-            self._thread.quit()
-            self._thread.wait(30000)
+        # never block the GUI thread on a running worker: cancel it, give it
+        # CLOSE_WAIT_MS, else close once its thread has ended
+        if self._worker is not None and not self.stop_worker(self.CLOSE_WAIT_MS):
+            self._pending_done = r
+            return
         super().done(r)
+
+    def closeEvent(self, event):
+        if self._worker is not None and not self.stop_worker(self.CLOSE_WAIT_MS):
+            if self._pending_done is None:
+                self._pending_done = int(QDialog.DialogCode.Rejected)
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 class _AnalysisDialog(_ThreadedDialog):
@@ -506,6 +711,7 @@ class _AnalysisDialog(_ThreadedDialog):
         self.controller = controller
         self.method = method
         self.populations = default_populations(controller)
+        self._watch_controller(controller)
         layout = QVBoxLayout(self)
 
         box = QGroupBox("Populations")
@@ -603,7 +809,15 @@ class _AnalysisDialog(_ThreadedDialog):
         if len(kwargs["params"]) < 2:
             QMessageBox.warning(self, self.title, "Choose at least two parameters.")
             return False
+        present = {id(s) for s in self._current_workspace().samples}
+        gone = list(dict.fromkeys(p.sample.name for p in kwargs["populations"] if id(p.sample) not in present))
+        if gone:
+            QMessageBox.warning(self, self.title, f"{', '.join(gone)} {'is' if len(gone) == 1 else 'are'} no longer in the workspace; close this dialog and open it again.")
+            return False
         return True
+
+    def _bind_samples(self, kwargs) -> list:
+        return [p.sample for p in kwargs["populations"]]
 
 
 class DimReductionDialog(_AnalysisDialog):
@@ -739,6 +953,7 @@ class ProjectDialog(_ThreadedDialog):
         super().__init__(parent)
         self.controller = controller
         self.workspace = _split(controller)[1]
+        self._watch_controller(controller)
         self.created: list[str] | None = None
         self.populations_created: list[str] = []
         self.results: list[A.ComputedResult] = []
@@ -903,7 +1118,19 @@ class ProjectDialog(_ThreadedDialog):
         if not kwargs["target_samples"]:
             QMessageBox.warning(self, self.title, "Choose at least one sample.")
             return False
+        ws = self._current_workspace()
+        present = {id(s) for s in ws.samples}
+        if self.workspace is not ws or any(id(s) not in present for s in self._bind_samples(kwargs)):
+            QMessageBox.warning(self, self.title, "The workspace changed since this dialog was opened; close it and open it again.")
+            return False
         return True
+
+    def _bind_samples(self, kwargs) -> list:
+        r = self.chosen_result()
+        samples = list(kwargs["target_samples"])
+        if r is not None and r.source is not None:
+            samples.append(r.source)  # its axis scales are copied
+        return samples
 
     def apply(self, projection: A.Projection):
         self.created = apply_projection(self.controller, projection)
@@ -929,6 +1156,7 @@ def _tint(value: float) -> QColor:
 class _TableDialog(QDialog):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle(title)
         self.layout_ = QVBoxLayout(self)
         self.table = QTableWidget()
@@ -1068,8 +1296,24 @@ class CompareDialog(_TableDialog):
 
 
 # ===================================================================== install
+def _alive(obj) -> bool:
+    """False once the Qt object behind a Python wrapper has been deleted."""
+    try:
+        import shiboken6
+
+        return shiboken6.isValid(obj)
+    except ImportError:  # pragma: no cover
+        return True
+
+
 class AnalysisTools:
-    """References to the actions and open dialogs of this extension."""
+    """References to the actions and open dialogs of this extension.
+
+    The dialogs delete themselves when closed; `dialogs` holds a Python
+    reference to each one until then. `stop_all()` (alias `stop_workers()`)
+    cancels the running computations before the application quits."""
+
+    STOP_WAIT_MS = 500  # total time stop_all() may block the GUI thread
 
     def __init__(self, window):
         self.window = window
@@ -1082,8 +1326,46 @@ class AnalysisTools:
 
     def _keep(self, dlg):
         self.dialogs.append(dlg)
-        dlg.finished.connect(lambda _r, d=dlg: self.dialogs.remove(d) if d in self.dialogs and not isinstance(d, _TableDialog) else None)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.finished.connect(lambda _r=0, d=dlg: self._forget(d))
+        dlg.destroyed.connect(lambda _obj=None, d=dlg: self._forget(d))
         return dlg
+
+    def _forget(self, dlg):
+        self.dialogs[:] = [d for d in self.dialogs if d is not dlg]
+
+    def threaded_dialogs(self) -> list:
+        """Open dialogs that can run a computation (kept or parented to the window)."""
+        found = [d for d in self.dialogs if isinstance(d, _ThreadedDialog)]
+        parent = self._parent()
+        if parent is not None:
+            try:
+                found += [d for d in parent.findChildren(_ThreadedDialog) if d not in found]
+            except RuntimeError:  # the window is being deleted
+                pass
+        return found
+
+    def running(self) -> bool:
+        return any(_alive(d) and d.running for d in self.threaded_dialogs())
+
+    def stop_all(self, timeout_ms: int | None = None) -> bool:
+        """Cancel every running computation of the analysis dialogs and wait
+        for their threads, at most `timeout_ms` in total (default
+        STOP_WAIT_MS = 500 ms). Their results are discarded. True when no
+        worker is still running; a worker that has not reached its next
+        cancellation point yet keeps running and stops on its own."""
+        budget = self.STOP_WAIT_MS if timeout_ms is None else max(0, int(timeout_ms))
+        dialogs = [d for d in self.threaded_dialogs() if _alive(d) and d.running]
+        for d in dialogs:  # ask all of them first, so they stop in parallel
+            d.request_stop()
+        deadline = QDeadlineTimer(budget)
+        stopped = True
+        for d in dialogs:
+            if _alive(d):
+                stopped = d.stop_worker(int(deadline.remainingTime())) and stopped
+        return stopped
+
+    stop_workers = stop_all
 
     def open_dimreduction(self, method: str):
         if not self.controller.workspace.samples:
@@ -1102,8 +1384,7 @@ class AnalysisTools:
         return dlg
 
     def open_compare(self):
-        dlg = CompareDialog(self.controller, self._parent())
-        self.dialogs.append(dlg)
+        dlg = self._keep(CompareDialog(self.controller, self._parent()))
         dlg.show()
         return dlg
 

@@ -5,13 +5,22 @@ the same entries to the Tools menu. All computations live in
 `flowdesk.core.qc` and `flowdesk.core.calibration`; the dialogs collect the
 settings, plot the result, show / export tables and create the populations
 or calibrated parameters through the controller.
+
+The per-sample loops ("Apply to all samples in group", "Apply to samples…")
+run in a worker thread with a progress dialog (as in `tools_analysis`): the
+worker loads the files and computes, the GUI thread then changes the
+workspace inside one undo step. `apply_to_group()` / `apply()` remain the
+synchronous versions of the same code; `start_group()` / `start_apply()` are
+what the buttons call.
 """
 from __future__ import annotations
 
 import math
+import weakref
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,6 +36,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -109,6 +119,56 @@ def _begin(controller, label: str, kind=None):
         controller.begin_change(label, kind)
     except TypeError:
         controller.begin_change(label)
+
+
+@contextmanager
+def _undo_step(controller, label: str, kind=None):
+    """One undo step for the whole block (controller.undo_group), falling back
+    to a single begin_change for controllers without undo groups."""
+    group = getattr(controller, "undo_group", None)
+    if group is None:
+        _begin(controller, label, kind)
+        yield
+        return
+    with group(label, kind):
+        yield
+
+
+class Cancelled(Exception):
+    """Raised by a worker function when the user pressed Cancel."""
+
+
+def _check_cancel(should_cancel):
+    if should_cancel is not None and should_cancel():
+        raise Cancelled()
+
+
+class _Worker(QThread):
+    """Runs `fn(progress=..., should_cancel=...)` in its own thread.
+
+    As tools_analysis._Worker: a QThread subclass owned by the dialog, so Qt
+    deletes it with the dialog. `fn` must not touch widgets; its result is
+    handed to the GUI thread through `done_result` (a queued connection).
+    """
+
+    done_result = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+        self.cancelled = False
+
+    def run(self):
+        try:
+            result = self.fn(progress=self.progress.emit, should_cancel=lambda: self.cancelled)
+        except Cancelled:
+            self.failed.emit("")
+        except Exception as exc:  # noqa: BLE001 - reported to the user
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+        else:
+            self.done_result.emit(result)
 
 
 class _Axes:
@@ -427,6 +487,99 @@ class _ToolDialog(QDialog):
         self.export_button = QPushButton(icon("export"), "Export CSV…")
         self.copy_button.clicked.connect(self.copy_results)
         self.export_button.clicked.connect(lambda: self.export_csv())
+        self._worker: _Worker | None = None
+        self._progress: QProgressDialog | None = None
+        self._job_apply = None
+        self._job_buttons: tuple = ()
+
+    # ------------------------------------------------------- threaded jobs
+    def busy(self) -> bool:
+        """A threaded job (group / multi-sample apply) is running."""
+        return self._worker is not None
+
+    def _start_job(self, title: str, total: int, compute, apply, buttons=()) -> bool:
+        """Run `compute(progress, should_cancel)` in a worker thread with a
+        progress dialog ("sample i of n", Cancel stops after the current
+        sample and changes nothing), then `apply(result)` in the GUI thread."""
+        if self._worker is not None:
+            return False
+        worker = _Worker(compute, self)
+        self._worker = worker
+        self._job_apply = apply
+        self._job_buttons = tuple(buttons)
+        for b in self._job_buttons:
+            b.setEnabled(False)
+        worker.done_result.connect(self._job_finished)
+        worker.failed.connect(self._job_failed)
+        worker.progress.connect(self._job_progress)
+        prog = QProgressDialog("Starting…", "Cancel", 0, max(1, int(total)), self)
+        prog.setWindowTitle(title)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.setValue(0)
+        prog.canceled.connect(self._job_cancel)
+        prog.show()
+        self._progress = prog
+        worker.start()
+        return True
+
+    def _job_progress(self, value: int, text: str):
+        prog = self._progress
+        if prog is None:
+            return
+        prog.setLabelText(text)
+        # a modal progress dialog processes events in setValue: the job may
+        # finish (and _end_job run) inside it, so nothing may follow here
+        prog.setValue(min(int(value), prog.maximum()))
+
+    def _job_cancel(self):
+        if self._worker is not None:
+            self._worker.cancelled = True
+            if self._progress is not None:
+                self._progress.setLabelText("Cancelling after the current sample…")
+
+    def _end_job(self) -> bool:
+        """Stop waiting for the worker; returns whether it was cancelled."""
+        worker = self._worker
+        cancelled = bool(worker is not None and worker.cancelled)
+        if worker is not None:
+            # the worker emits its result just before run() returns
+            if worker.isRunning():
+                worker.wait(10000)
+            worker.deleteLater()
+        self._worker = None
+        prog, self._progress = self._progress, None
+        if prog is not None:  # closed, deleted with the dialog (as in tools_analysis)
+            prog.canceled.disconnect(self._job_cancel)
+            prog.close()
+        for b in self._job_buttons:
+            b.setEnabled(True)
+        self._job_buttons = ()
+        return cancelled
+
+    def _job_finished(self, result):
+        apply, self._job_apply = self._job_apply, None
+        if self._end_job():
+            self.status.setText("Cancelled; nothing was changed.")
+            return
+        if apply is not None:
+            apply(result)
+
+    def _job_failed(self, message: str):
+        self._job_apply = None
+        self._end_job()
+        self.status.setText(f"Failed: {message}" if message else "Cancelled; nothing was changed.")
+
+    def done(self, r):
+        worker = self._worker
+        if worker is not None:
+            worker.cancelled = True
+            self._job_apply = None
+            worker.wait(30000)
+            self._end_job()
+        super().done(r)
 
     def _connect_controller(self):
         self.sample_combo.currentIndexChanged.connect(self._sample_changed)
@@ -580,6 +733,14 @@ def _spin(lo: float, hi: float, value: float, decimals: int = 1, step: float = 0
 # =============================================================================
 # data cleaning
 # =============================================================================
+def _run_qc(population, request: dict) -> qc.QCResult:
+    """The checks of a DataCleaningDialog.request() on one population (no widgets)."""
+    settings = dict(request["settings"])
+    if not settings.get("checks"):
+        raise ValueError("no check selected")
+    return qc.qc_for_population(population, request["time_param"], list(request["params"]), **settings)
+
+
 class DataCleaningDialog(_ToolDialog):
     """FlowAI / PeacoQC-style data cleaning of one population over time."""
 
@@ -590,6 +751,10 @@ class DataCleaningDialog(_ToolDialog):
         super().__init__(controller, parent)
         self.resize(1040, 720)
         self.result: qc.QCResult | None = None
+        # what self.result was computed from: weak references to the sample and
+        # its event data, the population path and the request (settings)
+        self._result_key: tuple | None = None
+        self._result_stale = False  # scales / compensation changed since
         self._param_choice: set[str] | None = None  # parameters the user ticked
 
         self.time_combo = QComboBox()
@@ -685,12 +850,69 @@ class DataCleaningDialog(_ToolDialog):
 
         self.run_button.clicked.connect(lambda: self.run())
         self.create_button.clicked.connect(lambda: self.apply())
-        self.group_button.clicked.connect(lambda: self.apply_to_group())
+        self.group_button.clicked.connect(lambda: self.start_group())
         for chk, widgets in ((self.rate_check, (self.rate_z, self.rate_min)), (self.signal_check, (self.signal_z, self.signal_min)), (self.range_check, (self.pile_spin, self.low_check))):
             chk.toggled.connect(lambda on, ws=widgets: [w.setEnabled(on) for w in ws])
         self.time_combo.currentIndexChanged.connect(self._time_changed)
         self._connect_controller()
+        self.controller.scalesChanged.connect(self._on_data_changed)
+        self.controller.compensationChanged.connect(self._on_data_changed)
         self.refresh(use_selection=True)
+
+    # ---------------------------------------------------------- stale results
+    def _result_sample(self):
+        key = self._result_key
+        return key[0]() if key is not None else None
+
+    def _drop_result(self):
+        """Forget the last result (it belongs to data that is gone)."""
+        self.result = None
+        self._result_key = None
+        self._result_stale = False
+        self.plot.clear()
+        self._set_table([], [])
+        self.status.setText("")
+
+    def _on_workspace_replaced(self, *_):
+        # sample ids restart in every workspace: a result of the old one must
+        # never be matched to a sample of the new one
+        self._drop_result()
+        super()._on_workspace_replaced()
+
+    def _on_samples_changed(self, *_):
+        s = self._result_sample()
+        if self.result is not None and (s is None or not any(x is s for x in self.controller.workspace.samples)):
+            self._drop_result()
+        super()._on_samples_changed()
+
+    def _on_data_changed(self, sample_id=None):
+        """Scales / compensation changed: the result no longer matches the
+        sample's values; "Create" recomputes it (the plot stays until then)."""
+        s = self._result_sample()
+        if self._result_key is not None and (s is None or sample_id is None or sample_id == s.id):
+            self._result_stale = True
+
+    def _remember(self, result: qc.QCResult, population, request: dict):
+        sample = population.sample
+        self.result = result
+        self._result_key = (weakref.ref(sample), weakref.ref(sample.fcs) if sample.fcs is not None else None, population.path, request)
+        self._result_stale = False
+
+    def _result_matches(self, population, request: dict) -> bool:
+        """self.result was computed on this very sample object (not just the
+        same id), on its current events and population membership, with the
+        current settings."""
+        r, key = self.result, self._result_key
+        if r is None or key is None or self._result_stale:
+            return False
+        sref, fref, path, req = key
+        sample = population.sample
+        if sample is None or sref() is not sample or path != population.path or req != request:
+            return False
+        if (fref() if fref is not None else None) is not sample.fcs:
+            return False  # the data were reloaded
+        mask = population.mask()
+        return r.event_index is not None and mask.size == sample.n_events and np.array_equal(np.flatnonzero(mask), r.event_index)
 
     # ------------------------------------------------------------ parameters
     def _refresh_params(self, sample):
@@ -785,10 +1007,12 @@ class DataCleaningDialog(_ToolDialog):
             self.mode_combo.setCurrentIndex(idx)
 
     # ---------------------------------------------------------------- actions
-    def compute(self, population) -> qc.QCResult:
-        if not self.checks():
-            raise ValueError("no check selected")
-        return qc.qc_for_population(population, self.time_param(), self.selected_params(), **self.settings())
+    def request(self) -> dict:
+        """What the checks run with: time parameter, parameters and settings."""
+        return {"time_param": self.time_param(), "params": list(self.selected_params()), "settings": self.settings()}
+
+    def compute(self, population, request: dict | None = None) -> qc.QCResult:
+        return _run_qc(population, request if request is not None else self.request())
 
     def run(self) -> qc.QCResult | None:
         """Run the checks on the chosen population; returns the result (or None)."""
@@ -796,14 +1020,16 @@ class DataCleaningDialog(_ToolDialog):
         if pop is None:
             self.status.setText("No population selected.")
             return None
+        request = self.request()
         try:
-            result = self.compute(pop)
+            result = self.compute(pop, request)
         except (ValueError, KeyError, RuntimeError) as exc:
             self.result = None
+            self._result_key = None
             self.plot.clear()
             self.status.setText(f"Could not check {pop.display_name}: {exc}")
             return None
-        self.result = result
+        self._remember(result, pop, request)
         self.plot.set_result(result, self.time_param() or "Event order")
         self._set_table(qc.TABLE_HEADER, qc.result_table(result))
         self.status.setText(f"{pop.sample.name} / {pop.display_name}: {self.describe(result)}")
@@ -812,17 +1038,20 @@ class DataCleaningDialog(_ToolDialog):
     @staticmethod
     def describe(r: qc.QCResult) -> str:
         parts = [f"{qc.CHECK_LABELS[k]} {r.percent_removed.get(k, 0.0):.1f}%" for k in r.checks]
+        parts = [f"{qc.CHECK_LABELS[k]} not tested" if r.bins_tested(k) == 0 else p for k, p in zip(r.checks, parts)]
         text = f"{r.n_good} of {r.n_events} events kept ({r.percent_removed.get('total', 0.0):.1f}% removed: {', '.join(parts)})"
         if r.notes:
             text += "; " + "; ".join(f"{k}: {v}" for k, v in r.notes.items())
         return text
 
     def _result_for(self, pop) -> qc.QCResult:
-        r = self.result
-        if r is not None and r.sample_id == pop.sample.id and r.population_path == pop.path:
-            return r
-        r = self.compute(pop)
-        self.result = r
+        """The last result when it was computed on this population with the
+        current settings, otherwise a fresh one."""
+        request = self.request()
+        if self._result_matches(pop, request):
+            return self.result
+        r = self.compute(pop, request)
+        self._remember(r, pop, request)
         return r
 
     def apply(self, name: str | None = None, mode: str | None = None):
@@ -862,51 +1091,109 @@ class DataCleaningDialog(_ToolDialog):
         c.gatingChanged.emit(sample_id)
         c.statusMessage.emit("Data cleaning population created")
 
-    def apply_to_group(self, name: str | None = None, mode: str | None = None) -> list[list]:
-        """Run the checks on the chosen population path of every sample in the
-        current group and create the QC population on each (one undo step)."""
+    def _group_plan(self, name: str | None, mode: str | None) -> dict:
         pop = self.current_population()
-        path = pop.path if pop is not None else ""
-        name = (name or self.name_edit.text() or qc.DEFAULT_NAME).strip()
-        mode = mode or self.mode()
         group = self.controller.current_group
-        members = self.controller.workspace.members(group)
-        rows: list[list] = []
-        failed = 0
-        began = False
-        for sample in members:
+        return {
+            "current": pop,
+            "path": pop.path if pop is not None else "",
+            "name": (name or self.name_edit.text() or qc.DEFAULT_NAME).strip(),
+            "mode": mode or self.mode(),
+            "group": group,
+            "members": list(self.controller.workspace.members(group)),
+            "request": self.request(),
+        }
+
+    @staticmethod
+    def _compute_group(plan: dict, progress=None, should_cancel=None) -> list[tuple]:
+        """Load every member and run the checks on its population (no widgets,
+        no workspace changes: runs in the worker thread). Returns
+        (sample, population or None, result or None, error) per member."""
+        members, path, mode = plan["members"], plan["path"], plan["mode"]
+        out: list[tuple] = []
+        for i, sample in enumerate(members):
+            _check_cancel(should_cancel)
+            if progress is not None:
+                progress(i, f"Sample {i + 1} of {len(members)}: {sample.name}")
             if not sample.ensure_loaded():
-                rows.append([sample.name, "", "", "", "", "", "", "", "", "", sample.load_error or "not loaded"])
-                failed += 1
+                out.append((sample, None, None, sample.load_error or "not loaded"))
                 continue
             target = sample.root.find(path)
             if target is None:
-                rows.append([sample.name, "", "", "", "", "", "", "", "", "", f"no population {path}"])
-                failed += 1
+                out.append((sample, None, None, f"no population {path}"))
                 continue
             try:
-                result = self.compute(target)
+                result = _run_qc(target, plan["request"])
+                if mode == "time" and not result.time_param:
+                    raise ValueError("time gates need a time parameter")
                 if mode == "time" and not result.intervals:
                     raise ValueError("no clean time interval")
-                if not began:
-                    self.controller.begin_change("data cleaning (group)")
-                    began = True
-                created = qc.apply_qc(target, result, name, mode)
             except (ValueError, KeyError, RuntimeError) as exc:
-                rows.append([sample.name, target.display_name, "", "", "", "", "", "", "", "", str(exc)])
-                failed += 1
+                out.append((sample, target, None, str(exc)))
                 continue
-            if pop is not None and sample is pop.sample:
-                self.result = result
-                self.plot.set_result(result, self.time_param() or "Event order")
-            rows.append(qc.group_row(sample.name, target.display_name, result, f"{created[0].name}: {created[0].count} events"))
-        if began:
+            out.append((sample, target, result, ""))
+        _check_cancel(should_cancel)
+        if progress is not None:
+            progress(len(members), "Creating populations…")
+        return out
+
+    def _apply_group(self, plan: dict, outcomes: list[tuple]) -> list[list]:
+        """Create the QC populations from computed results (GUI thread, one undo step)."""
+        name, mode, pop = plan["name"], plan["mode"], plan["current"]
+        rows: list[list] = []
+        failed = 0
+        created_any = False
+        blank = [""] * 8
+        step = _undo_step(self.controller, "data cleaning (group)") if any(o[2] is not None for o in outcomes) else nullcontext()
+        with step:
+            for sample, target, result, error in outcomes:
+                if result is None:
+                    rows.append([sample.name, target.display_name if target is not None else "", *blank, error])
+                    failed += 1
+                    continue
+                try:
+                    created = qc.apply_qc(target, result, name, mode)
+                except (ValueError, KeyError, RuntimeError) as exc:
+                    rows.append([sample.name, target.display_name, *blank, str(exc)])
+                    failed += 1
+                    continue
+                created_any = True
+                if pop is not None and sample is pop.sample:
+                    self._remember(result, target, plan["request"])
+                    self.plot.set_result(result, plan["request"]["time_param"] or "Event order")
+                rows.append(qc.group_row(sample.name, target.display_name, result, f"{created[0].name}: {created[0].count} events"))
+        if created_any:
             self.controller.mark_modified()
             self._notify(None)
         self._set_table(qc.GROUP_HEADER, rows)
-        msg = f"{name} created on {len(rows) - failed} of {len(members)} samples in {group.name}"
+        msg = f"{name} created on {len(rows) - failed} of {len(plan['members'])} samples in {plan['group'].name}"
         self.status.setText(msg + (f" ({failed} failed)" if failed else ""))
         return rows
+
+    def apply_to_group(self, name: str | None = None, mode: str | None = None) -> list[list]:
+        """Run the checks on the chosen population path of every sample in the
+        current group and create the QC population on each (one undo step).
+        Synchronous; the button runs the same in a worker thread (start_group)."""
+        plan = self._group_plan(name, mode)
+        return self._apply_group(plan, self._compute_group(plan))
+
+    def start_group(self, name: str | None = None, mode: str | None = None) -> bool:
+        """apply_to_group in a worker thread with a progress dialog; the
+        populations are created when it finishes (nothing on Cancel). Returns
+        False when a job is already running."""
+        if self.busy():
+            return False
+        plan = self._group_plan(name, mode)
+        if not plan["members"]:
+            self.apply_to_group(name, mode)
+            return True
+        return self._start_job(
+            self.TITLE,
+            len(plan["members"]),
+            lambda progress, should_cancel: self._compute_group(plan, progress, should_cancel),
+            lambda outcomes: self._apply_group(plan, outcomes),
+            (self.run_button, self.create_button, self.group_button),
+        )
 
 
 # =============================================================================
@@ -989,7 +1276,7 @@ class CalibrationDialog(_ToolDialog):
         self.table.itemChanged.connect(self._table_edited)
         self.run_button.clicked.connect(lambda: self.run())
         self.fit_button.clicked.connect(lambda: self.fit())
-        self.apply_button.clicked.connect(lambda: self.apply())
+        self.apply_button.clicked.connect(lambda: self.start_apply())
         self.save_button.clicked.connect(lambda: self.save_calibration())
         self.load_button.clicked.connect(lambda: self.load_calibration())
         self._connect_controller()
@@ -1193,42 +1480,94 @@ class CalibrationDialog(_ToolDialog):
         group = ws.group_by_name(target)
         return ws.members(group) if group is not None else []
 
-    def apply(self, target=None) -> list[tuple]:
-        """Create "<param> MESF" on the target samples ("current" group, "all",
-        a group name / Group, or a list of samples). Returns (sample, name) pairs."""
+    def _apply_plan(self, target) -> dict | None:
         fit = self.fit_result or self.fit()
         if fit is None:
-            return []
-        samples = self.target_samples(target)
+            return None
+        return {"fit": fit, "samples": list(self.target_samples(target))}
+
+    @staticmethod
+    def _prepare_samples(plan: dict, progress=None, should_cancel=None) -> list[tuple]:
+        """Load every target sample and its source values (no widgets, no
+        workspace changes: runs in the worker thread). Returns (sample, ok)."""
+        fit, samples = plan["fit"], plan["samples"]
+        out: list[tuple] = []
+        for i, s in enumerate(samples):
+            _check_cancel(should_cancel)
+            if progress is not None:
+                progress(i, f"Sample {i + 1} of {len(samples)}: {s.name}")
+            ok = s.ensure_loaded() and fit.param in s.parameter_names()
+            if ok:
+                try:
+                    s.data(fit.param)  # compensation of the source parameter, off the GUI thread
+                except (KeyError, ValueError):
+                    pass  # apply_calibration reports it
+            out.append((s, ok))
+        _check_cancel(should_cancel)
+        if progress is not None:
+            progress(len(samples), "Creating calibrated parameters…")
+        return out
+
+    def _apply_prepared(self, plan: dict, prepared: list[tuple]) -> list[tuple]:
+        """Create the calibrated parameters (GUI thread, one undo step)."""
+        fit = plan["fit"]
         done: list[tuple] = []
         skipped: list[str] = []
-        began = False
-        for s in samples:
-            if not s.ensure_loaded() or fit.param not in s.parameter_names():
-                skipped.append(s.name)
-                continue
-            if not began:
-                _begin(self.controller, f"calibrate {fit.param}", ("gating", "settings"))
-                began = True
-            try:
-                name = cal.apply_calibration(s, fit)
-            except (ValueError, KeyError) as exc:
-                skipped.append(f"{s.name} ({exc})")
-                continue
-            done.append((s, name))
-        if began:
-            cal.store_calibration(self.controller.workspace, fit)
+        ready = any(ok for _, ok in prepared)
+        with (_undo_step(self.controller, f"calibrate {fit.param}", ("gating", "settings")) if ready else nullcontext()):
+            for s, ok in prepared:
+                if not ok:
+                    skipped.append(s.name)
+                    continue
+                try:
+                    name = cal.apply_calibration(s, fit)
+                except (ValueError, KeyError) as exc:
+                    skipped.append(f"{s.name} ({exc})")
+                    continue
+                done.append((s, name))
+            if ready:
+                cal.store_calibration(self.controller.workspace, fit)
+        if ready:
             c = self.controller
             c.mark_modified()
             c.samplesChanged.emit()
             c.scalesChanged.emit(None)
             c.gatingChanged.emit(None)
             c.statusMessage.emit(f"Created {cal.calibrated_name(fit.param, fit.units)} on {len(done)} sample(s)")
-        msg = f"Created {cal.calibrated_name(fit.param, fit.units)} on {len(done)} of {len(samples)} sample(s)"
+        msg = f"Created {cal.calibrated_name(fit.param, fit.units)} on {len(done)} of {len(plan['samples'])} sample(s)"
         if skipped:
             msg += f"; skipped {', '.join(skipped[:5])}{'…' if len(skipped) > 5 else ''}"
         self.status.setText(msg)
         return done
+
+    def apply(self, target=None) -> list[tuple]:
+        """Create "<param> MESF" on the target samples ("current" group, "all",
+        a group name / Group, or a list of samples). Returns (sample, name) pairs.
+        Synchronous; the button runs the same in a worker thread (start_apply)."""
+        plan = self._apply_plan(target)
+        if plan is None:
+            return []
+        return self._apply_prepared(plan, self._prepare_samples(plan))
+
+    def start_apply(self, target=None) -> bool:
+        """apply() in a worker thread with a progress dialog (the files are
+        loaded there); the parameters are created when it finishes (nothing on
+        Cancel). Returns False when nothing was started."""
+        if self.busy():
+            return False
+        plan = self._apply_plan(target)
+        if plan is None:
+            return False
+        if not plan["samples"]:
+            self._apply_prepared(plan, [])
+            return True
+        return self._start_job(
+            self.TITLE,
+            len(plan["samples"]),
+            lambda progress, should_cancel: self._prepare_samples(plan, progress, should_cancel),
+            lambda prepared: self._apply_prepared(plan, prepared),
+            (self.run_button, self.fit_button, self.apply_button),
+        )
 
     def save_calibration(self, path: str | None = None) -> str | None:
         fit = self.fit_result or self.fit()

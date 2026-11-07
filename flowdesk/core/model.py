@@ -193,8 +193,16 @@ class Population:
             else:
                 try:
                     own = self.gate.membership(sample)
-                except KeyError:
-                    own = np.zeros(sample.n_events, dtype=bool)
+                except KeyError:  # a parameter the sample does not have
+                    own = None
+                except ValueError:
+                    # a computed parameter whose values do not fit the events
+                    # (stale data): empty, like a missing parameter
+                    if not any(d in sample.computed for d in getattr(self.gate, "dims", ())):
+                        raise
+                    own = None
+                if own is None or np.shape(own) != parent_mask.shape:
+                    own = np.zeros(parent_mask.shape, dtype=bool)
                 self._mask = parent_mask & own
         return self._mask
 
@@ -233,6 +241,10 @@ class Sample:
         self.channels: list[Channel] = []
         self.fcs: FCSFile | None = None
         self.load_error: str | None = None
+        # problems met while loading the workspace or the data that did not
+        # stop the sample from opening (computed parameters that could not be
+        # restored, ...), as messages for the user; never saved
+        self.load_warnings: list[str] = []
         self.root = Population(self.name)
         self.root.sample = self
         self.scales: dict[str, Scale] = {}
@@ -282,7 +294,26 @@ class Sample:
         if self.comp is None and not self.comp_cleared:
             self.comp = SpilloverMatrix.from_fcs(self.fcs)
         self.load_error = None
+        self._drop_stale_computed()
         return True
+
+    def _drop_stale_computed(self):
+        """Computed parameters restored from a workspace whose length does not
+        match the events of the file now on disk (the FCS file was replaced or
+        relocated to a different one) cannot belong to it: drop them, with a
+        load warning, instead of letting every mask on them fail."""
+        n = self.n_events
+        stale = [k for k, v in self.computed.items() if np.shape(v) != (n,)]
+        for name in stale:
+            size = int(np.size(self.computed.pop(name)))
+            self.computed_info.pop(name, None)
+            self._display_cache.pop(name, None)
+            self.load_warnings.append(
+                f"computed parameter {name!r} was dropped: {self.path.name} has {n} events, the saved values are for {size}"
+            )
+        if stale:
+            self._derived_cache.clear()
+            self.root.invalidate()
 
     @property
     def loaded(self) -> bool:
@@ -376,7 +407,10 @@ class Sample:
             raise KeyError(name)
         assert self.fcs is not None
         if name in self.computed:
-            return self.computed[name]
+            values = self.computed[name]
+            if values.shape != (self.fcs.n_events,):
+                raise KeyError(name)  # stale values (see _drop_stale_computed)
+            return values
         if name in self.derived:
             return self._derived_values(name)
         comp = self._comp_active()
@@ -695,6 +729,10 @@ class Workspace:
         self.path: Path | None = None
         self.settings: dict = {}
         self.modified = False
+        # messages about what load_workspace could not restore (computed
+        # parameters whose data folder or file is missing, unreadable or
+        # stale), one per problem, prefixed with the sample name; never saved
+        self.load_warnings: list[str] = []
         self._next_id = 1
 
     # ------------------------------------------------------------------ samples

@@ -894,11 +894,13 @@ class CompensationWizard(QWizard):
             if res != QMessageBox.StandardButton.Yes:
                 return
         m = self.matrix.copy(name)
-        self.controller.store_matrix(m)
-        if self.matrix_page.apply_check.isChecked():
-            g = ws.group_by_name(self.matrix_page.group_combo.currentText())
-            if g is not None:
-                members = ws.members(g)
-                if members:
-                    self.controller.set_compensation(members, m, True)
+        # one undo step: storing the matrix and applying it to the group
+        with self.controller.undo_group("compensation wizard", kind="matrices"):
+            self.controller.store_matrix(m)
+            if self.matrix_page.apply_check.isChecked():
+                g = ws.group_by_name(self.matrix_page.group_combo.currentText())
+                if g is not None:
+                    members = ws.members(g)
+                    if members:
+                        self.controller.set_compensation(members, m, True)
         super().accept()

@@ -186,6 +186,7 @@ class GraphWindow(QMainWindow):
         self.controller = controller
         self.sample = sample
         self.population = population
+        self._population_path = population.path  # where it was last seen in the tree
         self.group = group
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.resize(640, 700)
@@ -575,17 +576,63 @@ class GraphWindow(QMainWindow):
         if pop is self.population:
             return
         self.population = pop
+        self._population_path = pop.path
         self.plot.set_population(pop)
         self._update_title()
         self._sync_axes_ui()
         self.ancestry.rebuild(self.sample, pop)
         self._refresh_stats()
 
+    @staticmethod
+    def _attached(sample: Sample, pop: Population) -> bool:
+        """True while `pop` is a node of `sample`'s current gating tree."""
+        return pop is sample.root or (pop.parent is not None and pop.root is sample.root)
+
+    @classmethod
+    def _resolve(cls, sample: Sample, pop: Population, path: str | None = None) -> Population | None:
+        """The node of `sample`'s tree that now stands for `pop`, or None when it is gone.
+
+        Undo / redo rebuild a node whose name changed under the same id (the
+        old object is detached, its path is then meaningless); a group edit
+        replaces a node by a copy at the same path (`path`: where `pop` was
+        last seen). A detached node with neither is gone (undo of its creation,
+        redo of its deletion) - never fall back to the root."""
+        if cls._attached(sample, pop):
+            return pop
+        found = next((n for n in sample.root.walk() if n.id == pop.id), None)
+        if found is None and path:
+            found = sample.root.find(path)
+        return found
+
+    def _prune_overlays(self, sample_id=None) -> bool:
+        """Re-point overlays at their current nodes and drop the ones whose
+        population or sample is gone. Returns True when the list changed."""
+        samples = self.controller.workspace.samples
+        kept, changed = [], False
+        for s, p in self.plot.overlays:
+            if sample_id is not None and s.id != sample_id:
+                kept.append((s, p))
+                continue
+            q = self._resolve(s, p) if any(s is x for x in samples) else None
+            if q is None or (s is self.sample and q is self.population):
+                changed = True
+                continue
+            changed = changed or q is not p
+            kept.append((s, q))
+        if changed:
+            self.plot.overlays = kept
+        return changed
+
     def _on_gating_changed(self, sample_id):
+        overlays_changed = self._prune_overlays(sample_id)
         if sample_id is not None and sample_id != self.sample.id:
+            if overlays_changed:
+                self.plot.invalidate()
+                self._refresh_stats()
             return
-        # the population object may have been replaced (group copy / undo)
-        pop = self.sample.root.find(self.population.path) if self.population.parent is not None or self.population is not self.sample.root else self.sample.root
+        # the population object may have been replaced (group copy / undo) or
+        # detached from the tree (undo of its creation, redo of its deletion)
+        pop = self._resolve(self.sample, self.population, self._population_path)
         if pop is None:
             self.close()
             return
@@ -594,6 +641,9 @@ class GraphWindow(QMainWindow):
             self.plot.population = pop
             self.plot.graph = pop.graph
             self.plot._ensure_axes()
+            self.plot._on_data_changed(self.sample.id)  # the selected gate belongs to the old node
+        self._population_path = pop.path
+        self._update_title()  # also after a rename of the shown population
         self.plot.invalidate()
         self.ancestry.rebuild(self.sample, self.population)
         self._refresh_stats()
@@ -603,6 +653,9 @@ class GraphWindow(QMainWindow):
         if self.sample not in self.controller.workspace.samples:
             self.close()
         else:
+            if self._prune_overlays():
+                self.plot.invalidate()
+                self._refresh_stats()
             self._update_title()
 
     def stats_rows(self) -> list[tuple[str, Sample, Population]]:

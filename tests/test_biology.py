@@ -105,6 +105,27 @@ def test_cell_cycle_too_few_events():
         fit_cell_cycle(np.arange(10.0))
 
 
+@pytest.mark.parametrize("bins", [1, 2, 4, 16, 31, 0, -5, "many", None])
+def test_cell_cycle_rejects_too_few_bins(bins):
+    # a single-bin histogram used to crash with IndexError and 4-16 bins
+    # returned a collapsed fit (S ~ 0 or everything in G2/M) without an error
+    with pytest.raises(ValueError, match="bins"):
+        fit_cell_cycle(synth_cell_cycle(), bins=bins)
+
+
+def test_cell_cycle_minimum_bins_still_fit():
+    # the Cell Cycle dialog's lowest setting resolves the 4 % CV peaks
+    r = fit_cell_cycle(synth_cell_cycle(seed=0), bins=32)
+    assert r.counts.shape == (32,)
+    assert abs(r.percent_g1 - 60) < 3 and abs(r.percent_s - 15) < 3 and abs(r.percent_g2m - 25) < 3
+
+
+@pytest.mark.parametrize("bad", [(float("nan"), 300.0), (0.0, float("inf"))])
+def test_cell_cycle_rejects_a_non_finite_range(bad):
+    with pytest.raises(ValueError, match="range"):
+        fit_cell_cycle(synth_cell_cycle(), range=bad)
+
+
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_proliferation_recovers_generations(seed):
     r = fit_proliferation(synth_proliferation(seed=seed), max_generations=10)
@@ -243,6 +264,26 @@ def test_watson_follows_a_skewed_s_phase(shape, seed):
     errs = np.abs(np.array([w.percent_g1, w.percent_s, w.percent_g2m]) - 100 * np.array(mix))
     assert errs.max() < 3
     assert w.curves["S"].min() >= 0
+
+
+@pytest.mark.parametrize("model", ["dean_jett_fox", "watson"])
+@pytest.mark.parametrize("mixed", [True, False])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_cell_cycle_percentages_match_the_drawn_curves(model, mixed, seed):
+    """%G1 / %S / %G2M are the areas of the G1 / S / G2/M curves that are drawn
+    and exported (Watson pragmatic used to report %S from the raw residual,
+    including the negative residuals the clipped S curve does not show: off
+    by 0.05-0.5 points)."""
+    if mixed:
+        r = fit_cell_cycle(synth_cell_cycle_mixed(seed=seed), model=model, debris=True, aggregates=True)
+    else:
+        r = fit_cell_cycle(synth_cell_cycle(seed=seed), model=model)
+    areas = np.array([r.curves[k].sum() for k in ("G1", "S", "G2/M")])
+    from_curves = 100 * areas / areas.sum()
+    reported = np.array([r.percent_g1, r.percent_s, r.percent_g2m])
+    # a few thousandths of a point: the G1 Gaussian's tail beyond the histogram
+    assert np.abs(reported - from_curves).max() < 0.01
+    assert r.curves["S"].min() >= 0
 
 
 def test_watson_without_debris_on_clean_data():

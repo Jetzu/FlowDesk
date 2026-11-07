@@ -9,7 +9,9 @@ Gates on parameters FlowDesk cannot compute - FlowJo derived parameters,
 Gating-ML "new dimensions" (ratio transforms) or parameters missing from the
 FCS file - are kept with their dimension names, so the population tree stays
 complete; such populations evaluate as empty (0 events) and are listed in the
-import report's warnings.
+import report's warnings. Dimensions without a parameter name (Gating-ML new
+dimensions, unnamed dimensions) are named with the `UNRESOLVED_DIMENSION`
+prefix, which the FlowJo export never writes back as a parameter.
 """
 from __future__ import annotations
 
@@ -43,6 +45,9 @@ BOOLEAN_NODES = {"NotNode": "not", "AndNode": "and", "OrNode": "or"}
 POPULATION_TAGS = {"Population", *BOOLEAN_NODES}
 COMPENSATION_ROLE = "ws.group.dlog.compensation"
 ALL_SAMPLES = "All Samples"
+# prefix of the placeholder names given to gate dimensions that have no
+# parameter name (ratio / new dimensions); never the name of an FCS parameter
+UNRESOLVED_DIMENSION = "[unresolved] "
 
 GRAPH_TYPES = {
     "pseudocolor": "pseudocolor",
@@ -253,8 +258,9 @@ def parse_gate(gate_el: ET.Element, report: ImportReport, where: str) -> tuple[G
         for k, (d_el, d) in enumerate(zip(dim_els, dims)):
             if d is None:
                 ref = next((_get(c, "transformation-ref") for c in d_el.iter() if _local(c.tag) == "new-dimension"), None)
-                dims[k] = ref or "unnamed dimension"
-                report.warn(f"{where}: gate dimension {dims[k]!r} is a transformed (ratio / new) dimension FlowDesk cannot compute – the population stays empty")
+                label = ref or "unnamed dimension"
+                dims[k] = UNRESOLVED_DIMENSION + label
+                report.warn(f"{where}: gate dimension {label!r} is a transformed (ratio / new) dimension FlowDesk cannot compute – the population stays empty")
     gate: Gate | None = None
     boolean = None
     if kind == "RectangleGate":
@@ -596,18 +602,30 @@ def _derived_parameter_names(sample_el: ET.Element) -> list[str]:
 def missing_parameters(sample: Sample) -> dict[str, list[str]]:
     """Gate dimensions of `sample`'s populations that the sample cannot
     provide: {parameter: [population paths]}. Empty when the sample has no
-    channel information (file and keywords missing)."""
+    channel information (file and keywords missing). A compensated name of
+    an identity or disabled matrix is provided: it reads the raw channel.
+    Placeholder dimensions (`UNRESOLVED_DIMENSION`) are not listed, parsing
+    the gate already reported them."""
     if not sample.channels:
         return {}
+    channels = set(sample.channel_names)
     known = set(sample.parameter_names())
     known.update(c.stain for c in sample.channels if c.stain)
+    comp = sample.comp
+
+    def missing(d: str) -> bool:
+        if d in known or d.startswith(UNRESOLVED_DIMENSION):
+            return False
+        # identity / disabled matrix: "Comp-X" reads the raw channel X
+        return comp is None or comp.base_name(d) not in channels
+
     out: dict[str, list[str]] = {}
     for pop in sample.root.walk(include_self=False):
         gate = pop.gate
         if gate is None or isinstance(gate, BooleanGate):
             continue
         for d in gate.dims:
-            if d not in known:
+            if missing(d):
                 paths = out.setdefault(d, [])
                 if pop.path not in paths:
                     paths.append(pop.path)
@@ -620,8 +638,6 @@ def _warn_missing(report: ImportReport, missing: dict[str, dict], flowjo_derived
         paths = list(entry["paths"])
         if param in flowjo_derived:
             what = "a FlowJo derived parameter (not imported)"
-        elif entry.get("compensated"):
-            what = "a compensated parameter that is not available (identity or disabled matrix)"
         else:
             what = "not a parameter of the FCS file"
         shown = ", ".join(paths[:3]) + (", …" if len(paths) > 3 else "")
@@ -738,10 +754,7 @@ def import_wsp(path, search_dirs=None) -> tuple[Workspace, ImportReport]:
         for name in _derived_parameter_names(sel):
             flowjo_derived.setdefault(name, None)
         for param, paths in missing_parameters(sample).items():
-            entry = missing.setdefault(param, {"samples": [], "paths": {}, "compensated": False})
-            comp = sample.comp
-            if comp is not None and comp.base_name(param) in sample.channel_names:
-                entry["compensated"] = True
+            entry = missing.setdefault(param, {"samples": [], "paths": {}})
             entry["samples"].append(sample.name)
             for p in paths:
                 entry["paths"].setdefault(p, None)

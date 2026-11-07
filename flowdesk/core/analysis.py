@@ -24,10 +24,16 @@ projected only within the session that computed them.
 
 Optional dependencies: openTSNE (faster t-SNE that can also embed new events;
 falls back to sklearn.manifold.TSNE) and umap-learn (required for UMAP).
+
+Cancellation: the long computations accept `should_cancel`, a callable polled
+inside the fits (t-SNE iterations, UMAP epochs, SOM training iterations,
+k-means initialisations, kNN-graph chunks and Louvain moves); when it returns
+True they raise `Cancelled`.
 """
 from __future__ import annotations
 
 import importlib.util
+import threading
 import uuid
 import warnings
 import weakref
@@ -77,7 +83,7 @@ def has_sklearn() -> bool:
 
 
 # --------------------------------------------------------------------- matrix
-def prepare_matrix(samples: Sequence, population_paths, params: Sequence[str], max_events_per_sample: int | None = None, seed: int = 0) -> tuple[np.ndarray, list[IndexEntry]]:
+def prepare_matrix(samples: Sequence, population_paths, params: Sequence[str], max_events_per_sample: int | None = None, seed: int = 0, should_cancel=None) -> tuple[np.ndarray, list[IndexEntry]]:
     """Stack the display-space (0..1) values of `params` for a random subsample
     of each population.
 
@@ -99,6 +105,7 @@ def prepare_matrix(samples: Sequence, population_paths, params: Sequence[str], m
     blocks: list[np.ndarray] = []
     index: list[IndexEntry] = []
     for sample, path in zip(samples, population_paths):
+        _check_cancel(should_cancel)
         if not sample.ensure_loaded():
             raise ValueError(f"{sample.name}: {sample.load_error or 'file not found'}")
         if hasattr(path, "mask"):
@@ -162,25 +169,75 @@ def pca_explained_variance(X: np.ndarray, n_components: int = 2) -> np.ndarray:
     return var[:n_components] / total
 
 
-def run_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed: int = 0) -> np.ndarray:
+def run_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed: int = 0, should_cancel=None) -> np.ndarray:
     """2-D t-SNE embedding (openTSNE when installed, else scikit-learn)."""
-    return fit_tsne(X, perplexity, iterations, seed)[0]
+    return fit_tsne(X, perplexity, iterations, seed, should_cancel)[0]
 
 
-def fit_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed: int = 0) -> tuple[np.ndarray, object | None]:
+# scikit-learn's TSNE has no callback. Its optimiser calls the module-level
+# objective (_kl_divergence / _kl_divergence_bh) once per iteration, looked up
+# at call time, so those are wrapped (once, process-wide) to poll the
+# should_cancel of the calling thread; other threads and callers are
+# unaffected. Wrapping the objective keeps the optimisation exactly as
+# scikit-learn runs it (re-fitting in chunks of iterations would restart the
+# momentum / gains and recompute the affinities at every chunk).
+_SKLEARN_CANCEL = threading.local()
+_SKLEARN_HOOK_LOCK = threading.Lock()
+
+
+def _install_sklearn_tsne_hook() -> bool:
+    try:
+        from sklearn.manifold import _t_sne
+    except ImportError:  # pragma: no cover
+        return False
+    with _SKLEARN_HOOK_LOCK:
+        if getattr(_t_sne, "_flowdesk_cancel_hook", False):
+            return True
+        originals = {name: getattr(_t_sne, name, None) for name in ("_kl_divergence", "_kl_divergence_bh")}
+        if any(not callable(f) for f in originals.values()):
+            return False  # a scikit-learn without these internals: no mid-fit cancellation
+
+        def wrap(objective):
+            def polled(*args, **kwargs):
+                _check_cancel(getattr(_SKLEARN_CANCEL, "should_cancel", None))
+                return objective(*args, **kwargs)
+
+            polled.__wrapped__ = objective
+            return polled
+
+        for name, objective in originals.items():
+            setattr(_t_sne, name, wrap(objective))
+        _t_sne._flowdesk_cancel_hook = True
+        return True
+
+
+def _opentsne_cancel_callback(should_cancel):
+    # openTSNE stops the optimisation when a callback returns True and returns
+    # the embedding so far; fit_tsne then raises Cancelled
+    return lambda _iteration, _error, _embedding: bool(should_cancel())
+
+
+def fit_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed: int = 0, should_cancel=None) -> tuple[np.ndarray, object | None]:
     """(embedding, fitted model). The model is openTSNE's TSNEEmbedding, whose
     `transform` places new events in the existing map; None with the
-    scikit-learn engine, which cannot embed new events."""
+    scikit-learn engine, which cannot embed new events. `should_cancel` is
+    polled during the optimisation (every 10 iterations with openTSNE, every
+    iteration with scikit-learn)."""
     X = np.asarray(X, dtype=np.float64)
     n = X.shape[0]
     if n < 5:
         raise ValueError("t-SNE needs at least 5 events")
     perplexity = float(max(2.0, min(perplexity, (n - 1) / 3.0)))
     iterations = int(max(250, iterations))
+    _check_cancel(should_cancel)
     if has_opentsne():
         from openTSNE import TSNE
 
-        emb = TSNE(n_components=2, perplexity=perplexity, n_iter=iterations, random_state=seed, n_jobs=-1, verbose=False).fit(X)
+        extra = {}
+        if should_cancel is not None:
+            extra = {"callbacks": _opentsne_cancel_callback(should_cancel), "callbacks_every_iters": 10}
+        emb = TSNE(n_components=2, perplexity=perplexity, n_iter=iterations, random_state=seed, n_jobs=-1, verbose=False, **extra).fit(X)
+        _check_cancel(should_cancel)
         return np.asarray(emb, dtype=np.float64), emb
     try:
         from sklearn.manifold import TSNE
@@ -191,26 +248,67 @@ def fit_tsne(X: np.ndarray, perplexity: float = 30, iterations: int = 500, seed:
         model = TSNE(max_iter=iterations, **kwargs)
     except TypeError:  # scikit-learn < 1.5
         model = TSNE(n_iter=iterations, **kwargs)
-    return np.asarray(model.fit_transform(X), dtype=np.float64), None
+    hooked = should_cancel is not None and _install_sklearn_tsne_hook()
+    previous = getattr(_SKLEARN_CANCEL, "should_cancel", None)
+    if hooked:
+        _SKLEARN_CANCEL.should_cancel = should_cancel
+    try:
+        emb = model.fit_transform(X)
+    finally:
+        if hooked:
+            _SKLEARN_CANCEL.should_cancel = previous
+    _check_cancel(should_cancel)
+    return np.asarray(emb, dtype=np.float64), None
 
 
-def run_umap(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1, seed: int = 0) -> np.ndarray:
+def run_umap(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1, seed: int = 0, should_cancel=None) -> np.ndarray:
     """2-D UMAP embedding (requires umap-learn)."""
-    return fit_umap(X, n_neighbors, min_dist, seed)[0]
+    return fit_umap(X, n_neighbors, min_dist, seed, should_cancel)[0]
 
 
-def fit_umap(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1, seed: int = 0) -> tuple[np.ndarray, object]:
-    """(embedding, fitted umap.UMAP); the model's `transform` places new events."""
+class _CancelStream:
+    """A write-only stream for umap-learn's per-epoch progress bar
+    (`tqdm_kwds`, the only per-epoch hook its API offers): each refresh polls
+    `should_cancel` and raises Cancelled out of the epoch loop (once; the
+    bar's closing writes are swallowed)."""
+
+    def __init__(self, should_cancel):
+        self.should_cancel = should_cancel
+        self.raised = False
+
+    def write(self, _text):
+        if not self.raised and self.should_cancel():
+            self.raised = True
+            raise Cancelled()
+        return 0
+
+    def flush(self):
+        pass
+
+
+def fit_umap(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1, seed: int = 0, should_cancel=None) -> tuple[np.ndarray, object]:
+    """(embedding, fitted umap.UMAP); the model's `transform` places new events.
+    `should_cancel` is polled before and after the neighbour graph and during
+    the layout epochs."""
     if not has_umap():
         raise ImportError("UMAP requires the optional package umap-learn (pip install umap-learn, or pip install 'flowdesk[analysis]')")
     import umap
 
     X = np.asarray(X, dtype=np.float64)
     n_neighbors = int(max(2, min(n_neighbors, X.shape[0] - 1)))
-    model = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=float(min_dist), random_state=seed)
+    _check_cancel(should_cancel)
+    extra = {}
+    if should_cancel is not None:
+        extra["tqdm_kwds"] = {"disable": False, "file": _CancelStream(should_cancel), "mininterval": 0.05, "miniters": 1}
+    try:
+        model = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=float(min_dist), random_state=seed, **extra)
+    except TypeError:  # an umap-learn without tqdm_kwds
+        model = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=float(min_dist), random_state=seed)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*n_jobs.*", category=UserWarning)
-        return np.asarray(model.fit_transform(X), dtype=np.float64), model
+        emb = model.fit_transform(X)
+    _check_cancel(should_cancel)
+    return np.asarray(emb, dtype=np.float64), model
 
 
 # ---------------------------------------------------------------- clustering
@@ -225,10 +323,11 @@ def _sq_dist_argmin(X: np.ndarray, C: np.ndarray, chunk: int = 20000) -> np.ndar
     return out
 
 
-def _kmeans_numpy(X: np.ndarray, k: int, seed: int, n_init: int = 5, max_iter: int = 100) -> np.ndarray:
+def _kmeans_numpy(X: np.ndarray, k: int, seed: int, n_init: int = 5, max_iter: int = 100, should_cancel=None) -> np.ndarray:
     rng = np.random.default_rng(seed)
     best, best_inertia = None, np.inf
     for _ in range(n_init):
+        _check_cancel(should_cancel)
         # k-means++ seeding
         centres = [X[rng.integers(X.shape[0])]]
         d2 = ((X - centres[0]) ** 2).sum(axis=1)
@@ -253,16 +352,40 @@ def _kmeans_numpy(X: np.ndarray, k: int, seed: int, n_init: int = 5, max_iter: i
     return best
 
 
-def run_kmeans(X: np.ndarray, k: int, seed: int = 0) -> np.ndarray:
-    """k-means cluster ids 1..k (one per row of X)."""
+def _same_partition(a: np.ndarray, b: np.ndarray) -> bool:
+    """True when two label vectors describe the same partition (ids may differ)."""
+    pairs = np.unique(np.column_stack([a, b]), axis=0)
+    return len(pairs) == len(np.unique(a)) == len(np.unique(b))
+
+
+def _kmeans_sklearn(X: np.ndarray, k: int, seed: int, n_init: int = 10, should_cancel=None) -> np.ndarray:
+    """scikit-learn's KMeans(n_init=10, random_state=seed), one initialisation
+    at a time so `should_cancel` is polled between them. The initialisations
+    draw from one shared RandomState in the same order as a single
+    n_init=10 fit, and the best one is kept by the same rule (lower inertia,
+    unless it is the same partition), so the labels are identical."""
+    from sklearn.cluster import KMeans
+    from sklearn.utils import check_random_state
+
+    rs = check_random_state(seed)
+    best_labels, best_inertia = None, np.inf
+    for _ in range(n_init):
+        _check_cancel(should_cancel)
+        km = KMeans(n_clusters=k, n_init=1, random_state=rs).fit(X)
+        if best_labels is None or (km.inertia_ < best_inertia and not _same_partition(km.labels_, best_labels)):
+            best_labels, best_inertia = km.labels_, km.inertia_
+    return best_labels
+
+
+def run_kmeans(X: np.ndarray, k: int, seed: int = 0, should_cancel=None) -> np.ndarray:
+    """k-means cluster ids 1..k (one per row of X); `should_cancel` is polled
+    between the initialisations."""
     X = np.asarray(X, dtype=np.float64)
     k = int(max(1, min(k, X.shape[0])))
     if has_sklearn():
-        from sklearn.cluster import KMeans
-
-        labels = KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(X)
+        labels = _kmeans_sklearn(X, k, seed, should_cancel=should_cancel)
     else:
-        labels = _kmeans_numpy(X, k, seed)
+        labels = _kmeans_numpy(X, k, seed, should_cancel=should_cancel)
     return _renumber(np.asarray(labels))
 
 
@@ -274,7 +397,7 @@ def _renumber(labels: np.ndarray) -> np.ndarray:
     return rank[inverse.ravel()]
 
 
-def train_som(X: np.ndarray, grid: tuple[int, int] = (10, 10), iterations: int = 10, seed: int = 0, sigma_start: float | None = None, sigma_end: float = 0.5) -> np.ndarray:
+def train_som(X: np.ndarray, grid: tuple[int, int] = (10, 10), iterations: int = 10, seed: int = 0, sigma_start: float | None = None, sigma_end: float = 0.5, should_cancel=None) -> np.ndarray:
     """Batch self-organising map. Returns node codes (gx*gy x n_params).
 
     Each epoch assigns every event to its best-matching node and replaces each
@@ -296,6 +419,7 @@ def train_som(X: np.ndarray, grid: tuple[int, int] = (10, 10), iterations: int =
     s0 = max(s0, sigma_end)
     iterations = max(1, int(iterations))
     for t in range(iterations):
+        _check_cancel(should_cancel)
         frac = t / (iterations - 1) if iterations > 1 else 1.0
         sigma = s0 * (sigma_end / s0) ** frac
         bmu = _sq_dist_argmin(X, codes)
@@ -310,7 +434,7 @@ def train_som(X: np.ndarray, grid: tuple[int, int] = (10, 10), iterations: int =
     return codes
 
 
-def consensus_metaclusters(codes: np.ndarray, k: int, reps: int = 20, fraction: float = 0.9, seed: int = 0) -> np.ndarray:
+def consensus_metaclusters(codes: np.ndarray, k: int, reps: int = 20, fraction: float = 0.9, seed: int = 0, should_cancel=None) -> np.ndarray:
     """ConsensusClusterPlus-style metaclustering of SOM codes.
 
     Repeatedly clusters random subsets of nodes (average-linkage hierarchical
@@ -334,6 +458,7 @@ def consensus_metaclusters(codes: np.ndarray, k: int, reps: int = 20, fraction: 
     size = max(k + 1, int(round(fraction * n)))
     size = min(size, n)
     for _ in range(max(1, reps)):
+        _check_cancel(should_cancel)
         idx = np.sort(rng.choice(n, size=size, replace=False))
         labels = fcluster(linkage(codes[idx], method="average"), k, criterion="maxclust")
         same = (labels[:, None] == labels[None, :]).astype(np.float64)
@@ -347,16 +472,17 @@ def consensus_metaclusters(codes: np.ndarray, k: int, reps: int = 20, fraction: 
     return labels.astype(np.int64)
 
 
-def run_flowsom(X: np.ndarray, grid: tuple[int, int] = (10, 10), n_metaclusters: int = 10, iterations: int = 10, seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def run_flowsom(X: np.ndarray, grid: tuple[int, int] = (10, 10), n_metaclusters: int = 10, iterations: int = 10, seed: int = 0, should_cancel=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """FlowSOM: SOM + consensus hierarchical metaclustering.
 
     Returns (labels, som_codes, metacluster_of_node) where labels holds the
     metacluster id (1..k, largest first) of every row of X and
-    metacluster_of_node the id of each SOM node.
+    metacluster_of_node the id of each SOM node. `should_cancel` is polled
+    every training iteration and metaclustering repetition.
     """
     X = np.asarray(X, dtype=np.float64)
-    codes = train_som(X, grid, iterations, seed)
-    meta = consensus_metaclusters(codes, n_metaclusters, seed=seed)
+    codes = train_som(X, grid, iterations, seed, should_cancel=should_cancel)
+    meta = consensus_metaclusters(codes, n_metaclusters, seed=seed, should_cancel=should_cancel)
     bmu = _sq_dist_argmin(X, codes)
     event_meta = meta[bmu]
     # renumber metaclusters 1..m by decreasing event count; empty ones last
@@ -415,7 +541,7 @@ def apply_model(model: dict, X: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- phenograph
-def knn_jaccard_graph(X: np.ndarray, k: int = 30):
+def knn_jaccard_graph(X: np.ndarray, k: int = 30, should_cancel=None):
     """Phenograph graph: each event is linked to its k nearest neighbours
     (Euclidean, itself excluded) with weight |N(i) ∩ N(j)| / |N(i) ∪ N(j)|
     (Jaccard index of the two neighbour sets); the directed graph is
@@ -440,6 +566,7 @@ def knn_jaccard_graph(X: np.ndarray, k: int = 30):
     chunk = max(1, min(n, int(2e7 // n)))
     mark = np.zeros((chunk, n), dtype=bool)
     for start in range(0, n, chunk):
+        _check_cancel(should_cancel)
         stop = min(n, start + chunk)
         rows = np.arange(stop - start)[:, None]
         nb = idx[start:stop]
@@ -453,13 +580,17 @@ def knn_jaccard_graph(X: np.ndarray, k: int = 30):
     return W
 
 
-def _louvain_local_moving(W, resolution: float, rng) -> tuple[np.ndarray, int]:
+def _louvain_local_moving(W, resolution: float, rng, should_cancel=None) -> tuple[np.ndarray, int]:
     """One Louvain level: starting from singletons, move nodes to the
     neighbouring community with the largest modularity gain until no move
     improves modularity. Nodes are visited in random order from a queue; a
-    node is re-queued when a neighbour leaves for another community (the
-    "fast local moving" bookkeeping, equivalent to repeated full sweeps).
-    Returns (community per node, number of moves)."""
+    node that moves re-queues its neighbours outside its new community (the
+    "fast local moving" bookkeeping). That alone can miss nodes whose stay
+    gain dropped because their community grew, so whenever the queue runs
+    empty after moves, every node is queued again for a full sweep; the phase
+    ends after a full sweep without moves, i.e. at a node-level local optimum
+    (no single move to a neighbouring community raises modularity), or when
+    the visit budget runs out. Returns (community per node, number of moves)."""
     n = W.shape[0]
     indptr = W.indptr.tolist()
     indices = W.indices.tolist()
@@ -474,9 +605,18 @@ def _louvain_local_moving(W, resolution: float, rng) -> tuple[np.ndarray, int]:
     queue = deque(rng.permutation(n).tolist())
     queued = [True] * n
     moves = 0
+    sweep_start = 0  # moves made before the current full sweep was queued
     budget = 200 * n + 1000  # safety net; convergence needs far fewer visits
-    while queue and budget > 0:
+    while budget > 0:
+        if not queue:
+            if moves == sweep_start:
+                break  # a full sweep without moves: local optimum
+            sweep_start = moves
+            queue.extend(rng.permutation(n).tolist())
+            queued = [True] * n
         budget -= 1
+        if should_cancel is not None and budget % 4096 == 0:
+            _check_cancel(should_cancel)
         i = queue.popleft()
         queued[i] = False
         ki = degree[i]
@@ -510,7 +650,7 @@ def _louvain_local_moving(W, resolution: float, rng) -> tuple[np.ndarray, int]:
     return np.asarray(comm, dtype=np.int64), moves
 
 
-def louvain(W, resolution: float = 1.0, seed: int = 0) -> np.ndarray:
+def louvain(W, resolution: float = 1.0, seed: int = 0, should_cancel=None) -> np.ndarray:
     """Louvain community detection on a weighted undirected graph.
 
     `W` is a (scipy.sparse or dense) non-negative adjacency matrix; it is
@@ -519,7 +659,9 @@ def louvain(W, resolution: float = 1.0, seed: int = 0) -> np.ndarray:
     kept as a self-loop) until a level moves no node. The modularity
     Q = 1/2m Σ (A_ij − γ k_i k_j / 2m) δ(c_i, c_j) uses the resolution γ;
     lower values give fewer, larger communities. Deterministic for a given
-    seed (which only sets the node visiting order). Returns community ids
+    seed (which only sets the node visiting order). Every level ends at a
+    node-level local optimum (see `_louvain_local_moving`). `should_cancel`
+    is polled between levels and during the moves. Returns community ids
     1..m numbered by decreasing size.
     """
     import scipy.sparse as sp
@@ -533,7 +675,8 @@ def louvain(W, resolution: float = 1.0, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     labels = np.arange(n)
     for _level in range(100):
-        comm, moves = _louvain_local_moving(W, float(resolution), rng)
+        _check_cancel(should_cancel)
+        comm, moves = _louvain_local_moving(W, float(resolution), rng, should_cancel)
         uniq, comm = np.unique(comm, return_inverse=True)
         if moves == 0 or len(uniq) == W.shape[0]:
             break
@@ -560,16 +703,18 @@ def modularity(W, labels, resolution: float = 1.0) -> float:
     return inside / m2 - float(resolution) * float((tot**2).sum()) / (m2 * m2)
 
 
-def run_phenograph(X: np.ndarray, k: int = 30, seed: int = 0, resolution: float = 1.0) -> np.ndarray:
+def run_phenograph(X: np.ndarray, k: int = 30, seed: int = 0, resolution: float = 1.0, should_cancel=None) -> np.ndarray:
     """Phenograph clustering (Levine et al. 2015): Louvain communities of the
     Jaccard-weighted k-nearest-neighbour graph. Cluster ids 1..m, largest
     first. Modularity tends to split compact Gaussian-like populations into
     several communities at resolution 1; lower the resolution for coarser
-    clusters."""
+    clusters. `should_cancel` is polled while the graph is built, between the
+    Louvain levels and during the moves."""
     X = np.asarray(X, dtype=np.float64)
     if X.shape[0] < 3:
         return np.ones(X.shape[0], dtype=np.int64)
-    return louvain(knn_jaccard_graph(X, k), resolution, seed)
+    W = knn_jaccard_graph(X, k, should_cancel=should_cancel)
+    return louvain(W, resolution, seed, should_cancel=should_cancel)
 
 
 def cluster_medians(values: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

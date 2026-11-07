@@ -365,9 +365,50 @@ def test_apply_template_undo_restores_groups_gates_scales_layouts_tables(control
     assert ws.group_by_name("Panel") is not None and [l.name for l in ws.layouts] == ["Mine", "Figure 1"]
 
 
-def test_main_window_template_path_gets_a_full_snapshot(controller, tmp_path, app):
-    """main_window._apply_template_path calls begin_change("apply template")
-    without a kind; it must still undo layouts and tables."""
+def test_main_window_template_path_gets_a_full_snapshot(controller, tmp_path, app, monkeypatch):
+    """Opening a .fdwt in the main window (MainWindow._apply_template_path, the
+    File > Open / Finder / command-line path) is one undo step that restores
+    groups, gates, scales, layouts, tables and settings."""
+    from flowdesk.ui import main_window as mw
+    from flowdesk.ui.experiment import save_workspace_template
+
+    path = save_workspace_template(_template_source(tmp_path, app), tmp_path / "panel.fdwt")
+    c = controller
+    ws = c.workspace
+    own_layout = Layout("Mine")
+    ws.layouts.append(own_layout)
+    ws.tables.append(TableDef("Mine"))
+    groups_before = list(ws.groups)
+    scales_before = [s.scale("FITC-A").to_dict() for s in ws.samples]
+    asked = []
+    monkeypatch.setattr(mw, "confirm", lambda _parent, title, *_a, **_k: asked.append(title) or True)
+    win = mw.MainWindow(c)
+    try:
+        c._undo.clear()
+        win._apply_template_path(path)
+        assert asked == ["Apply template"]
+        assert ws.group_by_name("Panel") is not None and ws.samples[0].root.child_by_name("Big") is not None
+        assert [l.name for l in ws.layouts] == ["Mine", "Figure 1"] and [t.name for t in ws.tables] == ["Mine", "Freqs"]
+        assert ws.samples[0].scale("FITC-A").kind == "linear" and ws.settings["experiment"]["name"] == "From template"
+        assert len(c._undo) == 1  # one step
+        c.undo()
+        assert ws.groups == groups_before and ws.group_by_name("Panel") is None
+        assert all(s.root.child_by_name("Big") is None for s in ws.samples)
+        assert [s.scale("FITC-A").to_dict() for s in ws.samples] == scales_before
+        assert ws.layouts == [own_layout] and ws.layouts[0] is own_layout
+        assert [t.name for t in ws.tables] == ["Mine"]
+        assert "experiment" not in ws.settings
+        assert not c.can_undo and c.can_redo
+    finally:
+        c.mark_saved()
+        win.hide()
+        win.deleteLater()
+        app.processEvents()
+
+
+def test_legacy_apply_template_label_gets_a_full_snapshot(controller, tmp_path, app):
+    """begin_change("apply template") without a kind (callers written before
+    kinds existed) still snapshots layouts and tables (LEGACY_UNDO_KINDS)."""
     from flowdesk.core.templates import apply_template, build_template
 
     template = build_template(_template_source(tmp_path, app).workspace)
@@ -464,6 +505,112 @@ def test_undo_group_is_one_step_and_widens(controller):
     c.undo()
     assert s.root.child_by_name("Cells") is None and s.name == NAMES[0]
     assert ws.settings["experiment"] == {"name": "not covered"}  # settings were never part of the step
+
+
+def test_undo_rename_keeps_population_objects(controller):
+    """Finding 10: a rename undone / redone keeps the Population objects that
+    graph windows and the tree hold (matched by id, not by the changed name)."""
+    c = controller
+    ws = c.workspace
+    s = ws.samples[0]
+    cells = gate(c, s, "Cells")
+    small = gate(c, s, "Small", parent=cells, lo=0.0)
+    count = cells.count
+    c.rename_population(cells, "Lymph")
+    c.undo()
+    assert s.root.children == [cells] and cells.name == "Cells" and cells.parent is s.root
+    assert cells.children == [small] and small.parent is cells and cells.count == count
+    c.redo()
+    assert s.root.children == [cells] and cells.name == "Lymph" and cells.count == count
+    # group gates: the template node and every member's node survive too
+    g = ws.groups[0]
+    c.add_population(s.root, Population("G1", RectangleGate(["FSC-A"], [40000.0], [None])), group=g)
+    template = g.root.child_by_name("G1")
+    members = {x.id: x.root.child_by_name("G1") for x in ws.samples}
+    assert template is not None and all(m is not None for m in members.values())
+    c.rename_population(s.root.child_by_name("G1"), "G2", group=g)
+    c.undo()
+    assert g.root.child_by_name("G1") is template and g.root.child_by_name("G2") is None
+    assert all(x.root.child_by_name("G1") is members[x.id] for x in ws.samples)
+
+
+def test_section_recorder_inside_undo_group_restores_its_baseline(controller, app):
+    """Finding 27: an editor that changed its section in place and records the
+    change inside an undo group must not widen the step from the edited state."""
+    from flowdesk.ui.layout_editor import SectionUndoRecorder
+
+    c = controller
+    ws = c.workspace
+    s = ws.samples[0]
+    item = LayoutItem(x=150.0)
+    ws.layouts.append(Layout("L", [item]))
+    tab = TableDef("T", [TableColumn("/Cells")])
+    ws.tables.append(tab)
+    layouts = SectionUndoRecorder(c, "layouts", "edit layout")
+    tables = SectionUndoRecorder(c, "tables", "edit table")
+    n = len(c._undo)
+    with c.undo_group("outer"):  # gating only
+        gate(c, s)
+        item.x = 999.0  # in place, like a drag
+        assert layouts.record() is False  # no step of its own
+        item.x = 500.0
+        layouts.record()  # a second edit keeps the first baseline
+        tab.columns.append(TableColumn("/Other"))
+        tables.record()
+    assert len(c._undo) == n + 1 and c.undo_label() == "outer"
+    c.undo()
+    assert ws.layouts[0].items[0] is item and item.x == 150.0
+    assert [col.pop_path for col in tab.columns] == ["/Cells"]
+    assert s.root.child_by_name("Cells") is None
+    c.redo()
+    assert item.x == 500.0 and [col.pop_path for col in tab.columns] == ["/Cells", "/Other"]
+    # a group that covered the section from the start keeps its own snapshot
+    layouts.reset()
+    with c.undo_group("layout batch", "layouts"):
+        item.x = 1.0
+        ws.layouts[0].name = "changed before the recorder saw it"
+        layouts.reset()
+        item.x = 2.0
+        layouts.record()
+    c.undo()
+    assert item.x == 500.0 and ws.layouts[0].name == "L"
+
+
+def test_undo_of_non_tree_changes_keeps_selection(controller):
+    """Finding 30: undoing a layout / table / settings / scale change leaves the
+    workspace-tree selection and current group alone; a gating undo resets."""
+    c = controller
+    ws = c.workspace
+    s, t = ws.samples[0], ws.samples[1]
+    cells = gate(c, s)
+    group = c.create_group("Panel", [s])
+    c.set_current_group(group)
+    rows = [(s, cells), (t, t.root)]
+    c.set_selection(rows, [group])
+    seen = []
+    c.selectionChanged.connect(lambda: seen.append("selection"))
+    c.currentGroupChanged.connect(lambda g: seen.append("group"))
+    ws.layouts.append(Layout("L", [LayoutItem(x=1.0)]))
+    ws.tables.append(TableDef("T"))
+    for kind, edit in (
+        ("layouts", lambda: setattr(ws.layouts[0].items[0], "x", 5.0)),
+        ("tables", lambda: ws.tables[0].columns.append(TableColumn("/Cells"))),
+        ("settings", lambda: ws.settings.__setitem__("experiment", {"name": "x"})),
+    ):
+        c.begin_change("edit", kind)
+        edit()
+        c.undo()
+        c.redo()
+    c.set_scale([s], "PE-A", LinearScale(0, 10))
+    c.undo()
+    assert c.selected == rows and c.selected_groups == [group] and c.current_group is group
+    assert seen == []
+    # a gating change can invalidate the rows: those are reset as before
+    c.begin_change("edit gate")
+    cells.gate.lo[0] = 1.0
+    c.undo()
+    assert c.selected == [] and c.current_group is group
+    assert seen == ["group", "selection"]
 
 
 # ------------------------------------------------------------------ cost
