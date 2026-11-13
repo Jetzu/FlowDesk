@@ -187,6 +187,7 @@ Moore) and contains no FlowJo code. FlowJo is a trademark of its owner; FlowDesk
 | [docs/INSTALL.md](docs/INSTALL.md) | installing on macOS, Windows and Linux, file associations, building the apps |
 | [docs/PARITY.md](docs/PARITY.md) | every FlowJo feature area compared with FlowDesk |
 | [docs/make_gallery.py](docs/make_gallery.py) | regenerates the screenshots in this README |
+| [docs/make_testset.py](docs/make_testset.py) | writes a small synthetic test set (workspace, samples, compensation controls, cell-cycle, proliferation and bead files) to try FlowDesk out |
 | [packaging/](packaging) | PyInstaller spec, icons, DMG and zip builders, Linux desktop entry |
 
 ## Development
