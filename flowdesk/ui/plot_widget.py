@@ -271,8 +271,10 @@ class PlotWidget(QWidget):
         else:
             painter.setBrush(QBrush(QColor("#ffffff")))
         painter.setPen(pen)
+        plot = res.plot_rect.adjusted(-HANDLE, -HANDLE, HANDLE, HANDLE)
         for h in self._handles(shape):
-            painter.drawRect(QRectF(h.x() - HANDLE, h.y() - HANDLE, 2 * HANDLE, 2 * HANDLE))
+            if plot.contains(h):  # a handle beyond the axis is not drawn (zoom out to reach it)
+                painter.drawRect(QRectF(h.x() - HANDLE, h.y() - HANDLE, 2 * HANDLE, 2 * HANDLE))
 
     def _draw_creation(self, painter: QPainter):
         pen = QPen(QColor("#d81b1b"), 1.2)

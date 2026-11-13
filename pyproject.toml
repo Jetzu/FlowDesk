@@ -13,12 +13,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "mcp>=1.10"]
+agent = ["mcp>=1.10"]
 analysis = ["scikit-learn>=1.3", "openTSNE>=1.0", "umap-learn>=0.5"]
 packaging = ["pyinstaller>=6.10"]
 
 [project.scripts]
 flowdesk = "flowdesk.app:main"
+flowdesk-mcp = "flowdesk.agent.server:main"
+flowdesk-mcp-install = "flowdesk.agent.install:main"
 
 [project.gui-scripts]
 # Windows: starts without a console window (flowdesk-gui.exe in the venv's Scripts folder).
@@ -30,6 +33,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["flowdesk*"]
+
+[tool.setuptools.package-data]
+"flowdesk.agent" = ["skills/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

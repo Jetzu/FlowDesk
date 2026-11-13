@@ -176,16 +176,43 @@ workspace from rms 0.51 % to rms 0.30 %.
 * **Nothing is silently dropped.** Gates on parameters FlowJo cannot hold (t-SNE axes, cluster ids) are left out of an
   export with a note, and gates on parameters missing from the FCS file import as empty populations with a warning.
 
-FlowDesk is built from public standards (FCS 2.0 / 3.0 / 3.1, ISAC Gating-ML 2.0, the logicle scale of Parks, Roederer and
-Moore) and contains no FlowJo code. FlowJo is a trademark of its owner; FlowDesk is not affiliated with it.
+## Claude Code, Codex and Claude Desktop
+
+FlowDesk has an MCP server and an in-app bridge, so an AI assistant can work on the window you are looking at: read the
+workspace, look at histograms and plots (a PNG plus numbers), gate, compensate, cluster, measure and export. Every change
+is an undo step, and what you do in the window is reported back.
+
+```bash
+pip install -e ".[agent]" && flowdesk-mcp-install      # detects Claude Code, Codex and Claude Desktop and registers FlowDesk
+```
+
+The packaged app serves itself (`FlowDesk --mcp`), so the DMG needs no Python. **Tools ▸ Agent ▸ Agent Chat** docks a chat
+panel that runs your Claude Code or Codex CLI against the open window. Tool reference, safety notes and headless mode:
+[docs/mcp.md](docs/mcp.md).
+
+## Independence and trademarks
+
+FlowDesk is an independent, original program, written from scratch in Python and Qt. It is built from public standards
+and publications (FCS 2.0 / 3.0 / 3.1, ISAC Gating-ML 2.0, the logicle scale of Parks, Roederer and Moore, and the
+published algorithms of the analysis tools) and contains no code, assets or binaries of any other flow cytometry
+product; no other product was disassembled or decompiled. The comparison above describes behaviour that can be observed
+from the outside, and reading and writing FlowJo `.wsp` workspaces and `.mtx` matrices is file-format interoperability so
+that you can use your own data.
+
+FlowJo is a trademark of Becton, Dickinson and Company (BD). FlowDesk is **not affiliated with, endorsed by or sponsored
+by** BD, the makers of FlowJo, or any other maker of flow cytometry software or instruments. All product and company
+names are trademarks of their respective owners and are used only to describe compatibility. FlowDesk is provided as is,
+without warranty (see [LEGAL.md](LEGAL.md)); results must be verified by the person who uses them.
 
 ## Documentation
 
 | | |
 |---|---|
 | [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md) | a FlowJo-style session with a screenshot per step, and a ten-minute acceptance check |
+| [docs/mcp.md](docs/mcp.md) | the MCP server for Claude Code, Codex and Claude Desktop, Agent Chat, tools reference |
 | [docs/INSTALL.md](docs/INSTALL.md) | installing on macOS, Windows and Linux, file associations, building the apps |
 | [docs/PARITY.md](docs/PARITY.md) | every FlowJo feature area compared with FlowDesk |
+| [LEGAL.md](LEGAL.md) | independence, trademarks, warranty |
 | [docs/make_gallery.py](docs/make_gallery.py) | regenerates the screenshots in this README |
 | [docs/make_testset.py](docs/make_testset.py) | writes a small synthetic test set (workspace, samples, compensation controls, cell-cycle, proliferation and bead files) to try FlowDesk out |
 | [packaging/](packaging) | PyInstaller spec, icons, DMG and zip builders, Linux desktop entry |

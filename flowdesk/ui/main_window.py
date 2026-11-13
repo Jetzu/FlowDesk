@@ -1105,6 +1105,8 @@ class MainWindow(QMainWindow):
         "flowdesk.ui.loader",
         # sample-list commands: find, header sort, move, rename, group by keyword
         "flowdesk.ui.workspace_tools",
+        # Claude Code / Codex bridge and the Agent Chat dock
+        "flowdesk.ui.agent",
     )
     # more files than this are added through the loader (headers read in the
     # background with progress and cancel)

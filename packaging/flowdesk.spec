@@ -73,6 +73,13 @@ hiddenimports = (
      "PySide6.QtSvg", "PySide6.QtPrintSupport"]
     + collect_submodules("flowdesk")
 )
+try:  # the MCP server (flowdesk --mcp) lets the packaged app serve Claude Code / Codex on its own
+    import mcp  # noqa: F401
+
+    hiddenimports += collect_submodules("mcp")
+    HAS_MCP = True
+except ImportError:
+    HAS_MCP = False
 if "openTSNE" in BUNDLED_LIBS:
     # its Cython modules import openTSNE._matrix_mul (and the bundled annoy) at C level,
     # which the module graph does not see
@@ -89,7 +96,7 @@ a = Analysis(  # noqa: F821
     [str(PKG / "flowdesk_main.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[(str(PKG / "icon.png"), "packaging")],
+    datas=[(str(PKG / "icon.png"), "packaging"), (str(ROOT / "flowdesk" / "agent" / "skills"), "flowdesk/agent/skills")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

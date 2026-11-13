@@ -753,13 +753,18 @@ def draw_gates(painter: QPainter, result: RenderResult, population: Population, 
         if shape.kind == "quadrant":
             quadrant_groups.setdefault(gate.quadrant[0], []).append((child, shape))
             continue
+        # A gate may reach beyond the axis (open-ended ranges, vertices outside the plotted range). It keeps that extent in
+        # data space; only its drawing stops at the axes.
+        painter.save()
+        painter.setClipRect(rect)
         tint = float(getattr(gate, "tint", 0.0) or 0.0)
         if tint > 0:
             _fill_shape(painter, shape, QColor(gate.color or options.gate_color), tint)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
         _draw_shape(painter, shape)
-        if getattr(gate, "locked", False):
+        painter.restore()
+        if getattr(gate, "locked", False) and rect.contains(QPointF(shape.bbox.right(), shape.bbox.top())):
             _draw_padlock(painter, QPointF(shape.bbox.right(), shape.bbox.top()), color)
             painter.setPen(pen)
         label = _gate_label(child, options) if options.show_gate_labels else ""
@@ -917,7 +922,9 @@ def _place_label(painter: QPainter, fm: QFontMetricsF, shape: GateShape, label: 
         p = result.to_pixel(gate.label_pos[0], gate.label_pos[1])
         rect = QRectF(p.x() - w / 2, p.y() - h / 2, w, h)
     else:
-        b = shape.bbox
+        b = shape.bbox.intersected(plot)  # the visible part of a gate that reaches beyond the axes
+        if b.isEmpty():
+            b = shape.bbox
         if shape.kind == "range":
             if not shape.transposed:
                 rect = QRectF(b.center().x() - w / 2, b.top() + 16, w, h)

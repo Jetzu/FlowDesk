@@ -5,6 +5,8 @@ can be exercised without shipping binary fixtures.
 """
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +20,10 @@ REAL_TCELL_PANEL = Path(
 )
 
 DELIM = "/"
+
+# the test suite never opens the agent bridge or touches the user's ~/.flowdesk
+os.environ.setdefault("FLOWDESK_BRIDGE", "0")
+os.environ.setdefault("FLOWDESK_HOME", tempfile.mkdtemp(prefix="flowdesk-test-home-"))
 
 
 def _escape(value: str) -> str:

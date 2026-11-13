@@ -809,9 +809,12 @@ def show_about(parent=None):
         f"About {APP_NAME}",
         f"<h3>{APP_NAME} {__version__}</h3>"
         "<p>A desktop workspace for flow cytometry analysis: gating, compensation, layouts and tables.</p>"
-        "<p>Reads FCS 2.0/3.0/3.1 files and FlowJo™ workspace files. "
-        "Implemented from the public FCS, Gating-ML and logicle specifications.</p>"
-        "<p>FlowJo is a trademark of its owner; this program is not affiliated with it.</p>",
+        "<p>Reads FCS 2.0/3.0/3.1 files and FlowJo&trade; .wsp workspace files. "
+        "Implemented independently from the public FCS, Gating-ML and logicle specifications; it contains no code from, and was not "
+        "derived from, any other product.</p>"
+        "<p>FlowDesk is not affiliated with, endorsed by or sponsored by Becton, Dickinson and Company (BD) or the makers of any "
+        "other flow cytometry software. FlowJo and other product names are trademarks of their respective owners and are named "
+        "only to describe file compatibility. Provided as is, without warranty; see LEGAL.md.</p>",
     )
 
 

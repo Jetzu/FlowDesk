@@ -17,7 +17,7 @@ from . import APP_NAME, __version__
 
 APP_USER_MODEL_ID = "FlowDesk.FlowDesk"
 
-USAGE = f"""usage: flowdesk [-h] [--version] [FILE_OR_FOLDER ...]
+USAGE = f"""usage: flowdesk [-h] [--version] [--agent-headless] [--mcp] [FILE_OR_FOLDER ...]
 
 {APP_NAME} {__version__} - flow cytometry analysis workspace.
 
@@ -27,6 +27,8 @@ positional arguments:
 options:
   -h, --help      show this help message and exit
   --version       print the version and exit
+  --agent-headless  run without a window, serving only the agent bridge (Claude Code / Codex)
+  --mcp           run the FlowDesk MCP server on stdin/stdout (what flowdesk-mcp does; used by the packaged app)
 """
 
 
@@ -85,6 +87,16 @@ def main(argv: list[str] | None = None) -> int:
     if "--version" in args:
         print(f"{APP_NAME} {__version__}")
         return 0
+    if "--mcp" in args:
+        from .agent.server import main as mcp_main
+
+        mcp_main()
+        return 0
+    if "--agent-headless" in args:
+        from .agent.headless import run_headless
+
+        paths = [Path(a).expanduser().absolute() for a in args if not a.startswith("-")]
+        return run_headless(paths)
     # Resolve file arguments against the launch directory (relative paths, any cwd / drive).
     paths = [Path(a).expanduser().absolute() for a in args if not a.startswith("-")]
     app = create_app(argv)

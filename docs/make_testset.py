@@ -204,32 +204,36 @@ extras/Rainbow beads.fcs        Tools > Calibrate (MESF): six peaks; enter 900, 
 """
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", default="FlowDesk testset", help="folder to write (created if needed)")
-    ap.add_argument("--seed", type=int, default=2026)
-    args = ap.parse_args()
-    out = Path(args.out).expanduser()
+def write_testset(out: Path, seed: int = 2026, n: int = 25000) -> Workspace:
+    """Write the whole test set into `out` and return its workspace (n events per sample)."""
     (out / "samples").mkdir(parents=True, exist_ok=True)
     (out / "compensation controls").mkdir(exist_ok=True)
     (out / "extras").mkdir(exist_ok=True)
-    rng = np.random.default_rng(args.seed)
-
+    rng = np.random.default_rng(seed)
     paths = []
     wells = iter(["A1", "A2", "A3", "B1", "B2", "B3"])
     for condition, col in (("Control", 2), ("Stimulated", 3)):
         for donor, params in DONORS.items():
-            events = make_sample(rng, 25000, params[0], params[1], params[col], dip=(donor == "Donor3" and condition == "Stimulated"))
+            events = make_sample(rng, n, params[0], params[1], params[col], dip=(donor == "Donor3" and condition == "Stimulated"))
             path = out / "samples" / f"{donor}_{condition}.fcs"
             _write(path, events, {"Donor": donor, "Condition": condition, "WELL ID": next(wells), "$SPILLOVER": _spillover_keyword()})
             paths.append(path)
-    # wells in the order the files were written: control row A, stimulated row B
     for name, events in make_controls(rng).items():
         label = "Unstained" if name == "Unstained" else f"{STAINS[name]} {name.replace('-A', '')}"
         _write(out / "compensation controls" / f"{label}.fcs", events, {})
     write_extras(rng, out / "extras")
     ws = build_workspace(out, sorted(paths, key=lambda p: ("Stimulated" in p.name, p.name)))
     (out / "READ ME.txt").write_text(README, encoding="utf-8")
+    return ws
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default="FlowDesk testset", help="folder to write (created if needed)")
+    ap.add_argument("--seed", type=int, default=2026)
+    args = ap.parse_args()
+    out = Path(args.out).expanduser()
+    ws = write_testset(out, args.seed)
     for s in ws.samples:
         print(f"{s.name:26s} {s.n_events:6d} events  Lymphocytes {s.root.find('/Lymphocytes').count:6d}"
               f"  CD3+ {s.root.find('/Lymphocytes/Single cells/CD3+').count:6d}")
