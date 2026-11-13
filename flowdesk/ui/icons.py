@@ -574,10 +574,82 @@ def _draw(name: str, p: QPainter, s: float):
         p.drawLine(QPointF(cx + r.width() * 0.22, r.top() + r.height() * 0.3), QPointF(cx + r.width() * 0.22, cy))
         p.setBrush(YELLOW)
         p.drawRoundedRect(QRectF(r.left() + r.width() * 0.15, cy - 1, r.width() * 0.7, r.height() * 0.5), 2, 2)
+    elif name in ("agent", "agent-connect"):
+        _draw_agent_bubble(p, r, s, small=(name == "agent-connect"))
+        if name == "agent-connect":
+            br = s * 0.2
+            c = QPointF(r.right() - br * 0.55, r.bottom() - br * 0.55)
+            p.setPen(_pen(PAPER, max(1.0, s * 0.05)))
+            p.setBrush(GREEN)
+            p.drawEllipse(c, br, br)
+            p.setPen(_pen(PAPER, max(1.2, s * 0.07)))
+            p.drawLine(QPointF(c.x() - br * 0.5, c.y()), QPointF(c.x() + br * 0.5, c.y()))
+            p.drawLine(QPointF(c.x(), c.y() - br * 0.5), QPointF(c.x(), c.y() + br * 0.5))
+    elif name == "agent-bridge":
+        # a plug: cable from the lower left, body, two prongs pointing up-right
+        lw = max(1.2, s * 0.06)
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(45)
+        h = r.height() * 1.3
+        p.setPen(_pen(INK, lw))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        cable = QPainterPath(QPointF(0, h * 0.18))
+        cable.cubicTo(QPointF(0, h * 0.36), QPointF(-h * 0.14, h * 0.34), QPointF(-h * 0.12, h * 0.5))
+        p.drawPath(cable)
+        body = QRectF(-h * 0.2, -h * 0.12, h * 0.4, h * 0.32)
+        grad = QLinearGradient(body.topLeft(), body.bottomRight())
+        grad.setColorAt(0, QColor("#4f8df0"))
+        grad.setColorAt(1, QColor("#7c4dd6"))
+        p.setBrush(QBrush(grad))
+        p.drawRoundedRect(body, h * 0.06, h * 0.06)
+        p.setPen(_pen(INK, max(1.4, s * 0.075)))
+        for dx in (-h * 0.09, h * 0.09):
+            p.drawLine(QPointF(dx, -h * 0.13), QPointF(dx, -h * 0.34))
+        p.restore()
     else:
         p.setPen(_pen(GREY, 1.4))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(r)
+
+
+def _sparkle(p: QPainter, c: QPointF, radius: float, color: QColor):
+    """A four-pointed star with concave sides."""
+    path = QPainterPath(QPointF(c.x(), c.y() - radius))
+    k = radius * 0.18
+    pts = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+    for i in range(4):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % 4]
+        path.quadTo(QPointF(c.x() + (x0 + x1) * k, c.y() + (y0 + y1) * k), QPointF(c.x() + x1 * radius, c.y() + y1 * radius))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    p.drawPath(path)
+
+
+def _draw_agent_bubble(p: QPainter, r: QRectF, s: float, small: bool = False):
+    """Speech bubble in the app's blue-to-violet with a white sparkle: the AI assistant."""
+    w = r.width() * (0.86 if small else 1.0)
+    h = r.height() * (0.72 if small else 0.78)
+    box = QRectF(r.left(), r.top() + (0 if small else r.height() * 0.02), w, h)
+    path = QPainterPath()
+    rad = min(w, h) * 0.3
+    path.addRoundedRect(box, rad, rad)
+    tail = QPainterPath(QPointF(box.left() + w * 0.2, box.bottom() - 1))
+    tail.lineTo(QPointF(box.left() + w * 0.14, box.bottom() + r.height() * (0.2 if not small else 0.16)))
+    tail.lineTo(QPointF(box.left() + w * 0.44, box.bottom() - 1))
+    tail.closeSubpath()
+    path = path.united(tail)
+    grad = QLinearGradient(box.topLeft(), box.bottomRight())
+    grad.setColorAt(0, QColor("#3b82f6"))
+    grad.setColorAt(1, QColor("#7c4dd6"))
+    p.setPen(QPen(QColor("#2b4fa8"), max(0.8, s * 0.03)))
+    p.setBrush(QBrush(grad))
+    p.drawPath(path)
+    c = box.center()
+    big = min(w, h) * 0.3
+    _sparkle(p, QPointF(c.x() - big * 0.25, c.y() + big * 0.1), big, PAPER)
+    _sparkle(p, QPointF(c.x() + big * 0.95, c.y() - big * 0.62), big * 0.42, QColor("#ffe7a3"))
 
 
 # ------------------------------------------------------------------- app icon

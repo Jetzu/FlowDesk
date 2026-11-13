@@ -98,9 +98,9 @@ class AgentExtension:
         return a
 
     def _build_actions(self):
-        self._act("chat", "Agent Chat", "overlay", "Chat with Claude Code or Codex about this workspace: they gate, measure and plot in this window (every change is one undo step)", self.toggle_chat, shortcut="Ctrl+Shift+A")
-        self._act("bridge", "Agent Bridge", "table", "Let Claude Code, Codex and Claude Desktop connect to this FlowDesk (flowdesk-mcp)", self.toggle_bridge, checkable=True)
-        self._act("setup", "Connect Claude / Codex…", "ancestry", "Register the FlowDesk MCP server with Claude Code, Codex and Claude Desktop", self.setup_dialog)
+        self._act("chat", "Agent Chat", "agent", "Chat with Claude Code or Codex about this workspace: they gate, measure and plot in this window (every change is one undo step)", self.toggle_chat, shortcut="Ctrl+Shift+A")
+        self._act("bridge", "Agent Bridge", "agent-bridge", "Let Claude Code, Codex and Claude Desktop connect to this FlowDesk (flowdesk-mcp)", self.toggle_bridge, checkable=True)
+        self._act("setup", "Connect Claude / Codex…", "agent-connect", "Register the FlowDesk MCP server with Claude Code, Codex and Claude Desktop", self.setup_dialog)
         a = self.actions["bridge"]
         a.blockSignals(True)
         a.setChecked(self.host.running)

@@ -16,16 +16,34 @@ import os
 import re
 import time
 
-ORANGE = "#D97757"      # Claude's accent
-BG = "#1F1F1F"
-BG_INPUT = "#262626"
-FG = "#E6E6E6"
-DIM = "#8B8B8B"
-GREEN = "#5FB369"
-RED = "#E5484D"
-BLUE = "#7AA2F7"
-BORDER = "#3A3A3A"
-CODE_BG = "#161616"
+# Colour themes. Every colour in a theme is unique, so a rendered transcript can be re-coloured by swapping hex codes.
+THEMES = {
+    "dark": {"ORANGE": "#D97757", "BG": "#1F1F1F", "BG_INPUT": "#262626", "FG": "#E6E6E6", "DIM": "#8B8B8B", "GREEN": "#5FB369",
+             "RED": "#E5484D", "BLUE": "#7AA2F7", "BORDER": "#3A3A3A", "CODE_BG": "#161616"},
+    "light": {"ORANGE": "#B9532F", "BG": "#FFFFFF", "BG_INPUT": "#F6F7F9", "FG": "#1F2328", "DIM": "#6B7280", "GREEN": "#1A7F37",
+              "RED": "#CF222E", "BLUE": "#2F6FD6", "BORDER": "#D0D4DA", "CODE_BG": "#F3F4F6"},
+}
+THEME_MODES = ("auto", "light", "dark")
+P = dict(THEMES["dark"])  # the palette in use
+
+
+def resolve_theme(mode, QtWidgets=None, QtGui=None):
+    """"light" / "dark" for a mode; "auto" follows the host application's window colour."""
+    if mode in THEMES:
+        return mode
+    try:
+        app = QtWidgets.QApplication.instance()
+        role = getattr(QtGui.QPalette, "Window", None) or QtGui.QPalette.ColorRole.Window
+        return "light" if app.palette().color(role).lightness() >= 128 else "dark"
+    except Exception:
+        return "dark"
+
+
+def recolor(html_text, old, new):
+    """Swap the colours of palette `old` for those of palette `new` in rendered HTML."""
+    pairs = {old[k].lower(): new[k] for k in old}
+    return re.sub("|".join(re.escape(c) for c in sorted(pairs, key=len, reverse=True)),
+                  lambda m: pairs[m.group(0).lower()], html_text, flags=re.I)
 SPINNER = "·✢✳✶✻✽✻✶✳✢"
 VERBS = ["Thinking", "Pondering", "Gating", "Inspecting", "Counting", "Reasoning", "Composing"]
 SLASH = [
@@ -35,11 +53,13 @@ SLASH = [
     ("/codex", "switch to Codex"),
     ("/skills", "ask the agent to list its skills"),
     ("/stop", "interrupt the current run"),
+    ("/theme", "light, dark or auto (follow FlowDesk)"),
     ("/help", "shortcuts and commands"),
 ]
 HELP = ("/model   provider · model · effort (or the button bottom right)\n"
         "/claude  /codex   switch provider        /clear   new conversation\n"
         "/skills  list the agent's skill files     /stop    interrupt\n"
+        "/theme   light · dark · auto\n"
         "Enter sends · Shift+Enter newline · Esc interrupts · ↑/↓ history · Tab accepts a / suggestion")
 
 
@@ -57,7 +77,7 @@ def _esc(s):
 
 def _md_inline(s):
     s = _esc(s)
-    s = re.sub(r"`([^`\n]+)`", r'<code style="background:%s;padding:0 3px;border-radius:3px">\1</code>' % CODE_BG, s)
+    s = re.sub(r"`([^`\n]+)`", r'<code style="background:%s;padding:0 3px;border-radius:3px">\1</code>' % P["CODE_BG"], s)
     s = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", s)
     s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<i>\1</i>", s)
     return s
@@ -69,10 +89,10 @@ def _code_window(code, lang="", title=""):
     rows = []
     for i, line in enumerate(lines, 1):
         rows.append('<tr><td style="color:%s;padding:0 10px 0 6px;text-align:right">%d</td>'
-                    '<td style="white-space:pre;padding:0 8px 0 0">%s</td></tr>' % (DIM, i, _esc(line)))
-    head = ('<div style="color:%s;margin:0 0 2px 14px">%s%s</div>' % (DIM, _esc(title), (" · " + lang) if lang else "")) if title else ""
+                    '<td style="white-space:pre;padding:0 8px 0 0">%s</td></tr>' % (P["DIM"], i, _esc(line)))
+    head = ('<div style="color:%s;margin:0 0 2px 14px">%s%s</div>' % (P["DIM"], _esc(title), (" · " + lang) if lang else "")) if title else ""
     return (head + '<table cellpadding="1" cellspacing="0" style="background:%s;border:1px solid %s;margin:2px 0 4px 14px;'
-            'font-family:inherit">%s</table>' % (CODE_BG, BORDER, "".join(rows)))
+            'font-family:inherit">%s</table>' % (P["CODE_BG"], P["BORDER"], "".join(rows)))
 
 
 def _md_block(text):
@@ -120,17 +140,17 @@ def _tool_call_html(text):
         obj = json.loads(args) if args else {}
     except Exception:
         obj = None
-    head = '<div><span style="color:%s">⏺</span> <b>%s</b>' % (GREEN, _esc(name))
+    head = '<div><span style="color:%s">⏺</span> <b>%s</b>' % (P["GREEN"], _esc(name))
     tool = name.rsplit("/", 1)[-1]
     if isinstance(obj, dict) and tool == "python" and obj.get("code") is not None:
         return head + "</div>" + _code_window(obj["code"], "python", "script")
     if isinstance(obj, dict) and tool == "save_skill" and obj.get("content") is not None:
-        return head + '<span style="color:%s">(%s)</span></div>' % (DIM, _esc(obj.get("name", ""))) + _code_window(obj["content"], "markdown", "skill")
-    return head + '<span style="color:%s">(%s)</span></div>' % (DIM, _esc(args[:400]))
+        return head + '<span style="color:%s">(%s)</span></div>' % (P["DIM"], _esc(obj.get("name", ""))) + _code_window(obj["content"], "markdown", "skill")
+    return head + '<span style="color:%s">(%s)</span></div>' % (P["DIM"], _esc(args[:400]))
 
 
 def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions, cwd=None,
-                     find_backend=None, title="Agent Chat", agentcli=None):
+                     find_backend=None, title="Agent Chat", agentcli=None, theme="auto"):
     """Return a QWidget with .submit(text), .on_event(kind, payload), .set_backend(key), .run, .relay."""
     Signal = getattr(QtCore, "Signal", None) or getattr(QtCore, "pyqtSignal")
     Qt = QtCore.Qt
@@ -195,6 +215,13 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             self.render_timer = QtCore.QTimer(self)
             self.render_timer.setSingleShot(True)
             self.render_timer.timeout.connect(self._render)
+            self.theme_mode = ((agentcli.load_settings().get("theme") if agentcli else None) or theme)
+            if self.theme_mode not in THEME_MODES:
+                self.theme_mode = "auto"
+            P.update(THEMES[resolve_theme(self.theme_mode, QtWidgets, QtGui)])
+            if hasattr(QtCore.Qt, "WA_StyledBackground") or hasattr(QtCore.Qt, "WidgetAttribute"):
+                attr = getattr(QtCore.Qt, "WA_StyledBackground", None) or QtCore.Qt.WidgetAttribute.WA_StyledBackground
+                self.setAttribute(attr, True)
             self._build()
             self._welcome()
 
@@ -208,23 +235,53 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             e = st.get("effort")
             return "%s · %s%s" % (labels.get(self.backend, self.backend).lower(), m, (" · " + e) if e else "")
 
+        # ---- theme ------------------------------------------------------------
+        def _apply_style(self):
+            self.setStyleSheet(
+                "QWidget{background:%(BG)s;color:%(FG)s;font-family:%(mono)s;font-size:12.5px}"
+                "QTextBrowser{background:%(BG)s;border:none;padding:6px 10px}"
+                "QPlainTextEdit{background:%(BG_INPUT)s;border:1px solid %(BORDER)s;border-radius:4px;padding:4px 6px;color:%(FG)s;"
+                "selection-background-color:%(ORANGE)s;selection-color:#FFFFFF}"
+                "QPlainTextEdit:focus{border-color:%(ORANGE)s}"
+                "QLabel{color:%(DIM)s;background:transparent;border:none}"
+                "QToolButton{background:%(BG_INPUT)s;border:1px solid %(BORDER)s;border-radius:4px;padding:2px 8px;color:%(FG)s}"
+                "QToolButton:hover{border-color:%(ORANGE)s;color:%(FG)s}"
+                "QToolButton::menu-indicator{image:none}"
+                "QMenu{background:%(BG_INPUT)s;color:%(FG)s;border:1px solid %(BORDER)s}"
+                "QMenu::item:selected{background:%(ORANGE)s;color:#FFFFFF}"
+                "QMenu::item:disabled{color:%(DIM)s}"
+                "QListWidget{background:%(BG_INPUT)s;border:1px solid %(BORDER)s;color:%(FG)s}"
+                "QListWidget::item:selected{background:%(ORANGE)s;color:#FFFFFF}"
+                "QScrollBar:vertical{background:%(BG)s;width:10px;margin:0}"
+                "QScrollBar::handle:vertical{background:%(BORDER)s;border-radius:4px;min-height:24px}"
+                "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0}"
+                % dict(P, mono=mono))
+            if getattr(self, "status", None) is not None:
+                self.status.setStyleSheet("color:%s;padding-left:4px" % P["ORANGE"])
+                self.caret.setStyleSheet("color:%s;font-weight:bold;padding-top:4px" % P["FG"])
+
+        def set_theme(self, mode, save=True):
+            """mode: "light", "dark" or "auto" (follow the application). Re-colours the transcript in place."""
+            if mode not in THEME_MODES:
+                return
+            self.theme_mode = mode
+            old = dict(P)
+            P.update(THEMES[resolve_theme(mode, QtWidgets, QtGui)])
+            if old != P:
+                self.blocks = [recolor(b, old, P) for b in self.blocks]
+            self._apply_style()
+            self._update_footer()
+            self._render()
+            if save and agentcli:
+                d = agentcli.load_settings()
+                d["theme"] = mode
+                agentcli.save_settings(d)
+
         # ---- layout ------------------------------------------------------------
         def _build(self):
             self.setMinimumSize(500, 440)
-            self.setStyleSheet(
-                "QWidget{background:%s;color:%s;font-family:%s;font-size:12.5px}"
-                "QTextBrowser{background:%s;border:none;padding:6px 10px}"
-                "QPlainTextEdit{background:%s;border:1px solid %s;border-radius:4px;padding:4px 6px;color:%s;selection-background-color:%s}"
-                "QLabel{color:%s}"
-                "QToolButton{background:%s;border:1px solid %s;border-radius:4px;padding:2px 8px;color:%s}"
-                "QToolButton:hover{border-color:%s;color:%s}"
-                "QToolButton::menu-indicator{image:none}"
-                "QMenu{background:%s;color:%s;border:1px solid %s}"
-                "QMenu::item:selected{background:%s;color:%s}"
-                "QListWidget{background:%s;border:1px solid %s;color:%s}"
-                "QListWidget::item:selected{background:%s;color:%s}"
-                % (BG, FG, mono, BG, BG_INPUT, BORDER, FG, ORANGE, DIM, BG_INPUT, BORDER, FG, ORANGE, FG,
-                   BG_INPUT, FG, BORDER, ORANGE, BG, BG_INPUT, BORDER, FG, ORANGE, BG))
+            self.setObjectName("agentChat")
+            self._apply_style()
             lay = QtWidgets.QVBoxLayout(self)
             lay.setContentsMargins(6, 6, 6, 6)
             lay.setSpacing(4)
@@ -233,7 +290,7 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             self.view.setReadOnly(True)
             lay.addWidget(self.view, 1)
             self.status = QtWidgets.QLabel("")
-            self.status.setStyleSheet("color:%s;padding-left:4px" % ORANGE)
+            self.status.setStyleSheet("color:%s;padding-left:4px" % P["ORANGE"])
             self.status.hide()
             lay.addWidget(self.status)
             # slash-command suggestions (shown while the prompt starts with "/")
@@ -245,7 +302,8 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(6)
             caret = QtWidgets.QLabel(">")
-            caret.setStyleSheet("color:%s;font-weight:bold;padding-top:4px" % FG)
+            self.caret = caret
+            caret.setStyleSheet("color:%s;font-weight:bold;padding-top:4px" % P["FG"])
             caret.setAlignment(_enum(Qt, "AlignmentFlag", "AlignTop"))
             row.addWidget(caret)
             self.prompt = PromptEdit()
@@ -306,6 +364,11 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             if not self.available:
                 act = menu.addAction("No Claude Code or Codex CLI found — see docs/mcp.md")
                 act.setEnabled(False)
+            menu.addSeparator()
+            t_menu = menu.addMenu("Theme")
+            for mode, label in (("auto", "Auto (follow FlowDesk)"), ("light", "Light"), ("dark", "Dark")):
+                act = t_menu.addAction(("● " if mode == self.theme_mode else "   ") + label)
+                act.triggered.connect(lambda _=False, m=mode: self.set_theme(m))
 
         def _choose(self, backend, model=None, effort=None):
             if agentcli:
@@ -317,7 +380,7 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
 
         def _update_footer(self):
             self.model_btn.setText(self._model_label() + " ▾")
-            self.foot_right.setText('<span style="color:%s">%s pid %d</span>' % (DIM, "FlowDesk", self.pid))
+            self.foot_right.setText('<span style="color:%s">%s pid %d</span>' % (P["DIM"], "FlowDesk", self.pid))
 
         # ---- slash suggestions -------------------------------------------------
         def _update_suggestions(self):
@@ -354,7 +417,7 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
                    '<span style="color:%s">✻</span> <b>Welcome to %s</b><br/><br/>'
                    '<span style="color:%s">%s · connected to this FlowDesk window (pid %d)<br/>'
                    'cwd: %s<br/>Type a request below · /model to switch provider or model · /help for shortcuts</span></td></tr></table>'
-                   % (BORDER, BORDER, ORANGE, _esc(title), DIM, _esc(who), self.pid, _esc(where)))
+                   % (P["BORDER"], P["BORDER"], P["ORANGE"], _esc(title), P["DIM"], _esc(who), self.pid, _esc(where)))
             self._add(box)
 
         def _add(self, html_block):
@@ -368,7 +431,7 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
 
         def _render(self):
             doc = '<div style="font-family:%s;font-size:12.5px;color:%s;line-height:1.35">%s</div>' % (
-                mono, FG, '<div style="margin:0 0 6px 0"></div>'.join(self.blocks))
+                mono, P["FG"], '<div style="margin:0 0 6px 0"></div>'.join(self.blocks))
             self.view.setHtml(doc)
             self._scroll_bottom()
             QtCore.QTimer.singleShot(0, self._scroll_bottom)
@@ -386,12 +449,12 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
 
         def add_user(self, text):
             self._add('<div style="color:%s;margin:6px 0 4px 0"><span style="color:%s">&gt;</span> %s</div>'
-                      % (DIM, FG, _md_inline(text).replace("\n", "<br/>")))
+                      % (P["DIM"], P["FG"], _md_inline(text).replace("\n", "<br/>")))
 
         def add_assistant(self, text):
             self.draft = None
             self.draft_text = ""
-            self._add('<div><span style="color:%s">⏺</span> %s</div>' % (ORANGE, _md_block(text)))
+            self._add('<div><span style="color:%s">⏺</span> %s</div>' % (P["ORANGE"], _md_block(text)))
 
         def add_delta(self, delta):
             if self.draft is None:
@@ -399,12 +462,12 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
                 self.draft = self._add("")
             self.draft_text += delta
             self.blocks[self.draft] = '<div><span style="color:%s">⏺</span> %s<span style="color:%s">▌</span></div>' % (
-                ORANGE, _md_block(self.draft_text), DIM)
+                P["ORANGE"], _md_block(self.draft_text), P["DIM"])
             self._schedule_render()
 
         def finalize_draft(self, text):
             if self.draft is not None:
-                self.blocks[self.draft] = '<div><span style="color:%s">⏺</span> %s</div>' % (ORANGE, _md_block(text))
+                self.blocks[self.draft] = '<div><span style="color:%s">⏺</span> %s</div>' % (P["ORANGE"], _md_block(text))
                 self.draft = None
                 self.draft_text = ""
                 self._schedule_render()
@@ -419,9 +482,10 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             shown, more = _preview(text)
             tail = ('<br/>&nbsp;&nbsp;&nbsp;… +%d lines' % more) if more > 0 else ""
             self._add('<div style="color:%s;margin-left:14px">⎿&nbsp; %s%s</div>'
-                      % (DIM, "<br/>&nbsp;&nbsp;&nbsp;".join(_esc(l) for l in shown) or "(no output)", tail))
+                      % (P["DIM"], "<br/>&nbsp;&nbsp;&nbsp;".join(_esc(l) for l in shown) or "(no output)", tail))
 
-        def add_note(self, text, color=DIM):
+        def add_note(self, text, color=None):
+            color = color or P["DIM"]
             self._add('<div style="color:%s;white-space:pre-wrap">%s</div>' % (color, _esc(text)))
 
         # ---- running -----------------------------------------------------------
@@ -445,7 +509,7 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             try:
                 self.run = start_run(self.backend, text, lambda k, p: self.relay.event.emit(k, p if isinstance(p, str) else json.dumps(p)))
             except Exception as e:
-                self.add_note("! %s" % e, RED)
+                self.add_note("! %s" % e, P["RED"])
                 self.run = None
                 return
             self.t0 = time.time()
@@ -489,10 +553,16 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
                 self.submit("List your available skills (call the skills tool) and summarise them in one line each.")
             elif cmd == "/stop":
                 self.stop()
+            elif cmd == "/theme":
+                if rest in THEME_MODES:
+                    self.set_theme(rest)
+                    self.add_note("theme: %s" % rest)
+                else:
+                    self.add_note("theme: %s · usage: /theme light | dark | auto" % self.theme_mode)
             elif cmd in ("/help", "/?"):
                 self.add_note(HELP)
             else:
-                self.add_note("unknown command %s — /help" % cmd, RED)
+                self.add_note("unknown command %s — /help" % cmd, P["RED"])
 
         def _on_submit(self):
             if self.suggest.isVisible() and self.suggest.currentItem() and self.prompt.toPlainText().strip() != self.suggest.currentItem().data(32):
@@ -513,13 +583,13 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
         def stop(self):
             if self.run is not None:
                 self.run.cancel()
-                self.add_note("interrupted", RED)
+                self.add_note("interrupted", P["RED"])
 
         def _tick(self):
             self.spin = (self.spin + 1) % len(SPINNER)
             secs = int(time.time() - self.t0) if self.t0 else 0
             self.status.setText('<span style="color:%s">%s %s…</span> <span style="color:%s">(esc to interrupt · %ds)</span>'
-                                % (ORANGE, SPINNER[self.spin], self.verb, DIM, secs))
+                                % (P["ORANGE"], SPINNER[self.spin], self.verb, P["DIM"], secs))
 
         def _finish(self, stats=None):
             self.timer.stop()
@@ -550,7 +620,7 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
             elif kind == "tool_result":
                 self.add_tool_result(payload)
             elif kind == "error":
-                self.add_note("! " + payload, RED)
+                self.add_note("! " + payload, P["RED"])
             elif kind == "stats":
                 try:
                     self._last_stats = json.loads(payload)

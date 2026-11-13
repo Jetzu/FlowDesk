@@ -373,3 +373,45 @@ def test_chat_widget_slash_commands_and_events(app):
     w.submit("/bogus")
     w._render()
     assert "unknown command" in w.view.toPlainText()
+
+
+def test_chat_theme_follows_flowdesk_and_switches_in_place(app, tmp_path, monkeypatch):
+    from PySide6 import QtCore, QtGui, QtWidgets
+
+    from flowdesk.agent import chat_ui
+
+    monkeypatch.setenv("FLOWDESK_AGENT_SETTINGS", str(tmp_path / "settings.json"))
+    w = chat_ui.make_chat_widget(QtWidgets, QtCore, QtGui, app="flowdesk", pid=1, start_run=lambda *a, **k: None,
+                                 sessions={"claude": None, "codex": None}, agentcli=agentcli)
+    assert w.theme_mode == "auto" and chat_ui.P == chat_ui.THEMES["light"]  # FlowDesk's window is light
+    w.on_event("text", "hello")
+    assert chat_ui.THEMES["light"]["ORANGE"] in "".join(w.blocks)
+    w.submit("/theme dark")
+    joined = "".join(w.blocks)
+    assert chat_ui.P == chat_ui.THEMES["dark"] and chat_ui.THEMES["dark"]["ORANGE"] in joined
+    assert chat_ui.THEMES["light"]["ORANGE"] not in joined
+    assert json.loads((tmp_path / "settings.json").read_text())["theme"] == "dark"
+    assert chat_ui.THEMES["dark"]["BG"].lower() in w.styleSheet().lower()
+    w2 = chat_ui.make_chat_widget(QtWidgets, QtCore, QtGui, app="flowdesk", pid=1, start_run=lambda *a, **k: None,
+                                  sessions={"claude": None, "codex": None}, agentcli=agentcli)
+    assert w2.theme_mode == "dark"  # remembered
+    w2.set_theme("auto")
+    assert chat_ui.P == chat_ui.THEMES["light"]
+
+
+def test_theme_palettes_have_unique_colours():
+    from flowdesk.agent import chat_ui
+
+    for theme in chat_ui.THEMES.values():
+        vals = [v.lower() for v in theme.values()]
+        assert len(vals) == len(set(vals))
+    assert set(chat_ui.THEMES["dark"]) == set(chat_ui.THEMES["light"])
+
+
+def test_agent_icons_are_drawn(app):
+    from flowdesk.ui.icons import pixmap
+
+    for name in ("agent", "agent-bridge", "agent-connect"):
+        img = pixmap(name, 32).toImage()
+        painted = sum(1 for x in range(32) for y in range(32) if img.pixelColor(x, y).alpha() > 0)
+        assert painted > 120, name
