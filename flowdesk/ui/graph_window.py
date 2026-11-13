@@ -737,7 +737,8 @@ class GraphWindow(QMainWindow):
 
     def _add_to_layout(self):
         if self.controller.add_to_layout is not None:
-            self.controller.add_to_layout(self.sample, self.population)
+            overlays = [{"sample_id": s.id, "pop_path": p.path} for s, p in getattr(self.plot, "overlays", [])]
+            self.controller.add_to_layout(self.sample, self.population, overlays=overlays)
 
     def _copy_image(self):
         QApplication.clipboard().setImage(self.plot_image(2.0))

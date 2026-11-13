@@ -556,16 +556,22 @@ def _parse_group(node: ET.Element, report: ImportReport) -> Group:
         role = "all"
     elif role_attr == COMPENSATION_ROLE:
         role = "compensation"
+    elif role_attr == "ws.group.dlog.control":
+        role = "control"
+    elif role_attr == "ws.group.dlog.test":
+        role = "test"
     else:
         role = "custom"
     criteria: list[Criterion] = []
     color = "#000000"
     bold = False
+    italic = False
     live = True
     ids: set[int] = set()
     if gel is not None:
         color = gel.get("foreground") or color
         bold = "bold" in (gel.get("fontStyle") or "").lower()
+        italic = "italic" in (gel.get("fontStyle") or "").lower()
         live = gel.get("live", "1") != "0"
         for c in gel:
             if c.tag == "Criteria":
@@ -579,6 +585,7 @@ def _parse_group(node: ET.Element, report: ImportReport) -> Group:
                     except ValueError:
                         pass
     group = Group(gname, role, criteria, color, bold)
+    group.italic = italic
     group.live = live
     group.sample_ids = ids
     group.expanded = node.get("expanded", "1") != "0"

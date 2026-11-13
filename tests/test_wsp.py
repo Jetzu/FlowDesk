@@ -166,7 +166,9 @@ def _assert_same(ws: Workspace, ws2: Workspace):
     assert set(ws.matrices) == set(ws2.matrices)
     for k in ws.matrices:
         _matrix_equal(ws.matrices[k], ws2.matrices[k])
-    assert [(g.name, g.role) for g in ws.groups] == [(g.name, g.role) for g in ws2.groups]
+    # "custom" is the legacy spelling of the Test role: FlowJo has only test / control / compensation
+    norm = {"custom": "test"}
+    assert [(g.name, norm.get(g.role, g.role)) for g in ws.groups] == [(g.name, norm.get(g.role, g.role)) for g in ws2.groups]
     for g, g2 in zip(ws.groups, ws2.groups):
         assert {s.id for s in ws.members(g)} == {s.id for s in ws2.members(g2)}
         assert [(c.keyword, c.function, c.value, c.connector) for c in g.criteria] == [(c.keyword, c.function, c.value, c.connector) for c in g2.criteria]

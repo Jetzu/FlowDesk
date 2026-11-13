@@ -390,7 +390,8 @@ def test_sample_compensated_data(sample, synthetic_fcs):
 def test_scales_and_display_cache(sample, synthetic_fcs):
     ev = synthetic_fcs["events"]
     assert sample.scale("FSC-A") == LinearScale(0, 262144)
-    assert sample.scale("Time") == LinearScale(0, 262144)
+    # header only: the time axis falls back to $PnR (not cached) ...
+    assert sample.scale("Time") == LinearScale(0, 262144) and "Time" not in sample.scales
     assert sample.scale("FITC-A") == default_biex(262144)
     d1 = sample.display("FITC-A")
     assert d1 is sample.display("FITC-A")
@@ -409,7 +410,11 @@ def test_scales_and_display_cache(sample, synthetic_fcs):
     assert sample.scale("Comp-FITC-A") == LinearScale(0, 100000)
     sample.set_scale("Comp-PE-A", LogScale(1, 1e5))
     assert sample.scale("Comp-PE-A") == LogScale(1, 1e5)
+    # one transform per raw parameter: the raw axis follows the Comp- edit
+    assert sample.scale("PE-A") == LogScale(1, 1e5) and "Comp-PE-A" not in dict.keys(sample.scales)
     assert sample.scale("unknown-param") == default_biex(262144)
+    # ... and once the events are loaded it covers the acquired span (data 0..1000)
+    assert sample.scale("Time") == LinearScale(0, 1020)
 
 
 def test_log_amplified_channel_default_scale(tmp_path):
@@ -417,8 +422,10 @@ def test_log_amplified_channel_default_scale(tmp_path):
     p = write_fcs(tmp_path / "log.fcs", raw, ["FL1-H", "FSC-H"], datatype="I", log_amplified={0: (4, 1)})
     s = Sample(p, 1)
     s.load_header()
-    assert s.scale("FL1-H") == LogScale(1, 1024)
+    # $PnE=4,1 on a 1024-channel ADC decodes to 1 .. 10^4: the axis covers it
+    assert s.scale("FL1-H") == LogScale(1, 10000)
     assert s.scale("FSC-H") == LinearScale(0, 1024)
+    assert s.data("FL1-H").max() <= 10000 and s.data("FL1-H").min() >= 1
 
 
 def test_derived_parameters(sample, synthetic_fcs):
@@ -866,3 +873,329 @@ def test_restore_keeps_renamed_population_objects(tmp_path):
     a.name, b.name = "tmp", a_name
     restore_snapshot(ws, snap)
     assert (a.name, b.name) == (a_name, b_name)
+
+
+# ============================================ shared transforms, defaults, caches
+def test_comp_and_raw_parameters_share_one_transform(tmp_path, synthetic_fcs):
+    s = Sample(synthetic_fcs["path"], 1)
+    s.load_header()
+    s.set_compensation(SpilloverMatrix("m", ["FITC-A", "PE-A"], S2))
+    log = LogScale(1, 1e5)
+    s.set_scale("Comp-PE-A", log)
+    assert s.scale("PE-A") is log and s.scale("Comp-PE-A") is log
+    assert not any(k.startswith("Comp-") for k in s.scales)
+    assert "Comp-PE-A" in s.scales and s.scales.get("Comp-PE-A") is log  # lookups resolve too
+    lin = LinearScale(0, 5e4)
+    s.set_scale("PE-A", lin)  # and the other way round
+    assert s.scale("Comp-PE-A") is lin
+    # direct writes (wsp import, templates) land on the raw key as well
+    s.scales["Comp-FITC-A"] = LogScale(10, 1e5)
+    assert list(dict.keys(s.scales)).count("FITC-A") == 1 and s.scale("FITC-A") == LogScale(10, 1e5)
+    # identity / missing matrix: Comp-X still names X's transform
+    s.set_compensation(None)
+    assert s.scale("Comp-PE-A") is lin
+    # an exported workspace only carries raw keys
+    ws = Workspace()
+    ws.samples.append(s)
+    assert not any(k.startswith("Comp-") for k in workspace_to_dict(ws)["samples"][0]["scales"])
+
+
+def test_legacy_comp_keys_collapse_on_first_lookup(tmp_path):
+    p = make_file(tmp_path, "a.fcs")
+    ws = Workspace()
+    s = ws.add_sample(p)
+    s.set_compensation(SpilloverMatrix("m", ["FITC-A", "PE-A"], S2))
+    path = tmp_path / "legacy.fdw"
+    save_workspace(ws, path)
+    data = json.loads(path.read_text())
+    # an old FlowDesk wrote a separate entry for the Comp- axis (and a default for the raw one)
+    data["samples"][0]["scales"] = {"PE-A": LinearScale(0, 262144).to_dict(), "Comp-PE-A": LogScale(1, 1e4).to_dict(),
+                                    "Comp-FITC-A": LogScale(3, 3e4).to_dict()}
+    path.write_text(json.dumps(data))
+    ws2 = load_workspace(path)
+    s2 = ws2.samples[0]
+    assert s2.scale("PE-A") == LogScale(1, 1e4)  # the explicit Comp- entry wins
+    assert s2.scale("Comp-FITC-A") == LogScale(3, 3e4) and s2.scale("FITC-A") == LogScale(3, 3e4)
+    assert set(s2.scales) == {"PE-A", "FITC-A"}
+    # written before the channels are known: kept until they are, then collapsed
+    s3 = Sample(p, 3)
+    s3.scales = {"Comp-PE-A": LogScale(1, 1e3)}
+    assert list(dict.keys(s3.scales)) == ["Comp-PE-A"]
+    s3.load_header()
+    assert s3.scale("Comp-PE-A") == LogScale(1, 1e3) and list(dict.keys(s3.scales)) == ["PE-A"]
+    # a matrix with another prefix: the old spelling collapses on lookup
+    s4 = Sample(p, 4)
+    s4.load_header()
+    s4.scales["<PE-A>"] = LogScale(2, 2e4)
+    s4.comp = SpilloverMatrix("m", ["FITC-A", "PE-A"], S2, prefix="<", suffix=">")
+    assert s4.scale("<PE-A>") == LogScale(2, 2e4) and s4.scale("PE-A") == LogScale(2, 2e4)
+    assert "<PE-A>" not in dict.keys(s4.scales)
+
+
+def test_time_axis_ranged_to_acquired_data(tmp_path):
+    n = 4096
+    rng = np.random.default_rng(3)
+    ev = np.column_stack([rng.normal(9e4, 8e3, n), rng.normal(5e4, 6e3, n), rng.normal(300, 150, n), np.linspace(0, 8190, n)]).astype(np.float32)
+    # BD FACSDiva style: Time $PnR = 262144 but the run spans 0 .. 8190
+    p = write_fcs(tmp_path / "diva.fcs", ev, ["FSC-A", "SSC-A", "FITC-A", "Time"], ranges=[262144] * 4)
+    s = Sample(p, 1)
+    s.load_header()
+    assert s.scale("Time") == LinearScale(0, 262144)  # header only: $PnR, not cached
+    assert "Time" not in s.scales
+    s.ensure_loaded()
+    sc = s.scale("Time")
+    assert isinstance(sc, LinearScale) and sc.min == 0 and sc.max == pytest.approx(8354, abs=1)
+    assert s.scale("FSC-A") == LinearScale(0, 262144)  # scatter keeps $PnR
+    # a chosen time scale is kept
+    s.set_scale("Time", LinearScale(0, 5000))
+    assert s.scale("Time") == LinearScale(0, 5000)
+
+
+def test_selective_invalidation_on_scale_change(sample, synthetic_fcs):
+    s = sample
+    s.set_compensation(SpilloverMatrix("m", ["FITC-A", "PE-A"], S2))
+    scatter = s.root.add_child(Population("Cells", RectangleGate(["FSC-A", "SSC-A"], [50000, 20000], [None, None])))
+    cd4 = scatter.add_child(Population("CD4", PolygonGate(["Comp-FITC-A", "Comp-PE-A"], [(100, 1000), (1e5, 1000), (1e5, 1e5), (100, 1e5)])))
+    cd4_sub = cd4.add_child(Population("Sub", RectangleGate(["FSC-A"], [60000], [None])))
+    pe_range = scatter.add_child(Population("PE range", RectangleGate(["Comp-PE-A"], [5000], [None])))
+    fitc_ell = scatter.add_child(Population("FITC", EllipseGate(["FSC-A", "Comp-FITC-A"], (9e4, 2e4), (1.1e5, 2e4), (9e4, 3e4))))
+    both = scatter.add_child(Population("Bool", BooleanGate("and", ["/Cells/CD4", "/Cells/FITC"])))
+    other_bool = scatter.add_child(Population("Bool2", BooleanGate("or", ["/Cells/PE range"])))
+    for p in s.populations():
+        p.count
+    for n in ("SSC-A", "FSC-A", "PE-A", "Comp-PE-A", "Comp-FITC-A"):
+        s.display(n)
+    ssc_display = s._display_cache["SSC-A"]
+    scatter_mask = scatter._mask
+    s.set_scale("PE-A", LogScale(1, 1e5))  # "CD4" (stain of PE-A) via the T button
+    assert scatter._mask is scatter_mask and s._display_cache["SSC-A"] is ssc_display
+    assert "PE-A" not in s._display_cache and "Comp-PE-A" not in s._display_cache
+    assert "Comp-FITC-A" in s._display_cache and "FSC-A" in s._display_cache
+    assert cd4._mask is None and cd4_sub._mask is None and both._mask is None  # polygon, its child, boolean on it
+    assert pe_range._mask is not None and other_bool._mask is not None  # data-space range on PE: unaffected
+    assert fitc_ell._mask is not None
+    # an identical scale invalidates nothing
+    for p in s.populations():
+        p.count
+    s.set_scale("Comp-PE-A", LogScale(1, 1e5))
+    assert cd4._mask is not None
+    _assert_caches_fresh(s)
+
+
+def _assert_caches_fresh(s):
+    """Every cached display / derived value and mask equals a fresh computation."""
+    fresh = s.detached_copy()
+    for name, cached in s._display_cache.items():
+        np.testing.assert_array_equal(cached, fresh.display(name), err_msg=f"stale display cache {name}")
+    for name, cached in s._derived_cache.items():
+        np.testing.assert_array_equal(cached, fresh.data(name), err_msg=f"stale derived cache {name}")
+    for own, other in zip(s.root.walk(), fresh.root.walk()):
+        if own._mask is not None:
+            np.testing.assert_array_equal(own._mask, other.mask(), err_msg=f"stale mask {own.path}")
+
+
+def _fill(s):
+    for p in s.root.walk():
+        p.count
+    for n in s.parameter_names():
+        try:
+            s.display(n)
+        except KeyError:
+            pass
+
+
+def test_selective_invalidation_never_leaves_stale_caches(sample, synthetic_fcs):
+    s = sample
+    s.ensure_loaded()
+    n = s.n_events
+    s.add_derived("FITC/PE", {"op": "ratio", "a": "Comp-FITC-A", "b": "Comp-PE-A", "kind": "linear", "min": -5, "max": 5})
+    s.add_derived("FSCxSSC", {"op": "product", "a": "FSC-A", "b": "SSC-A"})
+    s.add_computed("tSNE1", np.linspace(-10, 10, n))
+    cells = s.root.add_child(Population("Cells", RectangleGate(["FSC-A", "SSC-A"], [50000, 20000], [None, None])))
+    cells.add_child(Population("Ratio", PolygonGate(["FITC/PE", "FSC-A"], [(-1, 0), (1, 0), (1, 2e5), (-1, 2e5)])))
+    cells.add_child(Population("CompPE", RectangleGate(["Comp-PE-A"], [5000], [None])))
+    cells.add_child(Population("Scatter2", PolygonGate(["FSCxSSC", "SSC-A"], [(0, 0), (1e10, 0), (1e10, 2e5), (0, 2e5)])))
+    t = cells.add_child(Population("tSNE", RectangleGate(["tSNE1"], [0], [None])))
+    t.add_child(Population("tSNE poly", PolygonGate(["tSNE1", "FSC-A"], [(-5, 0), (5, 0), (5, 2e5), (-5, 2e5)])))
+    cells.add_child(Population("Any", BooleanGate("or", ["/Cells/Ratio", "/Cells/tSNE"])))
+    _fill(s)
+    _assert_caches_fresh(s)
+    # 1) a transform
+    s.set_scale("Comp-FITC-A", LinearScale(-1000, 1e5))
+    _assert_caches_fresh(s)
+    _fill(s)
+    # 2) compensation: compensated parameters and what is derived from them change,
+    #    raw scatter (and the product of raw channels) keep their caches
+    scatter_mask = cells._mask
+    product = s._derived_cache["FSCxSSC"]
+    s.set_compensation(SpilloverMatrix("m", ["FITC-A", "PE-A"], S2))
+    assert cells._mask is scatter_mask and s._derived_cache["FSCxSSC"] is product
+    assert "FITC/PE" not in s._derived_cache and cells.find("Ratio")._mask is None
+    _assert_caches_fresh(s)
+    _fill(s)
+    s.set_compensation(SpilloverMatrix("m2", ["FITC-A", "PE-A"], [[1, 0.5], [0.1, 1]]), enabled=False)
+    _assert_caches_fresh(s)
+    _fill(s)
+    # 3) a computed parameter
+    s.add_computed("tSNE1", np.linspace(10, -10, n))
+    assert cells._mask is scatter_mask
+    _assert_caches_fresh(s)
+    _fill(s)
+    s.remove_computed("tSNE1")
+    _assert_caches_fresh(s)
+    assert cells.find("tSNE").count == 0
+    _fill(s)
+    # 4) derived parameters
+    s.add_derived("FSCxSSC", {"op": "sum", "a": "FSC-A", "b": "SSC-A"})
+    _assert_caches_fresh(s)
+    _fill(s)
+    s.remove_derived("FITC/PE")
+    assert "FITC/PE" not in s.derived and "FITC/PE" not in s.scales
+    _assert_caches_fresh(s)
+    assert cells.find("Ratio").count == 0
+
+
+def test_derived_registry_default_kind_and_remove(sample):
+    from flowdesk.core import model
+
+    def double(smp, spec):
+        return smp.data(spec["inputs"][0]) * 2
+
+    model.DERIVED_OPS["double"] = double
+    try:
+        sample.add_derived("2xFSC", {"op": "double", "inputs": ["FSC-A"], "kind": "log", "min": 10, "max": 1e6})
+        np.testing.assert_allclose(sample.data("2xFSC"), sample.data("FSC-A") * 2, rtol=1e-6)
+        assert sample.scale("2xFSC") == LogScale(10, 1e6)
+        sample.add_derived("r", {"op": "ratio", "a": "FITC-A", "b": "PE-A", "kind": "linear", "min": -2, "max": 3})
+        assert sample.scale("r") == LinearScale(-2, 3)
+        # redefining a derived parameter drops its cached default scale
+        sample.add_derived("r", {"op": "ratio", "a": "FITC-A", "b": "PE-A", "kind": "linear", "min": 0, "max": 9})
+        assert sample.scale("r") == LinearScale(0, 9)
+        sample.remove_derived("2xFSC")
+        assert "2xFSC" not in sample.parameter_names() and "2xFSC" not in sample._derived_cache
+        sample.remove_derived("does not exist")  # no error
+    finally:
+        model.DERIVED_OPS.pop("double", None)
+
+
+def test_compensated_file_does_not_get_its_matrix_again(tmp_path):
+    ev = make_synthetic_events(500)["events"]
+    spill = {"$SPILLOVER": "2,FITC-A,PE-A,1,0.2,0.05,1"}
+    names = ["FSC-A", "SSC-A", "Comp-FITC-A", "Comp-PE-A", "Time"]
+    p = write_fcs(tmp_path / "exported.fcs", ev, names, extra_keywords=spill)
+    s = Sample(p, 1)
+    s.load_header()
+    assert s.comp is None
+    s.ensure_loaded()
+    assert s.comp is None
+    q = write_fcs(tmp_path / "flagged.fcs", ev, SYNTH_NAMES, extra_keywords={"$SPILLOVER": "2,FITC-A,PE-A,1,0.2,0.05,1", "FLOWDESK_COMPENSATED": "TRUE"})
+    t = Sample(q, 2)
+    t.load_header()
+    assert t.comp is None
+    r = write_fcs(tmp_path / "raw.fcs", ev, SYNTH_NAMES, extra_keywords=spill)
+    u = Sample(r, 3)
+    u.load_header()
+    assert u.comp is not None and u.comp.params == ["FITC-A", "PE-A"]
+
+
+def test_unload_and_memory_budget(tmp_path):
+    ws = Workspace()
+    samples = [ws.add_sample(make_file(tmp_path, f"m{i}.fcs", seed=i, n=40000)) for i in range(3)]
+    for s in samples:
+        s.root.add_child(Population("Cells", RectangleGate(["FSC-A"], [50000], [None])))
+    counts = [s.root.children[0].count for s in samples]  # unlimited: all stay
+    assert all(s.loaded for s in samples) and ws.memory_budget.released == 0
+    assert samples[0].resident_bytes() > 40000 * 5 * 4
+    s0 = samples[0]
+    s0.root.add_child(Population("P", PolygonGate(["FITC-A", "PE-A"], [(1, 1), (1e5, 1), (1e5, 1e5)])))
+    s0.set_scale("FITC-A", LinearScale(0, 1e5))
+    s0.root.children[0].count
+    assert s0.unload() and s0.fcs is None and s0.root.children[0]._mask is None and not s0._display_cache
+    assert s0.scale("FITC-A") == LinearScale(0, 1e5) and s0.keywords and s0.channels  # header and scales stay
+    np.testing.assert_array_equal(s0.data("FSC-A"), make_synthetic_events(n=40000, seed=0)["events"][:, 0])  # transparent reload
+    assert s0.root.children[0].count == counts[0]
+    # a 1 MB cap: loading one sample releases the least recently used one
+    for s in samples:
+        s.unload()
+    ws.memory_budget.limit_mb = 1
+    samples[0].data("FSC-A")
+    samples[1].data("FSC-A")
+    assert samples[0].fcs is None and samples[1].loaded
+    assert samples[0].data("FSC-A").shape == (40000,)  # reloaded on demand ...
+    assert samples[1].fcs is None  # ... releasing the other one
+    # pinned samples (shown in a window) are never released
+    ws.memory_budget.pin_provider = lambda: [samples[0]]
+    samples[2].data("FSC-A")
+    assert samples[0].loaded and samples[2].loaded
+    ws.memory_budget.pinned = {samples[2].id}
+    ws.memory_budget.pin_provider = None
+    samples[1].data("FSC-A")
+    assert samples[0].fcs is None and samples[2].loaded and samples[1].loaded
+    assert ws.memory_budget.released >= 2
+    # a sample without a file behind it cannot be released
+    lost = Sample(tmp_path / "gone.fcs", 9)
+    assert not lost.unload()
+
+
+def test_adding_1000_header_only_samples_is_fast(tmp_path):
+    import time
+
+    src = make_file(tmp_path, "template.fcs", n=10)
+    data = src.read_bytes()
+    folder = tmp_path / "many"
+    folder.mkdir()
+    paths = []
+    for i in range(1000):
+        q = folder / f"s{i:04d}.fcs"
+        q.write_bytes(data)
+        paths.append(q)
+    ws = Workspace()
+    t0 = time.perf_counter()
+    for q in paths:
+        ws.add_sample(q)
+    elapsed = time.perf_counter() - t0
+    assert len(ws.samples) == 1000 and elapsed < 1.0, elapsed
+    assert ws.add_sample(folder / "." / "s0500.fcs") is ws.samples[500]
+    assert len({s.id for s in ws.samples}) == 1000
+    # the index follows samples appended directly and relocated paths
+    extra = Sample(folder / "x.fcs", 5000)
+    ws.samples.append(extra)
+    assert ws.sample_by_path(folder / "x.fcs") is extra
+    moved = tmp_path / "moved.fcs"
+    ws.samples[3].path = moved
+    assert ws.sample_by_path(moved) is ws.samples[3] and ws.sample_by_path(paths[3]) is None
+    ws.remove_sample(extra)
+    assert ws.sample_by_path(folder / "x.fcs") is None
+
+
+def test_detached_copy_and_adopt(tmp_path):
+    p = make_file(tmp_path, "w.fcs", n=3000)
+    s = Sample(p, 1)
+    s.load_header()
+    cells = s.root.add_child(Population("Cells", RectangleGate(["FSC-A"], [50000], [None])))
+    pos = cells.add_child(Population("Pos", PolygonGate(["FITC-A", "PE-A"], [(1000, 1000), (1e5, 1000), (1e5, 1e5), (1000, 1e5)])))
+    fp = s.state_fingerprint()
+    copy = s.detached_copy()
+    assert copy.root is not s.root and copy.scales is not s.scales
+    copy.ensure_loaded()  # what a worker does
+    for node in copy.root.walk():
+        node.mask()
+    assert s.fcs is None and cells._mask is None  # the original is untouched
+    assert s.adopt(copy, fp)
+    assert s.loaded and cells._mask is not None and pos._mask is not None
+    fresh = Sample(p, 2)
+    fresh.load_header()
+    fresh.root.add_child(cells.clone())
+    assert cells.count == fresh.root.children[0].count
+    # something changed meanwhile: the data is taken, the masks are not
+    t = Sample(p, 3)
+    t.load_header()
+    g = t.root.add_child(Population("G", RectangleGate(["FSC-A"], [50000], [None])))
+    fp = t.state_fingerprint()
+    copy = t.detached_copy()
+    copy.ensure_loaded()
+    copy.root.children[0].mask()
+    g.gate.lo = [80000]
+    assert not t.adopt(copy, fp)
+    assert t.loaded and g._mask is None
+    assert g.count == int((t.data("FSC-A") >= 80000).sum())

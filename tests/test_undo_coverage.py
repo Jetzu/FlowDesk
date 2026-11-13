@@ -644,3 +644,89 @@ def test_snapshots_share_computed_arrays_and_are_fast(app, tmp_path):
     c.undo()
     c.redo()
     assert all(s.computed[n] is a for s in ws.samples for n, a in arrays[s.id].items())
+
+
+# ------------------------------------------------------------ workspace hub
+def test_move_gate_undo_restores_tree_booleans_and_layouts(controller, app):
+    """Re-parenting a gate (drag inside a sample) is one undo step that brings
+    back the tree, the Boolean references and the layout plots that followed."""
+    from flowdesk.core.gates import BooleanGate
+    from flowdesk.ui import main_window as mw
+
+    c = controller
+    ws = c.workspace
+    s = ws.samples[0]
+    cells = gate(c, s)
+    cd3 = gate(c, s, "CD3+", parent=cells, lo=25000.0)
+    live = gate(c, s, "Live", parent=cells, lo=22000.0)
+    both = c.add_population(s.root, Population("Both", BooleanGate("and", ["/Cells/CD3+", "/Cells/Live"])))
+    ws.layouts.append(Layout("L", [LayoutItem(sample_id=s.id, pop_path="/Cells/CD3+")]))
+    c._undo.clear()
+    win = mw.MainWindow(c)
+    try:
+        rec = Recorder(c)
+        assert win.move_populations(s, [cd3], live) == 1
+        assert s.root.find("/Cells/Live/CD3+") is cd3 and s.root.find("/Cells/CD3+") is None
+        assert both.gate.refs == ["/Cells/Live/CD3+", "/Cells/Live"]
+        assert ws.layouts[0].items[0].pop_path == "/Cells/Live/CD3+"
+        assert len(c._undo) == 1 and c.undo_label() == "move gate"
+        assert {"gatingChanged", "layoutsChanged"} <= rec.take()
+        # moving a gate into its own sub-population is refused
+        assert win.move_populations(s, [cells], live) == 0 and len(c._undo) == 1
+        c.undo()
+        assert [p.path for p in s.root.walk(False)] == ["/Cells", "/Cells/CD3+", "/Cells/Live", "/Both"]
+        assert s.root.find("/Both").gate.refs == ["/Cells/CD3+", "/Cells/Live"]
+        assert ws.layouts[0].items[0].pop_path == "/Cells/CD3+"
+        c.redo()
+        assert s.root.find("/Cells/Live/CD3+") is not None
+    finally:
+        c.mark_saved()
+        win.hide()
+        win.deleteLater()
+        app.processEvents()
+
+
+def test_group_tree_move_rename_and_file_drop_undo(controller, app, tmp_path):
+    """Moving and renaming in the group tree changes every member and the
+    template in one step; files dropped on a group join it in one step."""
+    from flowdesk.ui import main_window as mw
+
+    c = controller
+    ws = c.workspace
+    s0, s1 = ws.samples[:2]
+    g = c.create_group("Panel", [s0, s1])
+    c.add_population(s0.root, Population("Cells", RectangleGate(["FSC-A"], [20000.0], [None])), g)
+    c.add_population(s0.root.find("/Cells"), Population("A", RectangleGate(["FSC-A"], [30000.0], [None])), g)
+    c.add_population(s0.root.find("/Cells"), Population("B", RectangleGate(["SSC-A"], [10000.0], [None])), g)
+    c._undo.clear()
+    win = mw.MainWindow(c)
+    try:
+        assert win.move_group_populations(g, [g.root.find("/Cells/A")], g.root.find("/Cells/B")) == 1
+        for root in (g.root, s0.root, s1.root):
+            assert root.find("/Cells/B/A") is not None and root.find("/Cells/A") is None
+        assert len(c._undo) == 1
+        c.undo()
+        for root in (g.root, s0.root, s1.root):
+            assert root.find("/Cells/A") is not None and root.find("/Cells/B/A") is None
+        # F2 on the group row renames the group; on a template row, the gate everywhere
+        assert win.rename_group(g, "Donors") and g.name == "Donors"
+        assert not win.rename_group(g, "Compensation")  # taken
+        win._group_item_renamed(g, g.root.find("/Cells"), "Lymphs")
+        assert all(r.find("/Lymphs/A") is not None for r in (g.root, s0.root, s1.root))
+        c.undo()
+        c.undo()
+        assert g.name == "Panel" and all(r.find("/Cells/A") is not None for r in (g.root, s0.root, s1.root))
+        # files dropped on the group: added and members in one step
+        c._undo.clear()
+        (tmp_path / "x").mkdir()
+        extra = make_files(tmp_path / "x", names=["Well_X1.fcs"], n_events=[100])[0]
+        added = win._files_dropped([str(extra)], g)
+        assert [s.path for s in added] == [extra] and g.contains(added[0]) and added[0].root.find("/Cells/A") is not None
+        assert len(c._undo) == 1
+        c.undo()
+        assert ws.sample_by_path(extra) is None and g.sample_ids == {s0.id, s1.id}
+    finally:
+        c.mark_saved()
+        win.hide()
+        win.deleteLater()
+        app.processEvents()

@@ -376,20 +376,109 @@ def default_biex(top: float) -> LogicleScale:
     return LogicleScale.from_biex(top, pos, 0.0, -top / 10 ** (pos - 1.0))
 
 
+# Defaults for parameters nobody chose a scale for yet. The workspace window
+# pushes the user preferences "default_transform" and "default_width_basis"
+# here (set_scale_defaults), the way the controller pushes the polygon mode
+# into gates.POLYGON_SETTINGS. A width basis of None (or the built-in -100)
+# keeps the range-derived default of default_biex().
+BUILTIN_WIDTH_BASIS = -100.0
+SCALE_DEFAULTS: dict = {"transform": "logicle", "width_basis": None}
+_KIND_ALIASES = {"biex": "logicle", "biexponential": "logicle", "logicle": "logicle", "log": "log", "logarithmic": "log",
+                 "arcsinh": "arcsinh", "fasinh": "arcsinh", "asinh": "arcsinh", "linear": "linear", "lin": "linear"}
+
+
+def normalize_kind(kind: str | None, fallback: str = "logicle") -> str:
+    return _KIND_ALIASES.get(str(kind or "").strip().lower(), fallback)
+
+
+def set_scale_defaults(transform: str | None = None, width_basis: float | None = None) -> bool:
+    """Set the transform kind and biexponential width basis that fluorescence
+    parameters get when their scale is defaulted. Returns True when that changed."""
+    kind = normalize_kind(transform)
+    wb: float | None
+    try:
+        wb = float(width_basis) if width_basis is not None else None
+    except (TypeError, ValueError):
+        wb = None
+    if wb is not None and (wb == 0 or not math.isfinite(wb) or abs(-abs(wb) - BUILTIN_WIDTH_BASIS) < 1e-9):
+        wb = None
+    elif wb is not None:
+        wb = -abs(wb)
+    new = {"transform": kind, "width_basis": wb}
+    if new == SCALE_DEFAULTS:
+        return False
+    SCALE_DEFAULTS.update(new)
+    return True
+
+
+def default_fluorescence_scale(top: float = 262144.0, transform: str | None = None, width_basis: float | None = None) -> Scale:
+    """The default scale of a fluorescence parameter whose range is `top`,
+    following SCALE_DEFAULTS unless `transform` / `width_basis` are given."""
+    top = float(top) if top and top > 0 else 262144.0
+    kind = normalize_kind(transform or SCALE_DEFAULTS.get("transform"))
+    wb = width_basis if width_basis is not None else SCALE_DEFAULTS.get("width_basis")
+    pos = max(3.0, math.log10(top) - 1.0)
+    if kind == "linear":
+        return LinearScale(0.0, top)
+    if kind == "log":
+        return LogScale(1.0 if top > 10.0 else top / 1e4, top)
+    if kind == "arcsinh":
+        return ArcsinhScale(top, pos, 0.0)
+    if wb is None or not wb:
+        return default_biex(top)
+    return LogicleScale.from_biex(top, pos, 0.0, -abs(float(wb)))
+
+
+def estimate_biex(values, top: float = 262144.0, pos: float | None = None, percentile: float = 5.0, neg: float = 0.0) -> LogicleScale:
+    """A biexponential scale whose linear region fits the negative spread of
+    `values` (typically compensated data): the width basis is the low
+    `percentile` of the events (r, the most negative value worth showing, in
+    Parks, Roederer & Moore 2006), kept between the narrowest width the scale
+    can represent (and -10) and a linear region of 1.5 decades, rounded to two
+    significant digits."""
+    top = float(top) if top and top > 0 else 262144.0
+    pos = float(pos) if pos and pos > 0 else max(3.0, math.log10(top) - 1.0)
+    v = np.asarray(values, dtype=float).ravel()
+    v = v[np.isfinite(v)]
+    floor = max(10.0, top / 10 ** pos)
+    ceiling = max(floor, top / 10 ** max(pos - 3.0, 0.0))
+    r = float(np.percentile(v, percentile)) if v.size else 0.0
+    mag = min(max(-r, floor), ceiling)
+    mag = float(f"{mag:.2g}")
+    return LogicleScale.from_biex(top, pos, max(0.0, float(neg)), -mag)
+
+
 _LINEAR_NAME_PATTERNS = ("FSC", "SSC", "TIME", "HDR-T", "EVENT", "INDEXSORT", "DELTATIME", "REGIONCLASSIFICATION", "SORT")
 
 
-def default_scale_for_channel(name: str, display_hint: str = "", top: float = 262144.0, log_amplified: bool = False) -> Scale:
+def default_scale_for_channel(
+    name: str,
+    display_hint: str = "",
+    top: float = 262144.0,
+    log_amplified: bool = False,
+    *,
+    log_decades: float = 0.0,
+    log_offset: float = 0.0,
+    transform: str | None = None,
+    width_basis: float | None = None,
+) -> Scale:
+    """Default scale of a measured parameter. Log-amplified channels ($PnE)
+    get a log scale over their decoded range offset .. offset*10^decades when
+    the decades are given; scatter, time, width and similar parameters are
+    linear; fluorescence follows SCALE_DEFAULTS (biexponential by default)."""
     upper = name.upper()
     hint = display_hint.upper()
     if log_amplified:
+        if log_decades and log_decades > 0:
+            lo = float(log_offset) if log_offset and log_offset > 0 else 1.0
+            return LogScale(lo, lo * 10 ** float(log_decades))
         return LogScale(max(1.0, top / 10 ** 4), top)
     if hint.startswith("LIN"):
         return LinearScale(0.0, top)
     if hint.startswith("LOG"):
-        return default_biex(top)
+        return default_fluorescence_scale(top, transform, width_basis)
     if any(upper.startswith(p) or upper == p for p in _LINEAR_NAME_PATTERNS):
         return LinearScale(0.0, top)
     if upper.endswith("-W") or upper.endswith("WIDTH"):
         return LinearScale(0.0, top)
-    return default_biex(top)
+    return default_fluorescence_scale(top, transform, width_basis)

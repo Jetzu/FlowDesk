@@ -2,6 +2,8 @@
 
     python packaging/build.py            # -> dist/FlowDesk[/.app]
     python packaging/build.py --zip      # also writes dist/FlowDesk-<os>.zip
+    python packaging/build.py --dmg      # macOS: also writes dist/FlowDesk-<version>-macOS-<arch>.dmg
+    python packaging/build.py --dmg-only # macOS: only package an existing dist/FlowDesk.app
     python packaging/build.py --keep-build
     python packaging/build.py --check-only   # only run the frozen-app check on dist/
 
@@ -15,6 +17,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -194,6 +198,98 @@ def check_document_types(target: Path) -> None:
     print("document types declared: " + ", ".join(sorted(declared)))
 
 
+DMG_README = """FlowDesk
+========
+
+1. Drag FlowDesk onto the Applications folder.
+2. Open FlowDesk from Applications or Launchpad.
+
+If macOS says it cannot verify the app: this build is signed ad hoc, not notarised.
+Right-click FlowDesk, choose Open, then Open again. You only have to do this once.
+Or in Terminal:   xattr -dr com.apple.quarantine /Applications/FlowDesk.app
+
+FlowDesk opens .fdw workspaces, FlowJo .wsp workspaces, .fcs files and folders of FCS files.
+https://github.com/Jetzu/FlowDesk
+"""
+
+
+def app_version() -> str:
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', (ROOT / "flowdesk" / "__init__.py").read_text(encoding="utf-8"))
+    return match.group(1) if match else "0.0.0"
+
+
+def prune_dangling_symlinks(app: Path) -> int:
+    """Delete symlinks whose target does not exist.
+
+    The spec leaves Qt's QML / Quick / PDF content out of the bundle, but PyInstaller still
+    links to it from Contents/Resources. The links are harmless at run time, yet they make
+    `codesign --strict` (and Apple's notarisation checks) fail."""
+    removed = 0
+    for path in list(app.rglob("*")):
+        if path.is_symlink() and not path.exists():
+            path.unlink()
+            removed += 1
+    return removed
+
+
+def _codesign_ok(app: Path) -> bool:
+    return subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True).returncode == 0
+
+
+def ensure_signed(app: Path) -> None:
+    """Apple Silicon refuses unsigned code, so the bundle must carry at least an ad-hoc signature.
+    PyInstaller normally signs every binary itself; this only repairs a bundle that does not verify."""
+    if _codesign_ok(app):
+        return
+    print("bundle signature does not verify strictly - signing ad hoc")
+    subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app)], check=True)
+    if not _codesign_ok(app):
+        raise SystemExit("codesign --verify still fails after signing")
+
+
+def verify_dmg(dmg: Path) -> None:
+    """Check the image checksum, mount it read-only and look inside."""
+    subprocess.run(["hdiutil", "verify", str(dmg)], check=True, capture_output=True)
+    with tempfile.TemporaryDirectory(prefix="flowdesk-mnt-") as mnt:
+        subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse", "-noverify", "-mountpoint", mnt, str(dmg)],
+                       check=True, capture_output=True)
+        try:
+            app = Path(mnt) / "FlowDesk.app"
+            if not (app / "Contents" / "MacOS" / "FlowDesk").is_file():
+                raise SystemExit("the disk image has no FlowDesk.app/Contents/MacOS/FlowDesk")
+            if not (Path(mnt) / "Applications").is_symlink():
+                raise SystemExit("the disk image has no Applications shortcut")
+            if not _codesign_ok(app):
+                raise SystemExit("the app inside the disk image does not pass codesign --verify")
+        finally:
+            subprocess.run(["hdiutil", "detach", mnt, "-force"], capture_output=True)
+
+
+def make_dmg() -> Path:
+    """Disk image with FlowDesk.app and an Applications shortcut (macOS only)."""
+    if sys.platform != "darwin":
+        raise SystemExit("--dmg only works on macOS")
+    app = DIST / "FlowDesk.app"
+    if not app.exists():
+        raise SystemExit("dist/FlowDesk.app not found - build first (without --dmg-only)")
+    removed = prune_dangling_symlinks(app)
+    if removed:
+        print(f"removed {removed} dangling symlinks from the bundle")
+    ensure_signed(app)  # removing files breaks the seal, so this re-signs when needed
+    out = DIST / f"FlowDesk-{app_version()}-macOS-{platform.machine() or 'arm64'}.dmg"
+    out.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="flowdesk-dmg-") as tmp:
+        stage = Path(tmp) / "FlowDesk"
+        stage.mkdir()
+        subprocess.run(["ditto", str(app), str(stage / "FlowDesk.app")], check=True)  # keeps symlinks and metadata
+        (stage / "Applications").symlink_to("/Applications")
+        (stage / "READ ME FIRST.txt").write_text(DMG_README, encoding="utf-8")
+        subprocess.run(["hdiutil", "create", "-volname", "FlowDesk", "-srcfolder", str(stage), "-fs", "HFS+",
+                        "-format", "UDZO", "-imagekey", "zlib-level=9", "-ov", str(out)], check=True, capture_output=True)
+    verify_dmg(out)
+    return out
+
+
 def make_zip() -> Path:
     target = artifact()
     out = DIST / f"FlowDesk-{os_tag()}.zip"
@@ -208,6 +304,8 @@ def make_zip() -> Path:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--zip", action="store_true", help="also create dist/FlowDesk-<os>.zip")
+    ap.add_argument("--dmg", action="store_true", help="macOS: also create dist/FlowDesk-<version>-macOS-<arch>.dmg")
+    ap.add_argument("--dmg-only", action="store_true", help="macOS: package an existing dist/FlowDesk.app, no rebuild")
     ap.add_argument("--keep-build", action="store_true", help="keep the intermediate build/ directory")
     ap.add_argument("--no-check", action="store_true", help="skip running the analysis check in the frozen app")
     ap.add_argument("--check-only", action="store_true", help="only run the frozen-app check on an existing build")
@@ -216,6 +314,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_only:
         check_document_types(artifact())
         check_frozen_app(artifact())
+        return 0
+    if args.dmg_only:
+        d = make_dmg()
+        print(f"disk image {d}  ({d.stat().st_size / 1e6:.0f} MB)")
         return 0
     ensure_pyinstaller()
     ensure_icons()
@@ -233,9 +335,17 @@ def main(argv: list[str] | None = None) -> int:
     check_document_types(target)
     if not args.no_check:
         check_frozen_app(target)
+    if sys.platform == "darwin" and target.suffix == ".app":
+        removed = prune_dangling_symlinks(target)
+        if removed:
+            print(f"removed {removed} dangling symlinks from the bundle")
+        ensure_signed(target)
     if args.zip:
         z = make_zip()
         print(f"zipped {z}  ({z.stat().st_size / 1e6:.0f} MB)")
+    if args.dmg:
+        d = make_dmg()
+        print(f"disk image {d}  ({d.stat().st_size / 1e6:.0f} MB)")
     return 0
 
 

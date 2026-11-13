@@ -1,6 +1,13 @@
 """Workspace model: samples, population hierarchies and groups."""
 from __future__ import annotations
 
+import itertools
+import json
+import math
+import operator
+import os
+import weakref
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -8,8 +15,179 @@ import numpy as np
 
 from .compensation import ACQUISITION_DEFINED, SpilloverMatrix
 from .fcs import Channel, FCSError, FCSFile
-from .gates import Gate, new_id
+from .gates import BooleanGate, Gate, RectangleGate, new_id
 from .transforms import Scale, default_scale_for_channel
+
+COMP_PREFIX = "Comp-"
+
+# Operations of derived parameters contributed by other modules: op name ->
+# function(sample, spec) returning one value per event. Sample._derived_values
+# consults it for ops it does not implement itself (ratio, product, sum,
+# difference, log10, identity). A spec may list the parameters it reads under
+# "inputs" so that changing other parameters keeps its cached values; without
+# it the parameter is recomputed after any data change.
+DERIVED_OPS: dict[str, Callable] = {}
+BUILTIN_DERIVED_OPS = ("ratio", "product", "sum", "difference", "log10", "identity")
+
+# FCS headers read ahead of Workspace.add_sample (e.g. by a background loader):
+# path string -> (mtime_ns, size, version, keywords). load_header() takes an
+# entry when the file has not changed since.
+HEADER_CACHE: dict[str, tuple] = {}
+
+_USE_CLOCK = itertools.count(1)  # Sample.last_used stamps (least-recently-used order)
+_BUDGETS: "weakref.WeakSet[MemoryBudget]" = weakref.WeakSet()
+
+
+def read_header_entry(path: Path | str) -> tuple:
+    """(mtime_ns, size, version, keywords) of an FCS file; safe in a worker thread."""
+    st = os.stat(path)
+    version, keywords = FCSFile.read_keywords(path)
+    return (st.st_mtime_ns, st.st_size, version, keywords)
+
+
+def _take_cached_header(path: Path) -> tuple[str, dict] | None:
+    entry = HEADER_CACHE.pop(os.fspath(path), None)
+    if entry is None:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if (st.st_mtime_ns, st.st_size) != (entry[0], entry[1]):
+        return None
+    return entry[2], dict(entry[3])
+
+
+def _derived_inputs(spec: dict) -> list[str] | None:
+    """The parameters a derived parameter reads, None when unknown."""
+    op = spec.get("op", "ratio")
+    if op in BUILTIN_DERIVED_OPS or op not in DERIVED_OPS:
+        return [n for n in (spec.get("a"), spec.get("b")) if n]
+    inputs = spec.get("inputs")
+    return list(inputs) if isinstance(inputs, (list, tuple)) else None
+
+
+class ScaleMap(dict):
+    """``Sample.scales``: one transform per raw parameter.
+
+    As in FlowJo, the transform belongs to the raw parameter: a compensated
+    name ("Comp-PE-A") is stored under, and read from, its raw parameter
+    ("PE-A"), so the raw and the compensated axis always agree. Entries
+    written under a compensated spelling (old .fdw files, templates, direct
+    writes before the sample knew its channels) collapse onto the raw key as
+    soon as the sample can resolve them; when both spellings were stored, the
+    compensated one wins (it was only ever written by an explicit edit, while
+    a raw entry may be a cached default).
+    """
+
+    def __init__(self, owner: "Sample | None" = None, data=None):
+        super().__init__()
+        self._owner = weakref.ref(owner) if owner is not None else None
+        self._sig: tuple | None = None
+        self._dirty = False
+        # keys holding a default that Sample.scale() cached (not chosen by anyone)
+        self.auto: set[str] = set()
+        if data:
+            items = list(data.items()) if hasattr(data, "items") else list(data)
+            own = self._sample()
+            if own is not None:
+                items.sort(key=lambda kv: own._scale_key(kv[0]) != kv[0])
+            for k, v in items:
+                self[k] = v
+
+    def _sample(self) -> "Sample | None":
+        return self._owner() if self._owner is not None else None
+
+    def _key(self, name):
+        own = self._sample()
+        return own._scale_key(name) if own is not None and isinstance(name, str) else name
+
+    def settle(self):
+        """Move entries stored under a compensated spelling to their raw key."""
+        own = self._sample()
+        if own is None:
+            return
+        sig = (id(own.comp), id(own.channels), len(own.channels))
+        if not self._dirty and sig == self._sig:
+            return
+        self._sig = sig
+        self._dirty = False
+        moves = [(k, own._scale_key(k)) for k in dict.keys(self) if isinstance(k, str)]
+        for k, key in moves:
+            if key != k:
+                dict.__setitem__(self, key, dict.pop(self, k))
+                self.auto.discard(key)
+                if k in self.auto:
+                    self.auto.discard(k)
+
+    def __setitem__(self, name, scale):
+        key = self._key(name)
+        dict.__setitem__(self, key, scale)
+        if key != name:
+            dict.pop(self, name, None)
+        self.auto.discard(key)
+        self._dirty = True
+
+    def __getitem__(self, name):
+        self.settle()
+        return dict.__getitem__(self, self._key(name))
+
+    def __contains__(self, name) -> bool:
+        self.settle()
+        return dict.__contains__(self, self._key(name))
+
+    def __delitem__(self, name):
+        self.settle()
+        key = self._key(name)
+        dict.__delitem__(self, key)
+        self.auto.discard(key)
+
+    def get(self, name, default=None):
+        self.settle()
+        return dict.get(self, self._key(name), default)
+
+    def pop(self, name, *default):
+        self.settle()
+        key = self._key(name)
+        self.auto.discard(key)
+        return dict.pop(self, key, *default)
+
+    def setdefault(self, name, default=None):
+        self.settle()
+        key = self._key(name)
+        if not dict.__contains__(self, key):
+            self[key] = default
+        return dict.__getitem__(self, key)
+
+    def update(self, *args, **kwargs):
+        for k, v in dict(*args, **kwargs).items():
+            self[k] = v
+
+    def __iter__(self):
+        self.settle()
+        return dict.__iter__(self)
+
+    def keys(self):
+        self.settle()
+        return dict.keys(self)
+
+    def values(self):
+        self.settle()
+        return dict.values(self)
+
+    def items(self):
+        self.settle()
+        return dict.items(self)
+
+    def __len__(self) -> int:
+        self.settle()
+        return dict.__len__(self)
+
+    def copy(self) -> dict:
+        return dict(self.items())
+
+    def __reduce__(self):
+        return (dict, (dict(self.items()),))
 
 PLOT_TYPES = [
     ("pseudocolor", "Pseudocolor"),
@@ -178,6 +356,48 @@ class Population:
         for c in self.children:
             c.invalidate()
 
+    def invalidate_where(self, gate_depends: Callable[[Gate], bool]) -> int:
+        """Selective invalidation over the whole tree this node belongs to:
+        drop the cached membership of every population whose own gate depends
+        on what changed (``gate_depends(gate)``), of all their descendants and
+        of boolean gates combining any of them. Everything else keeps its
+        mask. Returns the number of masks dropped."""
+        root = self.root
+        nodes = list(root.walk())
+        dirty: set[int] = set()
+        for node in nodes:
+            g = node.gate
+            if g is None or isinstance(g, BooleanGate):
+                continue
+            try:
+                hit = bool(gate_depends(g))
+            except Exception:  # noqa: BLE001 - when in doubt, recompute
+                hit = True
+            if hit:
+                dirty.add(id(node))
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes:
+                if id(node) in dirty:
+                    continue
+                hit = node.parent is not None and id(node.parent) in dirty
+                if not hit and isinstance(node.gate, BooleanGate):
+                    for ref in node.gate.refs:
+                        target = root.find(ref)
+                        if target is not None and id(target) in dirty:
+                            hit = True
+                            break
+                if hit:
+                    dirty.add(id(node))
+                    changed = True
+        dropped = 0
+        for node in nodes:
+            if id(node) in dirty and node._mask is not None:
+                node._mask = None
+                dropped += 1
+        return dropped
+
     def mask(self) -> np.ndarray:
         if self._mask is not None:
             return self._mask
@@ -247,7 +467,6 @@ class Sample:
         self.load_warnings: list[str] = []
         self.root = Population(self.name)
         self.root.sample = self
-        self.scales: dict[str, Scale] = {}
         self.comp: SpilloverMatrix | None = None
         self.comp_enabled = True
         self.comp_cleared = False  # the user removed the acquisition matrix on purpose
@@ -256,14 +475,46 @@ class Sample:
         # float32 value per event, NaN where the tool did not run
         self.computed: dict[str, np.ndarray] = {}
         self.computed_info: dict[str, dict] = {}
+        self.scales = {}
         self._comp_cache: tuple[SpilloverMatrix, np.ndarray] | None = None
         self._display_cache: dict[str, np.ndarray] = {}
         self._derived_cache: dict[str, np.ndarray] = {}
+        self._chan_set: tuple | None = None
+        self._was_unloaded = False  # unload() released the data: keep edited channels on reload
+        self._detached = False  # a worker-thread copy (detached_copy), not part of a workspace
+        self.last_used = 0  # _USE_CLOCK stamp of the last data access
+
+    # ------------------------------------------------------------------- scales map
+    @property
+    def scales(self) -> ScaleMap:
+        return self._scales
+
+    @scales.setter
+    def scales(self, value):
+        if isinstance(value, ScaleMap) and value._sample() is self:
+            self._scales = value
+        else:
+            self._scales = ScaleMap(self, value or {})
 
     # ------------------------------------------------------------------ loading
+    def _file_is_compensated(self, spill_params: list[str] | None = None) -> bool:
+        """The file already holds compensated data (an exported compensated
+        population): its matrix must not be applied a second time."""
+        flag = next((v for k, v in self.keywords.items() if str(k).upper() == "FLOWDESK_COMPENSATED"), "")
+        if str(flag).strip().upper() in ("TRUE", "1", "YES"):
+            return True
+        if spill_params:
+            names = set(self.channel_names)
+            return any(f"{COMP_PREFIX}{p}" in names for p in spill_params)
+        return False
+
     def load_header(self) -> bool:
         try:
-            self.version, self.keywords = FCSFile.read_keywords(self.path)
+            cached = _take_cached_header(self.path)
+            if cached is not None:
+                self.version, self.keywords = cached
+            else:
+                self.version, self.keywords = FCSFile.read_keywords(self.path)
         except (OSError, FCSError) as exc:
             self.load_error = str(exc)
             return False
@@ -272,30 +523,79 @@ class Sample:
         self.channels = channels_from_keywords(self.keywords)
         if self.comp is None and not self.comp_cleared:
             spill = parse_spillover(self.keywords)
-            if spill is not None:
+            if spill is not None and not self._file_is_compensated(spill[0]):
                 self.comp = SpilloverMatrix(ACQUISITION_DEFINED, spill[0], spill[1])
         self.load_error = None
         return True
 
     def ensure_loaded(self) -> bool:
         if self.fcs is not None:
+            self.last_used = next(_USE_CLOCK)
             return True
         if self.load_error and not self.path.exists():
             return False
         try:
-            self.fcs = FCSFile.read(self.path)
+            fcs = FCSFile.read(self.path)
         except (OSError, FCSError) as exc:
             self.load_error = str(exc)
             return False
-        self.version = self.fcs.version
-        if not self.keywords:
-            self.keywords = dict(self.fcs.keywords)
-        self.channels = self.fcs.channels
-        if self.comp is None and not self.comp_cleared:
-            self.comp = SpilloverMatrix.from_fcs(self.fcs)
-        self.load_error = None
-        self._drop_stale_computed()
+        self.attach_fcs(fcs)
         return True
+
+    def attach_fcs(self, fcs: FCSFile):
+        """Install event data read from this sample's file (by ensure_loaded,
+        or by a loader that read it in a worker thread). GUI thread only."""
+        kept = self.channels if self._was_unloaded else None
+        self.fcs = fcs
+        self.version = fcs.version
+        if not self.keywords:
+            self.keywords = dict(fcs.keywords)
+        if kept and len(kept) == len(fcs.channels):
+            fcs.channels = kept  # $PnN / $PnS edited before the data was released
+        self.channels = fcs.channels
+        if self.comp is None and not self.comp_cleared:
+            comp = SpilloverMatrix.from_fcs(fcs)
+            if comp is not None and not self._file_is_compensated(comp.params):
+                self.comp = comp
+        self.load_error = None
+        self._was_unloaded = False
+        self._drop_stale_computed()
+        self.last_used = next(_USE_CLOCK)
+        if not self._detached:
+            _notify_loaded(self)
+
+    def unload(self) -> bool:
+        """Release the event data and everything computed from it (compensated,
+        display and derived values, population masks). Header, keywords,
+        scales, gates and computed parameters stay; the next data() / mask()
+        reads the file again. Returns False (keeping the data) when nothing was
+        loaded or the file cannot be read back."""
+        if self.fcs is None or self._detached or not self.path.is_file():
+            return False
+        self._was_unloaded = True
+        self.fcs = None
+        self._comp_cache = None
+        self._display_cache.clear()
+        self._derived_cache.clear()
+        self.root.invalidate()
+        return True
+
+    def release_events(self) -> bool:
+        """Alias of unload()."""
+        return self.unload()
+
+    def resident_bytes(self) -> int:
+        """Bytes held for this sample's events and what is derived from them
+        (computed parameters, which cannot be re-read, are not counted)."""
+        if self.fcs is None:
+            return 0
+        total = int(getattr(self.fcs.events, "nbytes", 0) or 0)
+        if self._comp_cache is not None:
+            total += int(self._comp_cache[1].nbytes)
+        total += sum(int(a.nbytes) for a in self._display_cache.values())
+        total += sum(int(a.nbytes) for a in self._derived_cache.values())
+        total += sum(int(p._mask.nbytes) for p in self.root.walk() if p._mask is not None)
+        return total
 
     def _drop_stale_computed(self):
         """Computed parameters restored from a workspace whose length does not
@@ -341,6 +641,29 @@ class Sample:
         if self.comp is not None and self.comp_enabled and not self.comp.is_identity:
             return self.comp
         return None
+
+    def _channel_set(self) -> frozenset:
+        cached = self._chan_set
+        if cached is None or cached[0] is not self.channels or cached[1] != len(self.channels):
+            cached = (self.channels, len(self.channels), frozenset(c.name for c in self.channels))
+            self._chan_set = cached
+        return cached[2]
+
+    def _scale_key(self, name: str) -> str:
+        """The key a parameter's transform is stored under: the raw parameter
+        for a compensated name (FlowJo keeps one transform per raw parameter),
+        the name itself otherwise."""
+        chans = self._channel_set()
+        if name in chans or name in self.derived or name in self.computed:
+            return name
+        comp = self.comp
+        if comp is not None:
+            base = comp.base_name(name)
+            if base is not None and base != name:
+                return base
+        if name.startswith(COMP_PREFIX) and name[len(COMP_PREFIX):] in chans:
+            return name[len(COMP_PREFIX):]
+        return name
 
     def parameter_names(self) -> list[str]:
         names: list[str] = []
@@ -437,8 +760,14 @@ class Sample:
         if name in self._derived_cache:
             return self._derived_cache[name]
         spec = self.derived[name]
-        a = self.data(spec["a"]).astype(np.float64)
         op = spec.get("op", "ratio")
+        if op not in BUILTIN_DERIVED_OPS and op in DERIVED_OPS:
+            values = np.asarray(DERIVED_OPS[op](self, spec), dtype=np.float32)
+            if values.shape != (self.n_events,):
+                raise KeyError(name)
+            self._derived_cache[name] = values
+            return values
+        a = self.data(spec["a"]).astype(np.float64)
         b = self.data(spec["b"]).astype(np.float64) if spec.get("b") else None
         with np.errstate(divide="ignore", invalid="ignore"):
             if op == "ratio" and b is not None:
@@ -472,11 +801,37 @@ class Sample:
         return None if pop is None else pop.mask()
 
     # ------------------------------------------------------------------- scales
-    def default_scale(self, name: str) -> Scale:
-        ch = self.base_channel(name)
-        if name in self.computed:
-            from .transforms import LinearScale
+    def _is_time_channel(self, ch: Channel | None) -> bool:
+        if ch is None or ch.is_log_amplified or (ch.display or "").upper().startswith("LOG"):
+            return False
+        from .qc import is_time_parameter
 
+        return is_time_parameter(ch.name)
+
+    def time_span(self, name: str) -> tuple[float, float] | None:
+        """Axis range covering the acquired time values of a time channel
+        (0 .. 2 % above the last event), None before the data is loaded."""
+        ch = self.base_channel(name)
+        if self.fcs is None or not self._is_time_channel(ch):
+            return None
+        try:
+            values = np.asarray(self.fcs.column(ch.name), dtype=float)
+        except (KeyError, ValueError, IndexError):
+            return None
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return None
+        lo, hi = float(values.min()), float(values.max())
+        top = float(math.ceil(hi * 1.02)) if hi > 0 else 0.0
+        bottom = 0.0 if lo >= 0 else float(math.floor(lo * 1.02))
+        if top <= bottom:
+            return None
+        return bottom, top
+
+    def default_scale(self, name: str) -> Scale:
+        from .transforms import ArcsinhScale, LinearScale, LogicleScale, LogScale, default_biex, normalize_kind
+
+        if name in self.computed:
             info = self.computed_info.get(name, {})
             values = self.computed[name]
             finite = values[np.isfinite(values)]
@@ -489,51 +844,163 @@ class Sample:
             return LinearScale(lo - pad, hi + pad)
         if name in self.derived:
             spec = self.derived[name]
-            from .transforms import LinearScale, LogicleScale
-
+            kind = spec.get("kind")
+            if kind:
+                kind = normalize_kind(kind, "linear")
+                if kind == "linear":
+                    return LinearScale(float(spec.get("min", 0.0)), float(spec.get("max", 10.0)))
+                if kind == "log":
+                    return LogScale(float(spec.get("min", 1.0)), float(spec.get("max", 262144.0)))
+                if kind == "arcsinh":
+                    return ArcsinhScale(T=float(spec.get("max", 262144.0)))
+                return default_biex(float(spec.get("max", 262144.0)))
             if spec.get("op") in ("ratio", "log10"):
                 return LinearScale(spec.get("min", 0.0), spec.get("max", 10.0))
             return LogicleScale(T=spec.get("max", 262144.0))
+        ch = self.base_channel(name)
         if ch is None:
             return default_scale_for_channel(name)
         top = ch.range if ch.range and ch.range > 1 else 262144.0
-        return default_scale_for_channel(ch.name, ch.display, top, ch.is_log_amplified)
+        scale = default_scale_for_channel(
+            ch.name, ch.display, top, ch.is_log_amplified, log_decades=ch.log_decades, log_offset=ch.log_offset
+        )
+        if isinstance(scale, LinearScale) and self._is_time_channel(ch):
+            span = self.time_span(ch.name)
+            if span is not None:
+                return LinearScale(*span)
+        return scale
+
+    def _default_needs_data(self, key: str) -> bool:
+        """The default scale of `key` is computed from the events (time axes)."""
+        if key in self.computed or key in self.derived:
+            return False
+        return self._is_time_channel(self.base_channel(key))
 
     def scale(self, name: str) -> Scale:
-        s = self.scales.get(name)
+        """The transform of a parameter (shared by a raw parameter and its
+        compensated version), its default when nobody chose one."""
+        sc = self._scales
+        sc.settle()
+        key = self._scale_key(name)
+        s = dict.get(sc, key)
+        if s is None and key != name:
+            s = dict.pop(sc, name, None)  # stored under the compensated spelling
+            if s is not None:
+                dict.__setitem__(sc, key, s)
         if s is not None:
             return s
-        comp = self.comp
-        if comp is not None:
-            base = comp.base_name(name)
-            if base is not None and base != name:
-                # a compensated parameter follows its base channel's scale
-                # unless it was given one of its own
-                return self.scale(base)
-        s = self.default_scale(name)
-        self.scales[name] = s
+        s = self.default_scale(key)
+        if self.fcs is None and self._default_needs_data(key):
+            return s  # header only: computed from the data once it is loaded
+        dict.__setitem__(sc, key, s)
+        sc.auto.add(key)
         return s
 
+    def has_own_scale(self, name: str) -> bool:
+        """A transform was chosen for this parameter (not a cached default)."""
+        key = self._scale_key(name)
+        return key in self._scales and key not in self._scales.auto
+
     def set_scale(self, name: str, scale: Scale):
-        self.scales[name] = scale
-        self.invalidate_display()
+        """Set the transform of a parameter. A compensated name sets its raw
+        parameter's transform, which both share. Only the display values and
+        the gates that depend on this transform are invalidated."""
+        key = self._scale_key(name)
+        old = dict.get(self._scales, key)
+        self._scales[key] = scale
+        if old is not None and old == scale:
+            return
+        self.invalidate_param(key)
+
+    def reset_scale(self, name: str):
+        """Forget the chosen transform: the parameter shows its default again."""
+        key = self._scale_key(name)
+        if self._scales.pop(key, None) is not None:
+            self.invalidate_param(key)
 
     def invalidate_display(self):
         self._display_cache.clear()
         self.root.invalidate()
 
+    def invalidate_param(self, name: str) -> int:
+        """The transform of `name` changed: drop the display values of every
+        parameter using that transform (the raw and the compensated name) and
+        the masks of gates evaluated in display space on them (polygons,
+        ellipses; rectangles and ranges work on data values), their
+        descendants and boolean gates combining them. Returns the number of
+        masks dropped."""
+        return self.invalidate_params([name], data=False)
+
+    def invalidate_params(self, names: Iterable[str], data: bool = False) -> int:
+        """Selective invalidation. data=False: the transforms of `names`
+        changed. data=True: their values changed (derived parameters computed
+        from them follow)."""
+        names = list(names)
+        if data:
+            wanted = set(names)
+            return self._invalidate_data(self._data_dependency(lambda n: n in wanted))
+        keys = {self._scale_key(n) for n in names}
+
+        def shown(n: str) -> bool:
+            return self._scale_key(n) in keys
+
+        for n in [n for n in self._display_cache if shown(n)]:
+            del self._display_cache[n]
+        return self.root.invalidate_where(lambda g: not isinstance(g, RectangleGate) and any(shown(d) for d in g.dims))
+
+    def _data_dependency(self, changed: Callable[[str], bool]) -> Callable[[str], bool]:
+        """Extend `changed` (name -> its values changed) to the derived
+        parameters computed from such names."""
+        memo: dict[str, bool] = {}
+
+        def dep(n: str, stack: tuple = ()) -> bool:
+            if n in memo:
+                return memo[n]
+            hit = bool(changed(n))
+            if not hit and n in self.derived and n not in stack:
+                inputs = _derived_inputs(self.derived[n])
+                hit = True if inputs is None else any(dep(i, stack + (n,)) for i in inputs)
+            memo[n] = hit
+            return hit
+
+        return dep
+
+    def _invalidate_data(self, dep: Callable[[str], bool]) -> int:
+        for n in [n for n in self._display_cache if dep(n)]:
+            del self._display_cache[n]
+        for n in [n for n in self._derived_cache if dep(n)]:
+            del self._derived_cache[n]
+        return self.root.invalidate_where(lambda g: any(dep(d) for d in g.dims))
+
     def set_compensation(self, matrix: SpilloverMatrix | None, enabled: bool = True):
+        """Change the matrix. Raw parameters, computed parameters and
+        everything derived only from them keep their caches and masks."""
         self.comp = matrix
         self.comp_enabled = enabled
         self.comp_cleared = matrix is None
         self._comp_cache = None
-        self._derived_cache.clear()
-        self.invalidate_display()
+        raw = self._channel_set()
+
+        def changed(n: str) -> bool:
+            # compensated names, and names nothing provides (a matrix may add them)
+            return n not in raw and n not in self.computed and n not in self.derived
+
+        self._invalidate_data(self._data_dependency(changed))
 
     def add_derived(self, name: str, spec: dict):
         self.derived[name] = dict(spec)
+        if name in self._scales.auto:
+            self._scales.pop(name, None)  # default of the previous definition
         self._derived_cache.pop(name, None)
-        self.invalidate_display()
+        self.invalidate_params([name], data=True)
+
+    def remove_derived(self, name: str):
+        """Remove a derived parameter, its transform and what was computed from it."""
+        if self.derived.pop(name, None) is None:
+            return
+        self._scales.pop(name, None)
+        self._derived_cache.pop(name, None)
+        self.invalidate_params([name], data=True)
 
     def add_computed(self, name: str, values: np.ndarray, info: dict | None = None):
         """Add a computed parameter (one value per event; NaN = not computed)."""
@@ -545,15 +1012,132 @@ class Sample:
         self.computed[name] = arr
         self.computed_info[name] = dict(info or {})
         self.scales.pop(name, None)
-        self._display_cache.pop(name, None)
-        self.root.invalidate()
+        self.invalidate_params([name], data=True)
 
     def remove_computed(self, name: str):
         self.computed.pop(name, None)
         self.computed_info.pop(name, None)
         self.scales.pop(name, None)
-        self._display_cache.pop(name, None)
-        self.root.invalidate()
+        self.invalidate_params([name], data=True)
+
+    def estimate_scale(self, name: str, percentile: float = 5.0) -> Scale:
+        """A biexponential transform whose width basis fits the negative
+        spread of this parameter's (compensated) data (transforms.estimate_biex)."""
+        from .transforms import estimate_biex
+
+        ch = self.base_channel(name)
+        top = ch.range if ch is not None and ch.range and ch.range > 1 else 262144.0
+        return estimate_biex(self.data(name), top, percentile=percentile)
+
+    def auto_adjust_scales(self, names: Iterable[str] | None = None, only_defaults: bool = True) -> list[str]:
+        """Give compensated fluorescence parameters a data-driven width basis
+        (FlowJo's auto-adjusted biexponential after compensation). Parameters
+        whose transform somebody chose are left alone unless only_defaults is
+        False; only biexponential transforms are adjusted. Returns the raw keys
+        changed."""
+        from .transforms import LogicleScale
+
+        comp = self._comp_active()
+        if names is None:
+            names = [c for c in comp.compensated_names if comp.base_name(c) in self._channel_set()] if comp else []
+        changed = []
+        for name in names:
+            key = self._scale_key(name)
+            if only_defaults and self.has_own_scale(key):
+                continue
+            if not isinstance(self.scale(name), LogicleScale):
+                continue
+            try:
+                new = self.estimate_scale(name)
+            except KeyError:
+                continue
+            if new != self.scale(name):
+                self.set_scale(key, new)
+                changed.append(key)
+        return changed
+
+    # ------------------------------------------------------------ worker copies
+    def detached_copy(self) -> "Sample":
+        """A copy sharing no mutable state with this sample (gates cloned,
+        scales copied, event arrays shared read-only) that a worker thread may
+        load and gate; adopt() takes the results back on the GUI thread."""
+        c = Sample(self.path, self.id)
+        c._detached = True
+        c.name = self.name
+        c.version = self.version
+        c.keywords = dict(self.keywords)
+        c.channels = list(self.channels)
+        c.comp = self.comp.copy(self.comp.name) if self.comp is not None else None
+        c.comp_enabled = self.comp_enabled
+        c.comp_cleared = self.comp_cleared
+        c.derived = {k: dict(v) for k, v in self.derived.items()}
+        c.computed = dict(self.computed)
+        c.computed_info = {k: dict(v) for k, v in self.computed_info.items()}
+        c.scales = {k: v.copy() for k, v in self.scales.items()}
+        c.scales.auto = set(self.scales.auto)
+        c._was_unloaded = self._was_unloaded
+        root = self.root.clone(deep=True)
+        root.name = self.name
+        c.root = root
+        root._attach(c)
+        c.fcs = self.fcs
+        return c
+
+    def state_fingerprint(self) -> str:
+        """Everything population membership depends on, as a string (used to
+        tell whether results computed on a detached copy still apply)."""
+        from .gates import POLYGON_SETTINGS
+
+        self._scales.settle()
+        explicit = {k: v.to_dict() for k, v in dict.items(self._scales) if k not in self._scales.auto}
+        payload = {
+            "path": str(self.path),
+            "channels": [c.name for c in self.channels],
+            "scales": explicit,
+            "comp": self.comp.to_dict() if self.comp is not None else None,
+            "comp_enabled": bool(self.comp_enabled),
+            "derived": self.derived,
+            "computed": sorted((k, id(v)) for k, v in self.computed.items()),
+            "tree": [(p.path, p.gate.to_dict() if p.gate is not None else None) for p in self.root.walk()],
+            "polygon": dict(POLYGON_SETTINGS),
+        }
+        return json.dumps(payload, sort_keys=True, default=str)
+
+    def adopt(self, copy: "Sample", fingerprint: str | None = None) -> bool:
+        """Take over what a detached copy computed in a worker thread: its
+        event data when this sample has none, and - when nothing membership
+        depends on changed since the copy was made (`fingerprint`, from
+        state_fingerprint() at that time) - its cached values and population
+        masks. GUI thread only. Returns True when the masks were taken."""
+        if copy is None or copy.fcs is None or copy.path != self.path:
+            return False
+        if self.fcs is None:
+            self.attach_fcs(copy.fcs)
+        if self.fcs is None or self.fcs.n_events != copy.fcs.n_events:
+            return False
+        if fingerprint is None or fingerprint != self.state_fingerprint():
+            return False
+        mine, theirs = self._scales, copy._scales
+        for k in theirs.auto:
+            a, b = dict.get(mine, k), dict.get(theirs, k)
+            if a is not None and b is not None and a != b:
+                return False
+        for k in theirs.auto:
+            if dict.get(mine, k) is None and dict.get(theirs, k) is not None:
+                dict.__setitem__(mine, k, dict.get(theirs, k))
+                mine.auto.add(k)
+        comp = self._comp_active()
+        if copy._comp_cache is not None and self._comp_cache is None and comp is not None:
+            self._comp_cache = (comp, copy._comp_cache[1])
+        for k, v in copy._display_cache.items():
+            self._display_cache.setdefault(k, v)
+        for k, v in copy._derived_cache.items():
+            self._derived_cache.setdefault(k, v)
+        n = self.n_events
+        for own, other in zip(self.root.walk(), copy.root.walk()):
+            if own._mask is None and other._mask is not None and other._mask.shape == (n,):
+                own._mask = other._mask
+        return True
 
     # -------------------------------------------------------------- populations
     def export_population_fcs(self, population: Population, path: Path | str, compensated: bool = False):
@@ -685,6 +1269,7 @@ class Group:
         self.root = Population(name)
         self.color = color
         self.bold = bold
+        self.italic = False
         self.live = True
         self.expanded = True
 
@@ -719,8 +1304,112 @@ def default_compensation_group() -> Group:
     return g
 
 
+def _notify_loaded(sample: Sample):
+    """A sample read its events: let the memory budget of its workspace
+    release least-recently-used samples if the cap is exceeded."""
+    for budget in list(_BUDGETS):
+        if budget.limit_bytes is not None and budget.owns(sample):
+            budget.enforce(keep=sample)
+
+
+class MemoryBudget:
+    """Cap on the event data a workspace keeps in memory (FlowJo's
+    size-limited data cache).
+
+    When a sample reads its events and the samples' resident data
+    (Sample.resident_bytes) exceeds ``limit_mb``, the least-recently used
+    samples are released (Sample.unload) until the total fits again; they
+    reload transparently on their next data() / mask(). Samples shown in open
+    windows must stay: the window layer lists them in ``pinned`` (sample ids)
+    or provides ``pin_provider`` (a callable returning samples or ids), e.g.::
+
+        ws.memory_budget.limit_mb = prefs.get("memory_limit_mb", 2048)
+        ws.memory_budget.pin_provider = lambda: [w.sample for w in graph_windows]
+
+    ``limit_mb`` None or 0 means no cap (the default of a bare Workspace).
+    """
+
+    def __init__(self, workspace: "Workspace", limit_mb: float | None = None):
+        self._workspace = weakref.ref(workspace)
+        self.limit_mb = limit_mb
+        self.pinned: set[int] = set()
+        self.pin_provider: Callable[[], Iterable] | None = None
+        self.released = 0  # samples released so far
+        _BUDGETS.add(self)
+
+    @property
+    def limit_bytes(self) -> int | None:
+        try:
+            mb = float(self.limit_mb or 0)
+        except (TypeError, ValueError):
+            return None
+        return int(mb * 1024 * 1024) if mb > 0 else None
+
+    def samples(self) -> list[Sample]:
+        ws = self._workspace()
+        return list(ws.samples) if ws is not None else []
+
+    def owns(self, sample: Sample) -> bool:
+        return any(s is sample for s in self.samples())
+
+    def loaded_samples(self) -> list[Sample]:
+        return [s for s in self.samples() if s.fcs is not None]
+
+    def resident_bytes(self) -> int:
+        return sum(s.resident_bytes() for s in self.loaded_samples())
+
+    def pinned_ids(self) -> set[int]:
+        ids = set(self.pinned)
+        if self.pin_provider is not None:
+            try:
+                for item in self.pin_provider() or ():
+                    if item is None:
+                        continue
+                    ids.add(item.id if isinstance(item, Sample) else int(item))
+            except Exception:  # noqa: BLE001 - a broken provider must not stop loading
+                pass
+        return ids
+
+    def enforce(self, keep: Sample | None = None) -> list[Sample]:
+        """Release least-recently-used, unpinned samples (never `keep`) until
+        the resident data fits the cap. Returns the samples released."""
+        limit = self.limit_bytes
+        if limit is None:
+            return []
+        loaded = self.loaded_samples()
+        sizes = {id(s): s.resident_bytes() for s in loaded}
+        total = sum(sizes.values())
+        if total <= limit:
+            return []
+        pinned = self.pinned_ids()
+        released = []
+        for s in sorted((s for s in loaded if s is not keep and s.id not in pinned), key=lambda s: s.last_used):
+            if total <= limit:
+                break
+            if s.unload():
+                total -= sizes[id(s)]
+                released.append(s)
+        self.released += len(released)
+        return released
+
+
+_SAMPLE_PATH = operator.attrgetter("path")
+
+
+def _path_key(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(path))
+
+
 class Workspace:
     def __init__(self):
+        self.memory_budget = MemoryBudget(self)
+        self._path_seen: dict[int, tuple] = {}  # id(sample) -> (sample, path, resolved path)
+        self._path_index: dict[Path, Sample] = {}
+        self._index_ids: tuple = ()
+        self._index_paths: tuple = ()
         self.samples: list[Sample] = []
         self.groups: list[Group] = [Group("All Samples", role="all", bold=True), default_compensation_group()]
         self.matrices: dict[str, SpilloverMatrix] = {}
@@ -741,31 +1430,56 @@ class Workspace:
         return self.path.stem if self.path else "Untitled"
 
     def next_sample_id(self) -> int:
-        used = {s.id for s in self.samples}
-        while self._next_id in used:
-            self._next_id += 1
         sid = self._next_id
-        self._next_id += 1
+        if any(s.id >= sid for s in self.samples):
+            used = {s.id for s in self.samples}
+            while sid in used:
+                sid += 1
+        self._next_id = sid + 1
         return sid
 
+    def _sync_path_index(self):
+        """Keep the resolved-path index in step with the sample list (which
+        loaders append to directly) and with relocated sample paths; only new
+        or moved samples are resolved again. The index holds the samples, so
+        their ids stay unique while they are compared."""
+        samples = self.samples
+        ids = tuple(map(id, samples))
+        paths = tuple(map(_SAMPLE_PATH, samples))
+        if ids == self._index_ids and paths == self._index_paths:
+            return
+        seen = self._path_seen
+        new_seen: dict[int, tuple] = {}
+        index: dict[Path, Sample] = {}
+        for s in samples:
+            e = seen.get(id(s))
+            if e is None or e[0] is not s or e[1] != s.path:
+                e = (s, s.path, _path_key(s.path))
+            new_seen[id(s)] = e
+            index.setdefault(e[2], s)
+        self._path_seen = new_seen
+        self._path_index = index
+        self._index_ids = ids
+        self._index_paths = paths
+
     def sample_by_path(self, path: Path | str) -> Sample | None:
-        p = Path(path).resolve()
-        for s in self.samples:
-            try:
-                if s.path.resolve() == p:
-                    return s
-            except OSError:
-                continue
-        return None
+        self._sync_path_index()
+        return self._path_index.get(_path_key(Path(path)))
 
     def add_sample(self, path: Path | str, sample_id: int | None = None, load_header: bool = True) -> Sample:
-        existing = self.sample_by_path(path)
+        key = _path_key(Path(path))
+        self._sync_path_index()
+        existing = self._path_index.get(key)
         if existing is not None:
             return existing
         sample = Sample(path, sample_id if sample_id is not None else self.next_sample_id())
         if load_header:
             sample.load_header()
         self.samples.append(sample)
+        self._path_seen[id(sample)] = (sample, sample.path, key)
+        self._path_index.setdefault(key, sample)
+        self._index_ids += (id(sample),)
+        self._index_paths += (sample.path,)
         for group in self.groups:
             if group.contains(sample):
                 self.apply_template(group, sample)

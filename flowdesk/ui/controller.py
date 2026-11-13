@@ -43,6 +43,9 @@ DEFAULT_PREFERENCES = {
     "axis_label_style": "name_stain",  # name_stain | name | stain
     "default_transform": "logicle",  # logicle | log | linear | arcsinh
     "default_width_basis": -100.0,
+    "auto_width_basis": False,  # data-driven biexponential width basis for compensated parameters
+    "memory_limit_mb": 2048,  # resident event data per workspace; 0 = no cap (least-recently-used samples unload)
+    "loader_threads": 0,  # background FCS loader threads; 0 = automatic
     "histogram_bins": 256,
     "histogram_ymode": "count",  # count | mode (normalize to mode)
     "apply_to_group_default": False,  # new gates are copied to the current group

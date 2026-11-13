@@ -285,3 +285,67 @@ def test_default_scale_display_hints():
     assert isinstance(default_scale_for_channel("FSC-A", "LOG"), LogicleScale)
     assert isinstance(default_scale_for_channel("SSC-A", "Logarithmic,4,0.1"), LogicleScale)
     assert default_scale_for_channel("FITC-A", "LIN", top=1000).max == 1000.0
+
+
+def test_default_scale_log_amplified_covers_decoded_range():
+    from flowdesk.core.transforms import default_scale_for_channel
+
+    # $PnE = 4,1 on a 1024-channel ADC decodes to 1 .. 10^4
+    s = default_scale_for_channel("FL1-H", top=1024, log_amplified=True, log_decades=4, log_offset=1)
+    assert (s.min, s.max) == (1.0, 10000.0)
+    # offset 0 (FCS 3.0 legacy) means 1
+    s = default_scale_for_channel("FL2-H", top=256, log_amplified=True, log_decades=3, log_offset=0)
+    assert (s.min, s.max) == (1.0, 1000.0)
+    s = default_scale_for_channel("FL3-H", top=1024, log_amplified=True, log_decades=4, log_offset=0.1)
+    assert s.min == pytest.approx(0.1) and s.max == pytest.approx(1000.0)
+
+
+def test_scale_defaults_follow_preferences():
+    from flowdesk.core.transforms import (
+        SCALE_DEFAULTS,
+        ArcsinhScale,
+        default_fluorescence_scale,
+        default_scale_for_channel,
+        set_scale_defaults,
+    )
+
+    saved = dict(SCALE_DEFAULTS)
+    try:
+        assert not set_scale_defaults("logicle", -100.0)  # the built-in default: nothing changes
+        assert default_scale_for_channel("FITC-A") == default_biex(T)
+        assert set_scale_defaults("arcsinh", -50)
+        s = default_scale_for_channel("FITC-A", top=T)
+        assert isinstance(s, ArcsinhScale) and s.T == T
+        assert isinstance(default_scale_for_channel("FSC-A"), LinearScale)  # scatter stays linear
+        set_scale_defaults("biex", 50)  # positive spelling and aliases are accepted
+        s = default_scale_for_channel("PE-A", top=T)
+        assert isinstance(s, LogicleScale) and s.width_basis == pytest.approx(-50)
+        assert default_scale_for_channel("PE-A", "LOG", top=T).width_basis == pytest.approx(-50)
+        set_scale_defaults("log", None)
+        assert isinstance(default_fluorescence_scale(T), LogScale) and default_fluorescence_scale(T).max == T
+        set_scale_defaults("linear")
+        assert default_fluorescence_scale(1000.0) == LinearScale(0, 1000)
+        # explicit arguments win over the defaults
+        assert default_fluorescence_scale(T, "logicle", -300).width_basis == pytest.approx(-300)
+    finally:
+        SCALE_DEFAULTS.clear()
+        SCALE_DEFAULTS.update(saved)
+
+
+def test_estimate_biex_fits_negative_spread():
+    from flowdesk.core.transforms import estimate_biex
+
+    rng = np.random.default_rng(0)
+    narrow = np.concatenate([rng.normal(0, 30, 5000), rng.lognormal(9, 0.5, 5000)])
+    wide = np.concatenate([rng.normal(0, 600, 5000), rng.lognormal(9, 0.5, 5000)])
+    a, b = estimate_biex(narrow, T), estimate_biex(wide, T)
+    assert isinstance(a, LogicleScale) and isinstance(b, LogicleScale)
+    assert -100 < a.width_basis < -10
+    assert b.width_basis < -500 and b.W > a.W  # wider negative spread -> wider linear region
+    # the 5th percentile is shown inside the axis
+    assert b.forward_scalar(np.percentile(wide, 5)) > 0.0
+    # no negative events / no events: the narrowest width (-10), never invalid
+    assert estimate_biex(np.abs(narrow) + 1, T).width_basis == pytest.approx(-10)
+    assert estimate_biex(np.array([]), T).width_basis == pytest.approx(-10)
+    # huge spreads are capped at a 1.5-decade linear region
+    assert estimate_biex(rng.normal(0, 1e6, 1000), T).W == pytest.approx(1.5, abs=0.01)

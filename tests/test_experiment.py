@@ -250,3 +250,144 @@ def test_apply_fdw_as_template(window, tmp_path):
     report = ext(window).apply_template(str(fdw), replace_groups=False)
     assert report["groups"] >= 1
     assert c.workspace.group_by_name("FromWorkspace") is not None
+
+
+def _write_xlsx(path, rows):
+    """A minimal .xlsx (shared strings for text, numbers as values)."""
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    shared: list[str] = []
+
+    def cell(ref, value):
+        if isinstance(value, (int, float)):
+            return f'<c r="{ref}"><v>{value}</v></c>'
+        if value not in shared:
+            shared.append(value)
+        return f'<c r="{ref}" t="s"><v>{shared.index(value)}</v></c>'
+
+    body = []
+    for r, row in enumerate(rows, start=1):
+        cells = "".join(cell(f"{chr(65 + k)}{r}", v) for k, v in enumerate(row) if v != "")
+        body.append(f'<row r="{r}">{cells}</row>')
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    rel_ns = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    sheet = f'<?xml version="1.0" encoding="UTF-8"?><worksheet {ns}><sheetData>{"".join(body)}</sheetData></worksheet>'
+    sst = f'<?xml version="1.0" encoding="UTF-8"?><sst {ns}>' + "".join(f"<si><t>{escape(s)}</t></si>" for s in shared) + "</sst>"
+    workbook = f'<?xml version="1.0" encoding="UTF-8"?><workbook {ns} {rel_ns}><sheets><sheet name="Keywords" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    rels = ('<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/data.xml"/></Relationships>')
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", rels)
+        zf.writestr("xl/worksheets/data.xml", sheet)
+        zf.writestr("xl/sharedStrings.xml", sst)
+    return path
+
+
+def test_keyword_table_import_all_columns(window, tmp_path):
+    from flowdesk.ui.experiment import AddKeywordDialog
+
+    c = window.controller
+    samples = c.workspace.samples
+    path = tmp_path / "design.csv"
+    path.write_text(
+        "Sample,Donor,Treatment,Timepoint\n"
+        "Plate1_A1.fcs,D1,Stim,0h\n"
+        "plate1_b2,D2,Unstim,24h\n"
+        "Plate1_A10.fcs,D1,,48h\n"
+        "Unknown.fcs,D9,Stim,0h\n",
+        encoding="utf-8",
+    )
+    undo_depth = len(c._undo)
+    dlg = AddKeywordDialog(c, samples, window)
+    dlg.set_mode(AddKeywordDialog.MODE_CSV)
+    dlg.csv_edit.setText(str(path))
+    assert dlg.column_combo.currentText() == AddKeywordDialog.ALL_COLUMNS
+    assert dlg.multi_column() and not dlg.name_edit.isEnabled()
+    # the preview shows one column per keyword
+    assert dlg.preview.columnCount() == 4
+    assert [dlg.preview.horizontalHeaderItem(k).text() for k in range(4)] == ["Sample", "Donor", "Treatment", "Timepoint"]
+    row = [s.name for s in samples].index("Plate1_B2.fcs")
+    assert [dlg.preview.item(row, k).text() for k in range(1, 4)] == ["D2", "Unstim", "24h"]
+    assert "3 of 4 samples will get 3 keywords" in dlg.status.text()
+    dlg.accept()  # no keyword name needed for a multi-column import
+    by = {s.name: s for s in samples}
+    assert by["Plate1_A1.fcs"].keywords["Donor"] == "D1" and by["Plate1_A1.fcs"].keywords["Treatment"] == "Stim"
+    assert by["Plate1_B2.fcs"].keywords["Timepoint"] == "24h"
+    assert "Treatment" not in by["Plate1_A10.fcs"].keywords and by["Plate1_A10.fcs"].keywords["Timepoint"] == "48h"
+    assert "Donor" not in by["Plate1_A2.fcs"].keywords
+    # all three keywords in one undo step
+    assert len(c._undo) == undo_depth + 1 and c.undo_label() == "import 3 keywords"
+    c.undo()
+    assert not any(k in s.keywords for s in samples for k in ("Donor", "Treatment", "Timepoint"))
+
+    # one column only: the keyword is named after its header (or as typed)
+    dlg = AddKeywordDialog(c, samples, window)
+    dlg.set_mode(AddKeywordDialog.MODE_CSV)
+    dlg.csv_edit.setText(str(path))
+    dlg.column_combo.setCurrentText("Treatment")
+    assert dlg.name_edit.isEnabled() and dlg.name_edit.text() == "Treatment"
+    assert dlg.preview.columnCount() == 2
+    dlg.name_edit.setText("Condition")
+    assert dlg.apply() == 2
+    assert by["Plate1_A1.fcs"].keywords["Condition"] == "Stim" and "Donor" not in by["Plate1_A1.fcs"].keywords
+
+
+def test_keyword_table_xlsx(window, tmp_path):
+    from flowdesk.ui.experiment import AddKeywordDialog, read_keyword_table
+
+    path = _write_xlsx(tmp_path / "design.xlsx", [["Sample", "Donor", "Dose"], ["Plate1_A1.fcs", "D1", 10], ["Plate1_A2", "D2", 2.5]])
+    header, rows = read_keyword_table(path)
+    assert header == ["Sample", "Donor", "Dose"]
+    assert rows == [["Plate1_A1.fcs", "D1", "10"], ["Plate1_A2", "D2", "2.5"]]
+    c = window.controller
+    dlg = AddKeywordDialog(c, c.workspace.samples, window)
+    dlg.set_mode(AddKeywordDialog.MODE_CSV)
+    dlg.csv_edit.setText(str(path))
+    assert dlg.preview.columnCount() == 3
+    assert dlg.apply() == 2
+    by = {s.name: s for s in c.workspace.samples}
+    assert by["Plate1_A2.fcs"].keywords["Dose"] == "2.5" and by["Plate1_A1.fcs"].keywords["Donor"] == "D1"
+
+
+def test_read_keyword_table_formats(tmp_path):
+    from flowdesk.ui.experiment import read_keyword_csv, read_keyword_table, table_keywords
+
+    p = tmp_path / "t.tsv"
+    p.write_text("a.fcs\tx\ty\nb.fcs\tz\n", encoding="utf-8")
+    header, rows = read_keyword_table(p)
+    assert header is None and rows == [["a.fcs", "x", "y"], ["b.fcs", "z"]]
+    assert table_keywords(header, rows) == ["Column 2", "Column 3"]
+    mapping, name = read_keyword_csv(p)
+    assert mapping == {"a.fcs": "x", "b.fcs": "z"} and name is None
+
+
+def test_acquisition_time_and_event_rate(app, tmp_path):
+    from pathlib import Path
+
+    from flowdesk.core.model import Sample
+    from flowdesk.ui.experiment import acquisition_duration, event_rate, parse_fcs_time, sample_info, sample_info_text
+
+    assert parse_fcs_time("10:00:30") == 36030.0
+    assert parse_fcs_time("10:00:30:30") == 36030.5  # FCS 3.0: 1/60 s
+    assert parse_fcs_time("10:00:30.25") == 36030.25  # FCS 3.1: fractions
+    assert parse_fcs_time("garbage") is None
+    s = Sample(Path(tmp_path / "x.fcs"), 1)
+    s.keywords.update({"$BTIM": "23:59:50", "$ETIM": "00:00:10", "$TOT": "1000"})
+    assert acquisition_duration(s) == 20.0  # wraps past midnight
+    assert event_rate(s) == 50.0
+    info = sample_info(s)
+    text = sample_info_text(info)
+    assert "Acquisition time: 20.0 s" in text and "Event rate: 50 events/s" in text
+    s.keywords.pop("$ETIM")
+    assert acquisition_duration(s) is None and event_rate(s) is None
+    # loaded data with $TIMESTEP: the Time channel span decides
+    events = np.column_stack([np.linspace(0, 4000, 500), np.ones(500)]).astype(np.float32)
+    p = tmp_path / "timed.fcs"
+    write_fcs(p, events, [Channel(1, "Time"), Channel(2, "FSC-A")], extra_keywords={"$TIMESTEP": "0.01", "$BTIM": "10:00:00", "$ETIM": "10:05:00"})
+    t = Sample(p, 2)
+    t.load_header()
+    assert acquisition_duration(t) == 300.0  # header only: $ETIM - $BTIM
+    assert t.ensure_loaded()
+    assert acquisition_duration(t) == pytest.approx(40.0)

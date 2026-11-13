@@ -173,6 +173,31 @@ def real_tcell_panel() -> Path:
     return REAL_TCELL_PANEL
 
 
+# ------------------------------------------------------- simulated key state
+@pytest.fixture(autouse=True)
+def _clear_simulated_modifiers():
+    """Undo what QTest.keyClick(..., ControlModifier) leaves behind.
+
+    On the offscreen platform a simulated Ctrl+key keeps QApplication.keyboardModifiers()
+    at ControlModifier until a modifier-less key event arrives.  Every later test then
+    sees a held Ctrl: QTableWidget.selectRow() toggles instead of selecting, clicks
+    extend selections, and so on.  A plain key release clears it.
+    """
+    yield
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication, QLineEdit
+    except ImportError:  # core-only environment
+        return
+    if QApplication.instance() is None:
+        return
+    if QApplication.keyboardModifiers() != Qt.KeyboardModifier.NoModifier:
+        probe = QLineEdit()
+        QTest.keyRelease(probe, Qt.Key.Key_Control)
+        probe.deleteLater()
+
+
 # ---------------------------------------------------------------- Qt shutdown
 # Widgets that PySide believes Python owns (e.g. buttons added to a layout
 # before that layout had a parent widget, then re-parented by Qt) are freed

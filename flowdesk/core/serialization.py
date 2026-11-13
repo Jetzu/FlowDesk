@@ -206,6 +206,7 @@ def group_to_dict(group: Group) -> dict:
         "root": population_to_dict(group.root),
         "color": group.color,
         "bold": group.bold,
+        "italic": bool(getattr(group, "italic", False)),
         "live": group.live,
     }
 
@@ -213,6 +214,7 @@ def group_to_dict(group: Group) -> dict:
 def group_from_dict(d: dict) -> Group:
     g = Group(d.get("name", "Group"), d.get("role", "custom"), [Criterion.from_dict(c) for c in d.get("criteria", [])], d.get("color", "#000000"), bool(d.get("bold", False)))
     g.id = d.get("id", g.id)
+    g.italic = bool(d.get("italic", False))
     g.sample_ids = set(int(i) for i in d.get("sample_ids", []))
     g.live = bool(d.get("live", True))
     if d.get("root"):
@@ -592,6 +594,7 @@ def _restore_groups(ws: Workspace, dicts: list[dict], objects: dict | None = Non
         g.sample_ids = set(int(i) for i in d.get("sample_ids", []))
         g.color = d.get("color", g.color)
         g.bold = bool(d.get("bold", False))
+        g.italic = bool(d.get("italic", False))
         g.live = bool(d.get("live", True))
         if d.get("root"):
             _merge_population(g.root, d["root"])

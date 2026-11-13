@@ -350,3 +350,191 @@ def test_undo_well_assignment(window, tmp_path):
     ed.unassign_selected()
     ed.pattern_edit.editingFinished.emit()
     assert c.undo_label() == label
+
+
+DESIGN = ["P_A1.fcs", "P_A2.fcs", "P_A3.fcs", "P_B1.fcs", "P_B2.fcs", "P_B3.fcs", "P_C2.fcs"]
+
+
+@pytest.fixture
+def design(app, tmp_path):
+    from flowdesk.ui.main_window import MainWindow
+
+    win = MainWindow()
+    win.controller.add_samples(make_files(tmp_path, DESIGN))
+    app.processEvents()
+    yield win
+    ext = win.extensions["flowdesk.ui.plate_editor"]
+    if ext.editor is not None:
+        ext.editor.hide()
+    win.controller.workspace.modified = False
+    win.hide()
+    win.deleteLater()
+
+
+def _press(app, widget, pos, typ=None, buttons=None, mods=Qt.KeyboardModifier.NoModifier):
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QMouseEvent
+
+    typ = typ or QEvent.Type.MouseButtonPress
+    btn = Qt.MouseButton.LeftButton
+    held = btn if buttons is None else buttons
+    app.sendEvent(widget, QMouseEvent(typ, pos, widget.mapToGlobal(pos.toPoint()), Qt.MouseButton.NoButton if typ == QEvent.Type.MouseMove else btn, held, mods))
+
+
+def test_row_header_set_keyword_and_fill_series(design, app):
+    c = design.controller
+    ed = editor(design)
+    plate = ed.plate
+    plate.resize(760, 500)
+    w, h = plate._cell()
+    row_b = QPointF(5, plate.HEADER + 1.5 * h)
+    assert plate.header_at(row_b) == ("row", 1)
+    assert plate.header_at(QPointF(plate.HEADER + 2.5 * w, 5)) == ("col", 2)
+    assert plate.header_at(QPointF(3, 3)) == ("all", -1)
+    assert plate.header_at(QPointF(plate.HEADER + 5, plate.HEADER + 5)) is None
+    _press(app, plate, row_b)  # clicking the row letter B
+    assert plate.selected == {(1, 0), (1, 1), (1, 2)}
+    assert {s.name for s in c.selected_samples()} == {"P_B1.fcs", "P_B2.fcs", "P_B3.fcs"}  # selected in the workspace
+    assert ed.keyword_btn.isEnabled() and ed.series_btn.isEnabled()
+    assert ed.set_keyword_on_selection("Treatment", "X") == 3
+    assert {s.name for s in c.workspace.samples if s.keywords.get("Treatment") == "X"} == {"P_B1.fcs", "P_B2.fcs", "P_B3.fcs"}
+    assert c.undo_label() == "set keyword Treatment"
+    # a concentration series across the columns of row B: 10, 20, 40
+    plan = ed.fill_series("Concentration", start=10, factor=2, direction="columns")
+    assert plan == {(1, 0): "10", (1, 1): "20", (1, 2): "40"}
+    assert [by_name(design, f"P_B{k}.fcs").keywords["Concentration"] for k in (1, 2, 3)] == ["10", "20", "40"]
+    assert c.undo_label() == "set keyword Concentration"
+    c.undo()
+    assert "Concentration" not in by_name(design, "P_B1.fcs").keywords
+    # column header, Ctrl adds a row, the corner selects every well
+    ed.click_header("col", 1)
+    assert plate.selected == {(0, 1), (1, 1), (2, 1)}
+    ed.click_header("row", 0, Qt.KeyboardModifier.ControlModifier)
+    assert plate.selected == {(0, 0), (0, 1), (0, 2), (1, 1), (2, 1)}
+    ed.click_header("all", -1)
+    assert plate.selected == set(ed.wells)
+    # a series down the rows of column 2 and a list of values
+    ed.select_column(1)
+    assert ed.fill_series("Dose", start=1, step=1, direction="rows") == {(0, 1): "1", (1, 1): "2", (2, 1): "3"}
+    ed.select_row(0)
+    assert ed.fill_series("Stim", values=["none", "PMA"], direction="columns") == {(0, 0): "none", (0, 1): "PMA", (0, 2): "none"}
+    assert by_name(design, "P_A2.fcs").keywords["Stim"] == "PMA"
+
+
+def test_rubber_band_selection(design, app):
+    from PySide6.QtCore import QEvent
+
+    ed = editor(design)
+    plate = ed.plate
+    plate.resize(760, 500)
+    start = plate.well_rect(0, 0).center()
+    end = plate.well_rect(1, 1).center()
+    _press(app, plate, start)
+    assert plate.selected == {(0, 0)}
+    _press(app, plate, (start + end) / 2, QEvent.Type.MouseMove)
+    _press(app, plate, end, QEvent.Type.MouseMove)
+    assert plate.rubber is not None
+    _press(app, plate, end, QEvent.Type.MouseButtonRelease, Qt.MouseButton.NoButton)
+    assert plate.rubber is None
+    assert plate.selected == {(0, 0), (0, 1), (1, 0), (1, 1)}
+    assert {s.name for s in design.controller.selected_samples()} == {"P_A1.fcs", "P_A2.fcs", "P_B1.fcs", "P_B2.fcs"}
+
+
+def test_series_values_and_dialogs(design):
+    from flowdesk.ui.plate_editor import FillSeriesDialog, WellKeywordDialog, format_number, series_values
+
+    wells = [(0, 3), (0, 4), (1, 3), (1, 4)]
+    assert series_values(wells, 100, 0.5) == {(0, 3): "100", (0, 4): "50", (1, 3): "100", (1, 4): "50"}
+    assert series_values(wells, 0, 1, 2.5, "rows") == {(0, 3): "0", (0, 4): "0", (1, 3): "2.5", (1, 4): "2.5"}
+    assert format_number(1e6) == "1000000" and format_number(1 / 3) == "0.3333333333"
+    dlg = WellKeywordDialog(["Treatment"], 3, design)
+    dlg.name_combo.setCurrentText("Treatment")
+    dlg.value_edit.setText("aCD3")
+    assert dlg.values() == ("Treatment", "aCD3")
+    dlg = FillSeriesDialog([], design)
+    dlg.name_combo.setCurrentText("Concentration")
+    dlg.start_spin.setValue(10)
+    dlg.factor_spin.setValue(2)
+    assert dlg.values() == {"name": "Concentration", "direction": "columns", "start": 10.0, "factor": 2.0, "step": 0.0}
+    dlg.rb_list.setChecked(True)
+    dlg.list_edit.setText("a, b")
+    dlg.direction_combo.setCurrentIndex(1)
+    assert dlg.values() == {"name": "Concentration", "direction": "rows", "values": ["a", "b"]}
+
+
+def test_manual_placement_writes_well_keyword(window):
+    from flowdesk.ui.plate_editor import WELL_KEYWORD
+
+    c = window.controller
+    ed = editor(window)
+    control = by_name(window, "Control.fcs")
+    ed.unassigned_list.setCurrentRow(0)
+    ed.click_well(2, 6)
+    assert control.keywords[WELL_KEYWORD] == "C7"  # Edit Columns… can show it
+    assert c.undo_label() == "assign Control.fcs to C7"
+    c.undo()
+    assert WELL_KEYWORD not in control.keywords and (2, 6) not in ed.wells
+    c.redo()
+    assert control.keywords[WELL_KEYWORD] == "C7"
+    ed.plate.selected = {(2, 6)}
+    ed.unassign_selected()
+    assert WELL_KEYWORD not in control.keywords and [s.name for s in ed.unassigned] == ["Control.fcs"]
+    # a sample that had a WELL ID gets it back when taken off its new well
+    a1 = by_name(window, "Plate1_A1.fcs")
+    a1.keywords[WELL_KEYWORD] = "A1"
+    ed.refresh()
+    label = c.undo_label()
+    ed.plate.selected = {(0, 0)}
+    ed.unassign_selected()  # placed by its keyword, not by hand: nothing to do
+    assert a1.keywords[WELL_KEYWORD] == "A1" and c.undo_label() == label
+    ed.assign_sample(a1, 4, 4)
+    assert a1.keywords[WELL_KEYWORD] == "E5" and ed.wells[(4, 4)] is a1
+    ed.plate.selected = {(4, 4)}
+    ed.unassign_selected()
+    assert a1.keywords[WELL_KEYWORD] == "A1" and ed.wells[(0, 0)] is a1
+
+
+def test_several_plates(app, tmp_path):
+    from flowdesk.ui.main_window import MainWindow
+    from flowdesk.ui.plate_editor import ALL_PLATES, plate_ids, plate_keyword
+
+    plates = {"X_A1.fcs": "Plate 1", "X_B2.fcs": "Plate 1", "Y_A1.fcs": "Plate 2", "Z_C3.fcs": "Plate 10"}
+    win = MainWindow()
+    try:
+        win.controller.add_samples(make_files(tmp_path, list(plates), lambda k, n: {"$PLATEID": plates[n]}))
+        samples = win.controller.workspace.samples
+        assert plate_keyword(samples) == "$PLATEID"
+        assert plate_ids(samples, "$PLATEID") == ["Plate 1", "Plate 2", "Plate 10"]
+        ed = win.extensions["flowdesk.ui.plate_editor"].show_editor()
+        assert ed.plate_combo.isEnabled()
+        assert [ed.plate_combo.itemText(i) for i in range(ed.plate_combo.count())] == ["Plate 1", "Plate 2", "Plate 10", ALL_PLATES]
+        assert ed.current_plate == "Plate 1"
+        assert {w: s.name for w, s in ed.wells.items()} == {(0, 0): "X_A1.fcs", (1, 1): "X_B2.fcs"}
+        assert not ed.unassigned and "Plate 1:" in ed.status.text()
+        ed.set_plate("Plate 2")
+        assert {w: s.name for w, s in ed.wells.items()} == {(0, 0): "Y_A1.fcs"}
+        ed.refresh()  # the choice survives a refresh
+        assert ed.current_plate == "Plate 2"
+        ed.set_plate(ALL_PLATES)  # two A1 wells: the second sample is unassigned
+        assert [s.name for s in ed.unassigned] == ["Y_A1.fcs"]
+        ed.hide()
+    finally:
+        win.controller.workspace.modified = False
+        win.hide()
+        win.deleteLater()
+
+
+def test_plate_dialog_entry_points_and_context_menu(design, monkeypatch):
+    from PySide6.QtWidgets import QDialog
+
+    monkeypatch.setattr(QDialog, "exec", lambda self: 0)
+    ed = editor(design)
+    ed.plate.resize(760, 500)
+    ed.select_row(0)
+    assert ed.set_keyword_dialog() is None and ed.fill_series_dialog() is None
+    pos = ed.plate.well_rect(1, 1).center().toPoint()
+    menu = ed.context_menu(pos)
+    assert ed.plate.selected == {(1, 1)}  # right-click selects the well under the mouse
+    titles = [a.text() for a in menu.actions()]
+    assert "Set Keyword on Selected Wells…" in titles and "Fill Series…" in titles
+    assert "Select Row B" in titles and "Select Column 2" in titles

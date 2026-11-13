@@ -187,3 +187,95 @@ def test_layout_editor_actions_keys_and_rubber_band(app, window, tmp_path):
     pages = le.export_pdf(str(tmp_path / "batch.pdf"), batch_group=ws.groups[0])
     assert pages == len(ws.members(ws.groups[0])) and (tmp_path / "batch.pdf").stat().st_size > 1000
     le.close()
+
+
+def _tree_items(tree, pred):
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+
+    out = []
+    it = QTreeWidgetItemIterator(tree)
+    while it.value():
+        if pred(it.value()):
+            out.append(it.value())
+        it += 1
+    return out
+
+
+def test_layout_editor_arrange_keys_clipboard_and_overlay_handoff(app, window, tmp_path):
+    """Arrange menu / ribbon actions, Ctrl+Z / Ctrl+A / Ctrl+C / Ctrl+V / Ctrl+W
+    on the editor, a graph window's overlays handed to the layout and a real
+    multi-sample tree drag dropped onto a plot."""
+    import zipfile
+
+    from flowdesk.ui.main_window import ROLE_GROUP, ROLE_POP, ROLE_SAMPLE, ROLE_STAT
+
+    c = window.controller
+    ws = c.workspace
+    s0, s1 = ws.samples[:2]
+    c.add_population(s1.root, Population("Cells", RectangleGate(["FSC-A", "SSC-A"], [30000, 5000], [200000, 150000])), None)
+    app.processEvents()
+    le = window.show_layout_editor()
+    le.resize(1000, 800)
+    app.processEvents()
+    layout = le.current_layout()
+    cells = s0.root.find("/Cells")
+    items = [le.add_population(s0, cells, QPointF(x, y)) for x, y in ((40, 40), (330, 90), (150, 420))]
+    items[2].w = 120
+    le._sync_items(items)
+    le.flush_notify()
+    # Ctrl+A on the view selects every object
+    le.view.setFocus()
+    QTest.keyClick(le.view, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    assert len(le.selected_layout_items()) == 3
+    before = [(i.x, i.y) for i in items]
+    # the Arrange menu: Align ▸ Right, then Ctrl+Z restores the positions
+    align = next(a.menu() for a in le.arrange_menu.actions() if a.text() == "Align")
+    next(a for a in align.actions() if a.text() == "Align Right").trigger()
+    right = max(i.x + i.w for i in items)
+    assert all(i.x + i.w == pytest.approx(right) for i in items)
+    QTest.keyClick(le.view, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    layout = le.current_layout()  # undo restored the layouts from the snapshot
+    assert [(i.x, i.y) for i in layout.items] == before
+    # Distribute ▸ Horizontally from the menu: equal gaps
+    le.select_all()
+    dist = next(a.menu() for a in le.arrange_menu.actions() if a.text() == "Distribute")
+    dist.actions()[0].trigger()
+    order = sorted(layout.items, key=lambda i: i.x)
+    gaps = [order[k + 1].x - order[k].x - order[k].w for k in range(2)]
+    assert gaps[0] == pytest.approx(gaps[1])
+    # Ctrl+C / Ctrl+V into a second layout
+    le.select_all()
+    QTest.keyClick(le.view, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    second = le.new_layout("Panel B")
+    QTest.keyClick(le.view, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    assert len(second.items) == 3 and {i.pop_path for i in second.items} == {"/Cells"}
+    le.set_current_layout(layout)
+    # a graph window's overlays come along ("Add to Layout" hand-off)
+    gw = window.open_graph(s0, cells)
+    app.processEvents()
+    gw.plot.set_overlays([(s1, s1.root.find("/Cells"))])
+    handed = le.add_population(gw.sample, gw.population, overlays=gw.plot.overlays)
+    assert handed.overlays == [{"sample_id": s1.id, "pop_path": "/Cells"}]
+    le.page_pixmap(layout, scale=1.0)
+    assert len(le.render_legends[handed.id]) == 2
+    gw.close()
+    # a real multi-sample selection from the workspace tree dropped onto a plot
+    rows = _tree_items(window.tree, lambda it: it.data(0, ROLE_STAT) is None and it.data(0, ROLE_GROUP) is None
+                       and it.data(0, ROLE_SAMPLE) in (s0, s1) and it.data(0, ROLE_POP) is not None and it.data(0, ROLE_POP).path == "/Cells")
+    rows = list({it.data(0, ROLE_SAMPLE).id: it for it in rows}.values())  # one row per sample
+    assert len(rows) == 2
+    md = window.tree.mimeData(rows)
+    target = layout.items[1]  # (the full page put the hand-off plot over items[0])
+    assert le.drop_mime(md, QPointF(target.x + target.w / 2, target.y + 60)) == [target]
+    assert {"sample_id": s1.id, "pop_path": "/Cells"} in target.overlays
+    # export the layout to PowerPoint from the editor
+    out = tmp_path / "layout.pptx"
+    assert le.export_pptx(out) == 1 and "ppt/slides/slide1.xml" in zipfile.ZipFile(out).namelist()
+    # Ctrl+W closes (hides) the editor window
+    le.activateWindow()
+    QTest.keyClick(le.view, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    assert not le.isVisible()

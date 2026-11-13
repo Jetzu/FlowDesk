@@ -217,3 +217,21 @@ def test_layout_survives_save_load(editor, ws, tmp_path):
     editor.controller.set_workspace(ws2)
     assert editor.current_layout() is lay
     assert len(plot_items(editor)) == 1
+
+
+def test_batch_pptx_and_images_real_samples(editor, ws, tmp_path):
+    """One slide / one image file per sample of the group (real sample names
+    with spaces and dots make safe file names)."""
+    import zipfile
+
+    s = ws.samples[0]
+    editor.add_population(s, s.root.find("/Lymphocytes"))
+    editor.add_text("{$FIL}", edit=False)
+    g = ws.groups[0]
+    out = tmp_path / "batch.pptx"
+    assert editor.export_pptx(out, batch_group=g) == 2
+    names = zipfile.ZipFile(out).namelist()
+    assert sum(1 for n in names if n.startswith("ppt/slides/slide") and n.endswith(".xml")) == 2
+    files = editor.export_images(tmp_path / "imgs", g, "tif", dpi=150)
+    assert len(files) == 2 and all(Path(f).exists() and Path(f).suffix == ".tif" for f in files)
+    assert {Path(f).stem for f in files} == {f"Layout - {m.name}" for m in ws.members(g)}

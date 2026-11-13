@@ -29,7 +29,7 @@ TEMPLATE_EXTENSION = ".fdwt"
 
 
 # settings entries that refer to particular samples of the source workspace
-_PER_SAMPLE_SETTINGS = {"plate_editor": ("manual",)}
+_PER_SAMPLE_SETTINGS = {"plate_editor": ("manual", "keyword_backup")}
 _SKIPPED_SETTINGS = ("imported_from",)
 
 

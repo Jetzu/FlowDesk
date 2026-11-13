@@ -19,11 +19,14 @@ Every tagged version (`v*`) is built automatically on GitHub Actions for all thr
 platforms. Open the repository's **Releases** page and download the zip for your
 system:
 
-| System  | File                   | Start it with                       |
-|---------|------------------------|-------------------------------------|
-| Windows | `FlowDesk-windows.zip` | `FlowDesk\FlowDesk.exe`             |
-| Linux   | `FlowDesk-linux.zip`   | `FlowDesk/FlowDesk`                 |
-| macOS   | `FlowDesk-macos.zip`   | `FlowDesk.app`                      |
+| System  | File                                        | Start it with                       |
+|---------|---------------------------------------------|-------------------------------------|
+| Windows | `FlowDesk-windows.zip`                      | `FlowDesk\FlowDesk.exe`             |
+| Linux   | `FlowDesk-linux.zip`                        | `FlowDesk/FlowDesk`                 |
+| macOS   | `FlowDesk-<version>-macOS-arm64.dmg` (or `FlowDesk-macos.zip`) | `FlowDesk.app`        |
+
+The macOS disk image is built for Apple Silicon (M1 and later); Intel Macs run FlowDesk
+from source.
 
 1. Unzip it to a folder you can write to (Windows: e.g. `%LOCALAPPDATA%\Programs\FlowDesk`;
    Linux: e.g. `~/Applications/FlowDesk`; macOS: drag `FlowDesk.app` to *Applications*).
@@ -35,8 +38,11 @@ system:
    - **Linux:** `chmod +x FlowDesk/FlowDesk` if needed, then run it. Install the
      [Qt system libraries](#linux) first if it fails to start. To add a menu entry:
      `packaging/install_linux_desktop.sh /path/to/FlowDesk/FlowDesk` (from a source checkout).
-   - **macOS:** the app is not notarized. The first time, **right-click → Open → Open**
-     (or run `xattr -dr com.apple.quarantine /Applications/FlowDesk.app`).
+   - **macOS:** open the `.dmg`, drag **FlowDesk** onto **Applications** and eject the
+     image. The app is signed ad hoc but not notarised, so a copy that was downloaded
+     (rather than built on your own Mac) asks for one confirmation the first time:
+     **right-click → Open → Open** (or run
+     `xattr -dr com.apple.quarantine /Applications/FlowDesk.app`).
 
 ---
 
@@ -147,10 +153,15 @@ On the platform you want to build for (PyInstaller does not cross-compile):
 ```bash
 python -m pip install -e ".[packaging,analysis]"   # or let build.py install PyInstaller
 python packaging/build.py --zip
+python packaging/build.py --dmg        # macOS only: also writes the disk image
+python packaging/build.py --dmg-only   # macOS only: package an existing dist/FlowDesk.app
 ```
 
 Output: `dist/FlowDesk.app` (macOS), `dist/FlowDesk/FlowDesk.exe` (Windows),
-`dist/FlowDesk/FlowDesk` (Linux), plus `dist/FlowDesk-<os>.zip`. The app bundles
+`dist/FlowDesk/FlowDesk` (Linux), plus `dist/FlowDesk-<os>.zip` and, on macOS with
+`--dmg`, `dist/FlowDesk-<version>-macOS-<arch>.dmg` (the app and an *Applications*
+shortcut; the image is verified by mounting it read-only and checking the code signature
+of the app inside). The app bundles
 scikit-learn (k-means, the PhenoGraph kNN graph, the fallback t-SNE) and, when the
 `analysis` extra is installed, openTSNE and UMAP (with numba / pynndescent); without the
 extra those are left out. The macOS build with the extra is about 290 MB. After
@@ -160,8 +171,9 @@ FlowDesk opens; it fails if a library is missing from the bundle (`--no-check` s
 analysis run, `--check-only` re-runs the checks on an existing `dist/`).
 `packaging/make_icons.py` regenerates `icon.png`/`.ico`/`.icns` from the
 built-in artwork (the `.icns` needs macOS' `iconutil`). Pushing a tag `v*` runs
-`.github/workflows/release.yml`, which builds all three and attaches the zips to the
-GitHub release.
+`.github/workflows/release.yml`, which builds all three and attaches the zips, and on
+macOS the disk image, to the GitHub release. Signing with an Apple Developer ID and
+notarising would remove the first-launch confirmation; the build does not do that.
 
 ---
 

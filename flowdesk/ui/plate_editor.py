@@ -7,6 +7,15 @@ colour-coded by a statistic of a chosen population. Clicking a well selects the
 sample in the workspace, double-clicking opens its graph window. A plate map
 CSV (well -> sample name, as two columns or as a plate-shaped grid) can fill
 the wells in one go.
+
+Wells are selected by clicking (Ctrl/Shift adds), by a row letter or column
+number header (the whole row / column), the corner (every well) or by
+dragging a rubber band. Keywords are written on the selected wells' samples
+(Set Keyword on Selected Wells…) or as a series across the columns / down the
+rows (Fill Series…: start value times a dilution factor, plus a step, or a
+list). A sample placed by hand also gets the WELL ID keyword. Workspaces with
+samples from several plates ($PLATEID, $PLATENAME, PLATE NAME ...) show one
+plate at a time (Plate selector).
 """
 from __future__ import annotations
 
@@ -18,9 +27,13 @@ from pathlib import Path
 from PySide6.QtCore import QItemSelectionModel, QObject, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -28,7 +41,10 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
+    QMessageBox,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QSplitter,
     QVBoxLayout,
@@ -52,6 +68,12 @@ WELL_RE = re.compile(r"(?<![A-Za-z])([A-P])[-_ ]?0*(\d{1,2})(?!\d)")
 COLOR_STOPS = [(0.0, (49, 54, 149)), (0.25, (69, 117, 180)), (0.5, (171, 217, 233)), (0.62, (254, 224, 144)), (0.8, (244, 109, 67)), (1.0, (165, 0, 38))]
 EMPTY_COLOR = QColor("#f3f4f6")
 NO_VALUE_COLOR = QColor("#d1d5db")
+# keyword written on samples placed on a well by hand / from a plate map
+WELL_KEYWORD = "WELL ID"
+# keywords naming the plate a sample was acquired from, in order of preference
+PLATE_KEYWORDS = ["$PLATEID", "$PLATENAME", "PLATE NAME", "PLATE ID", "PLATEID", "Plate"]
+ALL_PLATES = "All samples"
+NO_PLATE = "(no plate)"
 
 
 # =============================================================== pure helpers
@@ -208,6 +230,63 @@ def match_sample(samples: list[Sample], name: str) -> Sample | None:
     return None
 
 
+def plate_keyword(samples: list[Sample]) -> str | None:
+    """The keyword that names each sample's plate: the first of PLATE_KEYWORDS
+    any sample has, else any keyword containing "PLATE"; None without one."""
+    for key in PLATE_KEYWORDS:
+        if any(s.keywords.get(key, "").strip() for s in samples):
+            return key
+    for s in samples:
+        for k, v in s.keywords.items():
+            if "PLATE" in k.upper() and str(v).strip():
+                return k
+    return None
+
+
+def plate_ids(samples: list[Sample], key: str | None) -> list[str]:
+    """Distinct plate names in natural order."""
+    if not key:
+        return []
+    from .experiment import natural_key
+
+    return sorted({s.keywords.get(key, "").strip() for s in samples} - {""}, key=natural_key)
+
+
+def samples_on_plate(samples: list[Sample], key: str | None, plate: str) -> list[Sample]:
+    if not key or plate == ALL_PLATES:
+        return list(samples)
+    if plate == NO_PLATE:
+        return [s for s in samples if not s.keywords.get(key, "").strip()]
+    return [s for s in samples if s.keywords.get(key, "").strip() == plate]
+
+
+def format_number(x: float) -> str:
+    """A series value as keyword text: 10 -> "10", 2.5 -> "2.5", 1e6 -> "1000000"."""
+    x = round(float(x), 10)
+    if x == int(x) and abs(x) < 1e15:
+        return str(int(x))
+    return f"{x:.10g}"
+
+
+def series_values(wells, start: float = 1.0, factor: float = 1.0, step: float = 0.0, direction: str = "columns", values: list[str] | None = None) -> dict[tuple[int, int], str]:
+    """Keyword values for a series over wells. The k-th column (direction
+    "columns") or row ("rows") of the selection, counted from its first one,
+    gets values[k] (cycling) or start * factor**k + step * k."""
+    wells = sorted(set(wells))
+    if not wells:
+        return {}
+    axis = 1 if direction == "columns" else 0
+    first = min(w[axis] for w in wells)
+    out = {}
+    for w in wells:
+        k = w[axis] - first
+        if values:
+            out[w] = str(values[k % len(values)])
+        else:
+            out[w] = format_number(start * (factor ** k) + step * k)
+    return out
+
+
 def color_for(t: float) -> QColor:
     t = min(max(float(t), 0.0), 1.0)
     for (t0, c0), (t1, c1) in zip(COLOR_STOPS, COLOR_STOPS[1:]):
@@ -226,12 +305,16 @@ def value_range(values: dict) -> tuple[float, float] | None:
 
 # ======================================================================= views
 class PlateWidget(QWidget):
-    """Paints the plate grid; emits well clicks."""
+    """Paints the plate grid; emits well clicks, header clicks (a row letter,
+    a column number or the corner) and rubber-band selections."""
 
     wellClicked = Signal(int, int, object)  # row, col, keyboard modifiers
     wellDoubleClicked = Signal(int, int)
+    headerClicked = Signal(str, int, object)  # "row" | "col" | "all", index, modifiers
+    wellsSelected = Signal(object, object)  # set of (row, col) inside a rubber band, modifiers
 
     HEADER = 22
+    DRAG_THRESHOLD = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -241,6 +324,9 @@ class PlateWidget(QWidget):
         self.selected: set[tuple[int, int]] = set()
         self.vrange: tuple[float, float] | None = None
         self.stat_name = ""
+        self.rubber: QRectF | None = None  # rubber band being dragged
+        self._press: QPointF | None = None
+        self._press_mods = Qt.KeyboardModifier.NoModifier
         self.setMinimumSize(520, 340)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
@@ -266,6 +352,25 @@ class PlateWidget(QWidget):
         if 0 <= r < self.rows and 0 <= c < self.cols:
             return r, c
         return None
+
+    def header_at(self, pos) -> tuple[str, int] | None:
+        """("row", r) over a row letter, ("col", c) over a column number,
+        ("all", -1) over the corner, else None."""
+        w, h = self._cell()
+        x, y = pos.x(), pos.y()
+        if x < 0 or y < 0 or (x >= self.HEADER and y >= self.HEADER):
+            return None
+        if x < self.HEADER and y < self.HEADER:
+            return ("all", -1)
+        if y < self.HEADER:
+            c = int((x - self.HEADER) // w)
+            return ("col", c) if 0 <= c < self.cols else None
+        r = int((y - self.HEADER) // h)
+        return ("row", r) if 0 <= r < self.rows else None
+
+    def wells_in(self, rect: QRectF) -> set[tuple[int, int]]:
+        """Wells whose square intersects rect."""
+        return {(r, c) for r in range(self.rows) for c in range(self.cols) if self.well_rect(r, c).intersects(rect)}
 
     def color_of(self, well: tuple[int, int]) -> QColor:
         if well not in self.wells:
@@ -318,13 +423,34 @@ class PlateWidget(QWidget):
                     p.drawText(inner, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, format_value(self.stat_name, v))
                 else:
                     p.drawText(inner, Qt.AlignmentFlag.AlignCenter, text)
+        if self.rubber is not None:
+            p.setPen(QPen(QColor("#2563eb"), 1.0, Qt.PenStyle.DashLine))
+            p.setBrush(QColor(37, 99, 235, 40))
+            p.drawRect(self.rubber)
         p.end()
 
     def mousePressEvent(self, event):
-        well = self.well_at(event.position())
-        if well is not None and event.button() == Qt.MouseButton.LeftButton:
-            self.wellClicked.emit(well[0], well[1], event.modifiers())
+        pos = event.position()
+        if event.button() == Qt.MouseButton.LeftButton:
+            head = self.header_at(pos)
+            if head is not None:
+                self.headerClicked.emit(head[0], head[1], event.modifiers())
+            else:
+                self._press = QPointF(pos)
+                self._press_mods = event.modifiers()
+                well = self.well_at(pos)
+                if well is not None:
+                    self.wellClicked.emit(well[0], well[1], event.modifiers())
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.rubber is not None:
+            wells = self.wells_in(self.rubber)
+            self.rubber = None
+            self.update()
+            self.wellsSelected.emit(wells, self._press_mods)
+        self._press = None
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         well = self.well_at(event.position())
@@ -332,6 +458,12 @@ class PlateWidget(QWidget):
             self.wellDoubleClicked.emit(well[0], well[1])
 
     def mouseMoveEvent(self, event):
+        if self._press is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            pos = event.position()
+            if self.rubber is not None or (pos - self._press).manhattanLength() > self.DRAG_THRESHOLD:
+                self.rubber = QRectF(self._press, pos).normalized()
+                self.update()
+                return
         well = self.well_at(event.position())
         if well is None:
             self.setToolTip("")
@@ -394,6 +526,8 @@ class PlateEditorWindow(QMainWindow):
         self.unassigned: list[Sample] = []
         self.values: dict[tuple[int, int], float] = {}
         self._updating = False
+        self.plate_key: str | None = None  # keyword naming each sample's plate
+        self._plate_choice: str | None = None  # plate shown (None: automatic)
 
         central = QWidget()
         outer = QVBoxLayout(central)
@@ -405,7 +539,13 @@ class PlateEditorWindow(QMainWindow):
         self.pattern_edit = QLineEdit(DEFAULT_NAME_PATTERN)
         self.pattern_edit.setToolTip("Regular expression on the sample name: group 1 = row letter, group 2 = column")
         self.pattern_edit.setMaximumWidth(170)
-        for w, label in ((self.format_combo, "Plate:"), (self.source_combo, "Wells from:"), (self.pattern_edit, "Pattern:")):
+        self.plate_combo = QComboBox()
+        self.plate_combo.setMinimumWidth(130)
+        self.plate_combo.setToolTip("Samples from several plates ($PLATEID, $PLATENAME, PLATE NAME …) are shown one plate at a time")
+        self.plate_label = QLabel("Plate:")
+        top.addWidget(self.plate_label)
+        top.addWidget(self.plate_combo)
+        for w, label in ((self.format_combo, "Format:"), (self.source_combo, "Wells from:"), (self.pattern_edit, "Pattern:")):
             top.addWidget(QLabel(label))
             top.addWidget(w)
         top.addStretch(1)
@@ -454,6 +594,13 @@ class PlateEditorWindow(QMainWindow):
         sl.addWidget(QLabel("Pick a sample, then click a well."))
         self.unassign_btn = QPushButton("Unassign Selected Wells")
         sl.addWidget(self.unassign_btn)
+        sl.addWidget(QLabel("Select a row / column by its header, drag to select wells:"))
+        self.keyword_btn = QPushButton(icon("keyword"), "Set Keyword on Selected Wells…")
+        self.keyword_btn.setToolTip("Write one keyword value (e.g. Treatment) on the samples of the selected wells")
+        sl.addWidget(self.keyword_btn)
+        self.series_btn = QPushButton(icon("keyword"), "Fill Series…")
+        self.series_btn.setToolTip("Write a series (e.g. a concentration dilution) across the columns or down the rows of the selected wells")
+        sl.addWidget(self.series_btn)
         split.addWidget(side)
         split.setStretchFactor(0, 1)
         split.setSizes([800, 220])
@@ -485,7 +632,14 @@ class PlateEditorWindow(QMainWindow):
         self.assign_combo.currentIndexChanged.connect(self._assign_combo_changed)
         self.plate.wellClicked.connect(self.click_well)
         self.plate.wellDoubleClicked.connect(self.open_well)
+        self.plate.headerClicked.connect(self.click_header)
+        self.plate.wellsSelected.connect(self.select_wells)
+        self.plate.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.plate.customContextMenuRequested.connect(self._plate_context_menu)
+        self.plate_combo.currentIndexChanged.connect(lambda *_: self._plate_changed())
         self.unassign_btn.clicked.connect(self.unassign_selected)
+        self.keyword_btn.clicked.connect(lambda: self.set_keyword_dialog())
+        self.series_btn.clicked.connect(lambda: self.fill_series_dialog())
         self.export_btn.clicked.connect(lambda: self.export_csv())
         self.copy_btn.clicked.connect(self.copy_image)
         self.group_btn.clicked.connect(lambda: self.create_group_from_selection())
@@ -602,9 +756,52 @@ class PlateEditorWindow(QMainWindow):
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
 
+    # ---------------------------------------------------------------- plates
+    def _fill_plates(self):
+        """Plate selector items from the plate keyword ($PLATEID ...)."""
+        samples = self.controller.workspace.samples
+        self.plate_key = plate_keyword(samples)
+        ids = plate_ids(samples, self.plate_key)
+        items = list(ids)
+        if ids and any(not s.keywords.get(self.plate_key, "").strip() for s in samples):
+            items.append(NO_PLATE)
+        items.append(ALL_PLATES)
+        keep = self._plate_choice
+        if keep not in items:
+            # several plates: show the first one, else everything
+            keep = ids[0] if len(ids) > 1 else ALL_PLATES
+        self._fill_combo(self.plate_combo, [(t, t) for t in items], keep)
+        several = len(items) > 1
+        self.plate_combo.setEnabled(several)
+        self.plate_combo.setVisible(several)
+        self.plate_label.setVisible(several)
+
+    @property
+    def current_plate(self) -> str:
+        return self.plate_combo.currentData() or ALL_PLATES
+
+    def plate_samples(self) -> list[Sample]:
+        """The samples of the plate shown."""
+        return samples_on_plate(self.controller.workspace.samples, self.plate_key, self.current_plate)
+
+    def set_plate(self, plate: str):
+        i = self.plate_combo.findData(plate)
+        if i >= 0:
+            self.plate_combo.setCurrentIndex(i)
+
+    def _plate_changed(self):
+        if self._updating:
+            return
+        self._plate_choice = self.plate_combo.currentData()
+        self.plate.selected.clear()
+        self.assign()
+        self.compute_values()
+        self.plate.update()
+
     def refresh(self):
         ws = self.controller.workspace
         self._updating = True
+        self._fill_plates()
         # well source: defaults + any keyword that looks like a well
         keep_source = getattr(self, "_pending_source", None) or self.source_combo.currentText() or AUTO_SOURCE
         self._pending_source = None
@@ -639,7 +836,7 @@ class PlateEditorWindow(QMainWindow):
     def assign(self):
         rows, cols = self.dims
         self.plate.rows, self.plate.cols = rows, cols
-        self.wells, self.unassigned = assign_wells(self.controller.workspace.samples, self.source_combo.currentText() or AUTO_SOURCE, rows, cols, self.pattern_edit.text().strip(), self.manual)
+        self.wells, self.unassigned = assign_wells(self.plate_samples(), self.source_combo.currentText() or AUTO_SOURCE, rows, cols, self.pattern_edit.text().strip(), self.manual)
         self.plate.wells = self.wells
         self.plate.selected &= set(self.wells)
         keep = self.assign_combo.currentData()
@@ -651,7 +848,16 @@ class PlateEditorWindow(QMainWindow):
             self.unassigned_list.addItem(item)
         self.unassigned_list.blockSignals(False)
         self._fill_combo(self.assign_combo, [("(none)", None)] + [(s.name, s.id) for s in self.unassigned], keep)
-        self.status.setText(f"{len(self.wells)} samples on the plate · {len(self.unassigned)} unassigned")
+        plate = "" if self.current_plate == ALL_PLATES else f"{self.current_plate}: "
+        self.status.setText(f"{plate}{len(self.wells)} samples on the plate · {len(self.unassigned)} unassigned")
+        self._update_buttons()
+
+    def _update_buttons(self):
+        has_sel = bool(self.plate.selected & set(self.wells))
+        self.keyword_btn.setEnabled(has_sel)
+        self.series_btn.setEnabled(has_sel)
+        self.unassign_btn.setEnabled(has_sel)
+        self.group_btn.setEnabled(has_sel)
 
     def _list_row_changed(self, row: int):
         if 0 <= row < len(self.unassigned):
@@ -717,15 +923,181 @@ class PlateEditorWindow(QMainWindow):
         else:
             self.plate.selected = {well} if well in self.wells else set()
         self.plate.update()
+        self._update_buttons()
         sample = self.wells.get(well)
         if sample is not None:
             self.select_in_workspace([self.wells[w] for w in sorted(self.plate.selected)] if additive else [sample])
 
+    @staticmethod
+    def _additive(modifiers) -> bool:
+        try:
+            mods = Qt.KeyboardModifier(modifiers)
+        except (TypeError, ValueError):
+            return False
+        return bool(mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier | Qt.KeyboardModifier.ShiftModifier))
+
+    def select_wells(self, wells, modifiers=Qt.KeyboardModifier.NoModifier) -> set[tuple[int, int]]:
+        """Select the occupied wells among `wells` (Ctrl/Cmd/Shift: add to the
+        selection) and the matching samples in the workspace."""
+        occupied = {w for w in wells if w in self.wells}
+        if self._additive(modifiers):
+            self.plate.selected = set(self.plate.selected) | occupied
+        else:
+            self.plate.selected = occupied
+        self.plate.update()
+        self._update_buttons()
+        samples = self.selected_samples()
+        if samples:
+            self.select_in_workspace(samples)
+        return set(self.plate.selected)
+
+    def select_row(self, row: int, modifiers=Qt.KeyboardModifier.NoModifier):
+        return self.select_wells({(row, c) for c in range(self.plate.cols)}, modifiers)
+
+    def select_column(self, col: int, modifiers=Qt.KeyboardModifier.NoModifier):
+        return self.select_wells({(r, col) for r in range(self.plate.rows)}, modifiers)
+
+    def select_all_wells(self):
+        return self.select_wells(set(self.wells))
+
+    def click_header(self, kind: str, index: int, modifiers=Qt.KeyboardModifier.NoModifier):
+        """A row letter / column number selects that row / column, the corner every well."""
+        if kind == "row":
+            return self.select_row(index, modifiers)
+        if kind == "col":
+            return self.select_column(index, modifiers)
+        return self.select_wells(set(self.wells), modifiers)
+
+    # ------------------------------------------------------ keyword design
+    def set_keyword_on_selection(self, name: str, value: str) -> int:
+        """Write keyword `name` = value on the samples of the selected wells
+        (one undo step). Returns the number of samples changed."""
+        from .experiment import set_keyword
+
+        samples = self.selected_samples()
+        if not samples or not name.strip():
+            return 0
+        n = set_keyword(self.controller, samples, name.strip(), str(value))
+        self.status.setText(f"{name.strip()} = {value} on {n} sample{'s' if n != 1 else ''}")
+        return n
+
+    def fill_series(self, name: str, start: float = 1.0, factor: float = 1.0, step: float = 0.0, direction: str = "columns", values: list[str] | None = None) -> dict[tuple[int, int], str]:
+        """Write a series as keyword `name` over the selected wells (all
+        occupied wells when none is selected): the k-th column ("columns") or
+        row ("rows") gets start * factor**k + step * k, or values[k]. One undo
+        step; returns {well: value} written."""
+        from .experiment import set_keyword
+
+        name = name.strip()
+        wells = sorted(self.plate.selected & set(self.wells)) or sorted(self.wells)
+        if not name or not wells:
+            return {}
+        plan = series_values(wells, start, factor, step, direction, values)
+        per_sample = {self.wells[w].id: v for w, v in plan.items()}
+        set_keyword(self.controller, [self.wells[w] for w in wells], name, per_sample)
+        self.status.setText(f"{name}: series on {len(plan)} wells")
+        return plan
+
+    def set_keyword_dialog(self):
+        if not self.selected_samples():
+            QMessageBox.information(self, "Set Keyword", "Select wells first (click, drag, or click a row / column header).")
+            return None
+        dlg = WellKeywordDialog(self._keyword_names(), len(self.selected_samples()), self)
+        if dlg.exec():
+            name, value = dlg.values()
+            return self.set_keyword_on_selection(name, value)
+        return None
+
+    def fill_series_dialog(self):
+        if not self.wells:
+            return None
+        dlg = FillSeriesDialog(self._keyword_names(), self)
+        if dlg.exec():
+            return self.fill_series(**dlg.values())
+        return None
+
+    def _keyword_names(self) -> list[str]:
+        from .experiment import keyword_union
+
+        return [k for k in keyword_union(self.controller.workspace.samples) if not k.startswith("$")]
+
+    def _plate_context_menu(self, pos):
+        self.context_menu(pos).exec(self.plate.mapToGlobal(pos))
+
+    def context_menu(self, pos) -> QMenu:
+        """The plate's context menu at pos (selects the well under it first)."""
+        well = self.plate.well_at(QPointF(pos))
+        if well is not None and well in self.wells and well not in self.plate.selected:
+            self.select_wells({well})
+        menu = QMenu(self)
+        has_sel = bool(self.selected_samples())
+        a = menu.addAction(icon("keyword"), "Set Keyword on Selected Wells…")
+        a.setEnabled(has_sel)
+        a.triggered.connect(lambda: self.set_keyword_dialog())
+        a = menu.addAction(icon("keyword"), "Fill Series…")
+        a.setEnabled(bool(self.wells))
+        a.triggered.connect(lambda: self.fill_series_dialog())
+        menu.addSeparator()
+        if well is not None:
+            r, c = well
+            menu.addAction(f"Select Row {ROW_LETTERS[r]}").triggered.connect(lambda: self.select_row(r))
+            menu.addAction(f"Select Column {c + 1}").triggered.connect(lambda: self.select_column(c))
+        menu.addAction("Select All Wells").triggered.connect(lambda: self.select_all_wells())
+        menu.addSeparator()
+        a = menu.addAction(icon("group"), "Create Group from Selected Wells…")
+        a.setEnabled(has_sel)
+        a.triggered.connect(lambda: self.create_group_from_selection())
+        a = menu.addAction("Unassign Selected Wells")
+        a.setEnabled(has_sel)
+        a.triggered.connect(self.unassign_selected)
+        return menu
+
+    # ------------------------------------------------------ manual wells
+    def _place_keywords(self, placed: dict, removed: list) -> bool:
+        """Write the WELL ID keyword of samples placed by hand ({sample: "C5"})
+        and give samples taken off a well their earlier value back; the value
+        a sample had before its first placement is kept in the plate settings
+        (with the file path, so entries copied from another workspace by a
+        template are ignored). Call inside an undo step covering "samples"
+        and "settings". True when a keyword changed."""
+        backup = self._settings().setdefault("keyword_backup", {})
+
+        def entry(s):
+            e = backup.get(str(s.id))
+            return e if isinstance(e, dict) and e.get("path") == str(s.path) else None
+
+        changed = False
+        for s, wname in placed.items():
+            if entry(s) is None:
+                backup[str(s.id)] = {"path": str(s.path), "value": s.keywords.get(WELL_KEYWORD)}
+            if s.keywords.get(WELL_KEYWORD) != wname:
+                s.keywords[WELL_KEYWORD] = wname
+                changed = True
+        for s in removed:
+            e = entry(s)
+            backup.pop(str(s.id), None)
+            if e is None:
+                continue
+            old = e.get("value")
+            if old is None:
+                changed |= s.keywords.pop(WELL_KEYWORD, None) is not None
+            elif s.keywords.get(WELL_KEYWORD) != old:
+                s.keywords[WELL_KEYWORD] = old
+                changed = True
+        return changed
+
+    def _keywords_written(self):
+        from .experiment import notify_keywords_changed
+
+        notify_keywords_changed(self.controller)
+
     def assign_sample(self, sample: Sample, row: int, col: int):
-        self._begin_settings_change(f"assign {sample.name} to {well_name(row, col)}")
-        manual = self._settings().setdefault("manual", {})
-        manual[str(sample.id)] = well_name(row, col)
-        self.controller.mark_modified()
+        with self.controller.undo_group(f"assign {sample.name} to {well_name(row, col)}", ("settings", "samples")):
+            manual = self._settings().setdefault("manual", {})
+            manual[str(sample.id)] = well_name(row, col)
+            self.controller.mark_modified()
+            if self._place_keywords({sample: well_name(row, col)}, []):
+                self._keywords_written()
         self.assign_combo.setCurrentIndex(0)
         self.assign()
         self.compute_values()
@@ -762,15 +1134,21 @@ class PlateEditorWindow(QMainWindow):
                 continue  # a well or a sample listed twice: the first entry wins
             placed[well] = s
         if placed:
-            self._begin_settings_change(f"fill wells from {Path(str(path)).name}")
-            manual = self._settings().setdefault("manual", {})
-            wells_taken = {well_name(*w) for w in placed}
-            moved = {str(s.id) for s in placed.values()}
-            for sid in [k for k, w in manual.items() if w in wells_taken and k not in moved]:
-                manual.pop(sid)  # another sample was put on a listed well by hand
-            for w, s in placed.items():
-                manual[str(s.id)] = well_name(*w)
-            self.controller.mark_modified()
+            with self.controller.undo_group(f"fill wells from {Path(str(path)).name}", ("settings", "samples")):
+                manual = self._settings().setdefault("manual", {})
+                wells_taken = {well_name(*w) for w in placed}
+                moved = {str(s.id) for s in placed.values()}
+                dropped = []
+                for sid in [k for k, w in manual.items() if w in wells_taken and k not in moved]:
+                    manual.pop(sid)  # another sample was put on a listed well by hand
+                    s = self.controller.workspace.sample_by_id(int(sid))
+                    if s is not None:
+                        dropped.append(s)
+                for w, s in placed.items():
+                    manual[str(s.id)] = well_name(*w)
+                self.controller.mark_modified()
+                if self._place_keywords({s: well_name(*w) for w, s in placed.items()}, dropped):
+                    self._keywords_written()
         self.plate.selected.clear()
         self.assign()
         self.compute_values()
@@ -787,11 +1165,14 @@ class PlateEditorWindow(QMainWindow):
         raw = self.controller.workspace.settings.get("plate_editor", {}).get("manual", {})
         ids = [str(self.wells[w].id) for w in self.plate.selected if w in self.wells]
         if any(sid in raw for sid in ids):
-            self._begin_settings_change("unassign wells")
-            manual = self._settings().setdefault("manual", {})
-            for sid in ids:
-                manual.pop(sid, None)
-            self.controller.mark_modified()
+            with self.controller.undo_group("unassign wells", ("settings", "samples")):
+                manual = self._settings().setdefault("manual", {})
+                for sid in ids:
+                    manual.pop(sid, None)
+                self.controller.mark_modified()
+                ws = self.controller.workspace
+                if self._place_keywords({}, [s for s in (ws.sample_by_id(int(i)) for i in ids) if s is not None]):
+                    self._keywords_written()
         self.plate.selected.clear()
         self.assign()
         self.compute_values()
@@ -883,6 +1264,105 @@ class PlateEditorWindow(QMainWindow):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
+
+
+# ===================================================================== dialogs
+def _ok_cancel(dialog: QDialog, ok_text: str) -> QDialogButtonBox:
+    box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    box.button(QDialogButtonBox.StandardButton.Ok).setText(ok_text)
+    box.accepted.connect(dialog.accept)
+    box.rejected.connect(dialog.reject)
+    return box
+
+
+def _keyword_combo(names: list[str], placeholder: str) -> QComboBox:
+    combo = QComboBox()
+    combo.setEditable(True)
+    combo.addItems(names)
+    combo.setCurrentText("")
+    combo.lineEdit().setPlaceholderText(placeholder)
+    return combo
+
+
+class WellKeywordDialog(QDialog):
+    """Keyword name and value for the samples of the selected wells."""
+
+    def __init__(self, keyword_names: list[str], n_samples: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Keyword on Selected Wells")
+        form = QFormLayout(self)
+        self.name_combo = _keyword_combo(keyword_names, "e.g. Treatment")
+        self.value_edit = QLineEdit()
+        self.value_edit.setPlaceholderText("e.g. Stimulated")
+        form.addRow(QLabel(f"{n_samples} sample{'s' if n_samples != 1 else ''} in the selected wells"))
+        form.addRow("Keyword:", self.name_combo)
+        form.addRow("Value:", self.value_edit)
+        form.addRow(_ok_cancel(self, "Set"))
+
+    def values(self) -> tuple[str, str]:
+        return self.name_combo.currentText().strip(), self.value_edit.text()
+
+    def accept(self):
+        if not self.name_combo.currentText().strip():
+            return
+        super().accept()
+
+
+class FillSeriesDialog(QDialog):
+    """A keyword series across the columns or down the rows of the selection:
+    start × factor^k + step × k, or a list of values."""
+
+    def __init__(self, keyword_names: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Fill Series")
+        form = QFormLayout(self)
+        self.name_combo = _keyword_combo(keyword_names, "e.g. Concentration")
+        form.addRow("Keyword:", self.name_combo)
+        self.mode_group = QButtonGroup(self)
+        self.rb_numeric = QRadioButton("Numbers: start × factor per step + increment")
+        self.rb_list = QRadioButton("List of values (comma separated, repeated)")
+        self.mode_group.addButton(self.rb_numeric, 0)
+        self.mode_group.addButton(self.rb_list, 1)
+        self.rb_numeric.setChecked(True)
+        form.addRow(self.rb_numeric)
+        self.start_spin = QDoubleSpinBox()
+        self.factor_spin = QDoubleSpinBox()
+        self.step_spin = QDoubleSpinBox()
+        for spin, value in ((self.start_spin, 1.0), (self.factor_spin, 1.0), (self.step_spin, 0.0)):
+            spin.setRange(-1e12, 1e12)
+            spin.setDecimals(6)
+            spin.setValue(value)
+        self.factor_spin.setToolTip("2 doubles, 0.5 halves (a 1:2 dilution), 1 keeps the value")
+        form.addRow("Start value:", self.start_spin)
+        form.addRow("Factor per step:", self.factor_spin)
+        form.addRow("Increment per step:", self.step_spin)
+        form.addRow(self.rb_list)
+        self.list_edit = QLineEdit()
+        self.list_edit.setPlaceholderText("e.g. Unstim, PMA, aCD3")
+        form.addRow("Values:", self.list_edit)
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItem("Across the columns (1, 2, 3 …)", "columns")
+        self.direction_combo.addItem("Down the rows (A, B, C …)", "rows")
+        form.addRow("Direction:", self.direction_combo)
+        form.addRow(QLabel("Applies to the selected wells (every occupied well when none is selected)."))
+        form.addRow(_ok_cancel(self, "Fill"))
+
+    def values(self) -> dict:
+        out = {
+            "name": self.name_combo.currentText().strip(),
+            "direction": self.direction_combo.currentData(),
+        }
+        if self.rb_list.isChecked():
+            out["values"] = [v.strip() for v in self.list_edit.text().split(",") if v.strip()]
+        else:
+            out.update(start=self.start_spin.value(), factor=self.factor_spin.value(), step=self.step_spin.value())
+        return out
+
+    def accept(self):
+        v = self.values()
+        if not v["name"] or (self.rb_list.isChecked() and not v.get("values")):
+            return
+        super().accept()
 
 
 # ================================================================== extension

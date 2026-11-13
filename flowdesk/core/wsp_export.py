@@ -550,7 +550,7 @@ class _Writer:
 
 # ----------------------------------------------------------------- workspace
 def _group_role(group: Group) -> str:
-    return COMPENSATION_ROLE if group.role == "compensation" else "ws.group.dlog.test"
+    return {"compensation": COMPENSATION_ROLE, "control": "ws.group.dlog.control"}.get(group.role, "ws.group.dlog.test")
 
 
 def _sample_known(sample: Sample, ws_foreign: set[str], matrices):
@@ -640,7 +640,7 @@ def build_tree(ws: Workspace, with_counts: bool = True, warnings: list | None = 
                 "key": "",
                 "synchronized": "0",
                 "foreground": group.color or "#000000",
-                "fontStyle": "bold" if group.bold else "plain",
+                "fontStyle": ("bold italic" if group.bold and getattr(group, "italic", False) else "bold" if group.bold else "italic" if getattr(group, "italic", False) else "plain"),
             },
         )
         crit = ET.SubElement(gel, "Criteria")
