@@ -76,7 +76,8 @@ hiddenimports = (
 try:  # the MCP server (flowdesk --mcp) lets the packaged app serve Claude Code / Codex on its own
     import mcp  # noqa: F401
 
-    hiddenimports += collect_submodules("mcp")
+    # mcp.cli (the `mcp` dev command) exits at import without typer and is not needed by the server
+    hiddenimports += collect_submodules("mcp", filter=lambda name: not name.startswith("mcp.cli"))
     HAS_MCP = True
 except ImportError:
     HAS_MCP = False
