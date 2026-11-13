@@ -39,3 +39,5 @@ include = ["flowdesk*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# a test that hangs dumps every thread's stack after two minutes instead of stalling CI silently
+faulthandler_timeout = 120

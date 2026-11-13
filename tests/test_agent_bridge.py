@@ -255,10 +255,11 @@ def test_installer_refuses_to_corrupt_unparseable_config(fakehome):
 
 def test_frozen_server_entry_uses_the_app_executable(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", "/Applications/FlowDesk.app/Contents/MacOS/FlowDesk")
-    assert install.server_entry() == ("/Applications/FlowDesk.app/Contents/MacOS/FlowDesk", ["--mcp"])
-    assert install.is_ours({"command": "/Applications/FlowDesk.app/Contents/MacOS/FlowDesk", "args": ["--mcp"]})
-    assert discovery.find_flowdesk() == ["/Applications/FlowDesk.app/Contents/MacOS/FlowDesk"]
+    exe = os.path.abspath("/Applications/FlowDesk.app/Contents/MacOS/FlowDesk")
+    monkeypatch.setattr(sys, "executable", exe)
+    assert install.server_entry() == (exe, ["--mcp"])
+    assert install.is_ours({"command": exe, "args": ["--mcp"]})
+    assert discovery.find_flowdesk() == [exe]
 
 
 def test_check_cli(fakehome, capsys):
