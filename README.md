@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="packaging/icon.png" width="112" alt="FlowDesk logo">
+
 # FlowDesk
 
 **Flow cytometry analysis on the desktop: gate, compensate, lay out figures and cluster, and open your FlowJo workspaces as they are.**

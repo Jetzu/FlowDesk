@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import math
+import random
 from functools import lru_cache
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QFont
+from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient
 
 INK = QColor("#3c4043")
 BLUE = QColor("#2f6fd6")
@@ -551,17 +552,7 @@ def _draw(name: str, p: QPainter, s: float):
         p.setFont(_icon_font(int(s * 0.36)))
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, "ƒx")
     elif name == "app":
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(BLUE)
-        p.drawRoundedRect(QRectF(1, 1, s - 2, s - 2), s * 0.22, s * 0.22)
-        inner = QRectF(s * 0.22, s * 0.2, s * 0.6, s * 0.6)
-        p.setPen(_pen(PAPER, s * 0.07))
-        p.drawLine(QPointF(inner.left(), inner.top()), QPointF(inner.left(), inner.bottom()))
-        p.drawLine(QPointF(inner.left(), inner.bottom()), QPointF(inner.right(), inner.bottom()))
-        _scatter(p, inner, PAPER, n=14, seed=5)
-        p.setPen(_pen(YELLOW, s * 0.07))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(inner.center().x() + 1, inner.center().y() - 1), inner.width() * 0.3, inner.height() * 0.24)
+        _draw_app_icon(p, s)
     elif name == "cytometer":
         # instrument body with a flow cell and a laser beam
         p.setPen(_pen(INK, 1.5))
@@ -587,6 +578,110 @@ def _draw(name: str, p: QPainter, s: float):
         p.setPen(_pen(GREY, 1.4))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(r)
+
+
+# ------------------------------------------------------------------- app icon
+_DENSITY = ("#2D6BFF", "#1FB6F5", "#26E0A0", "#B8F04A", "#FFD23F", "#FF8A2B", "#FF3B4E")  # pseudocolor, cold to hot
+
+
+def _squircle(rect: QRectF, n: float = 5.0, steps: int = 160) -> QPainterPath:
+    """Superellipse: the continuous-corner rounded square of macOS icons."""
+    cx, cy = rect.center().x(), rect.center().y()
+    a, b = rect.width() / 2, rect.height() / 2
+    path = QPainterPath()
+    for i in range(steps + 1):
+        t = 2 * math.pi * i / steps
+        c, sn = math.cos(t), math.sin(t)
+        x = cx + a * math.copysign(abs(c) ** (2 / n), c)
+        y = cy + b * math.copysign(abs(sn) ** (2 / n), sn)
+        if i == 0:
+            path.moveTo(x, y)
+        else:
+            path.lineTo(x, y)
+    path.closeSubpath()
+    return path
+
+
+def _density_blob(p: QPainter, c: QPointF, a: float, b: float, angle: float, colors, factors) -> None:
+    """Concentric pseudocolor bands of one cell population (outermost first)."""
+    p.save()
+    p.translate(c)
+    p.rotate(angle)
+    p.setPen(Qt.PenStyle.NoPen)
+    for col, f in zip(colors, factors):
+        p.setBrush(QColor(col))
+        p.drawEllipse(QPointF(0, 0), a * f, b * f)
+    p.restore()
+
+
+def _draw_app_icon(p: QPainter, s: float) -> None:
+    """A pseudocolor population with a polygon gate on a deep-blue rounded square."""
+    margin = s * 0.085
+    body = QRectF(margin, margin, s - 2 * margin, s - 2 * margin)
+    shape = _squircle(body)
+    bg = QLinearGradient(0, body.top(), 0, body.bottom())
+    bg.setColorAt(0.0, QColor("#2F4FD0"))
+    bg.setColorAt(1.0, QColor("#0B1445"))
+    p.fillPath(shape, QBrush(bg))
+    p.save()
+    p.setClipPath(shape)
+    gloss = QRadialGradient(QPointF(s * 0.5, body.top() - s * 0.1), s * 0.62)
+    gloss.setColorAt(0.0, QColor(255, 255, 255, 70))
+    gloss.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(gloss))
+    p.drawRect(QRectF(0, 0, s, s * 0.6))
+    big = s >= 48
+
+    # faint axes of the plot
+    ax = QPointF(s * 0.17, s * 0.83)
+    p.setPen(QPen(QColor(255, 255, 255, 70), max(1.0, s * 0.022), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(ax, QPointF(ax.x(), s * 0.2))
+    p.drawLine(ax, QPointF(s * 0.82, ax.y()))
+    if big:
+        p.setPen(QPen(QColor(255, 255, 255, 60), max(1.0, s * 0.012), Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        for k in range(1, 4):
+            t = k / 4
+            p.drawLine(QPointF(ax.x(), ax.y() - (ax.y() - s * 0.2) * t), QPointF(ax.x() + s * 0.022, ax.y() - (ax.y() - s * 0.2) * t))
+            p.drawLine(QPointF(ax.x() + (s * 0.82 - ax.x()) * t, ax.y()), QPointF(ax.x() + (s * 0.82 - ax.x()) * t, ax.y() - s * 0.022))
+
+    # events scattered around the populations
+    main_c, main_a, main_b, angle = QPointF(s * 0.46, s * 0.58), s * 0.205, s * 0.13, -28.0
+    side_c, side_a, side_b = QPointF(s * 0.73, s * 0.29), s * 0.085, s * 0.055
+    if s >= 64:
+        rng = random.Random(11)
+        p.setPen(Qt.PenStyle.NoPen)
+        placed = 0
+        while placed < 34:
+            x, y = rng.uniform(0.2, 0.84) * s, rng.uniform(0.2, 0.84) * s
+            if (x - main_c.x()) ** 2 / (main_a * 1.75) ** 2 + (y - main_c.y()) ** 2 / (main_a * 1.45) ** 2 < 1:
+                continue
+            if (x - side_c.x()) ** 2 + (y - side_c.y()) ** 2 < (side_a * 2.2) ** 2:
+                continue
+            p.setBrush(QColor(170, 205, 255, rng.randint(55, 120)))
+            r = s * rng.uniform(0.006, 0.011)
+            p.drawEllipse(QPointF(x, y), r, r)
+            placed += 1
+
+    _density_blob(p, side_c, side_a, side_b, angle, _DENSITY[:4], (1.0, 0.72, 0.46, 0.22))
+    _density_blob(p, main_c, main_a, main_b, angle, _DENSITY, (1.0, 0.84, 0.68, 0.53, 0.40, 0.27, 0.15))
+
+    # the gate: a polygon with draggable vertices
+    p.save()
+    p.translate(main_c)
+    p.rotate(angle)
+    spread = (1.34, 1.22, 1.38, 1.26, 1.42, 1.2, 1.3)
+    pts = [QPointF(main_a * m * math.cos(2 * math.pi * k / 7 + 0.35), main_b * m * 1.12 * math.sin(2 * math.pi * k / 7 + 0.35)) for k, m in enumerate(spread)]
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QColor("#FFFFFF"), max(1.3, s * 0.024), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    p.drawPolygon(QPolygonF(pts))
+    if s >= 64:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#FFFFFF"))
+        for pt in pts:
+            p.drawEllipse(pt, s * 0.017, s * 0.017)
+    p.restore()
+    p.restore()
 
 
 @lru_cache(maxsize=512)
