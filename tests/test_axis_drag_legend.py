@@ -16,7 +16,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docs"))
 import make_testset  # noqa: E402
 
-from flowdesk.core.transforms import ArcsinhScale, LinearScale, LogicleScale, LogScale, drag_edge, rescale  # noqa: E402
+from flowdesk.core.transforms import ArcsinhScale, LinearScale, LogicleScale, LogScale, rescale  # noqa: E402
 
 
 # ------------------------------------------------------------------- core math
@@ -35,12 +35,6 @@ def test_min_edge_keeps_the_top_and_reveals_negatives():
     log = LogicleScale(262144, 0.5, 4.5, 0.0)
     more = rescale(log, "min", -500, 0.1)
     assert more.T == log.T and more.A > log.A and more.forward_scalar(-500) == pytest.approx(0.1, abs=0.01)
-
-
-def test_drag_edge_by_position_and_kind():
-    lin, lgc = LinearScale(), LogicleScale()
-    assert [drag_edge(lin, f) for f in (0.1, 0.5, 0.9)] == ["min", "pan", "max"]
-    assert [drag_edge(lgc, f) for f in (0.1, 0.5, 0.9)] == ["min", "max", "max"]
 
 
 def test_dragging_beyond_the_far_end_is_harmless():
@@ -78,41 +72,120 @@ def widget(testset):
     w.close()
 
 
-def _drag(w, a: QPointF, b: QPointF):
-    QTest.mousePress(w, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, a.toPoint())
+def _drag(w, a: QPointF, b: QPointF, button=Qt.MouseButton.LeftButton):
+    QTest.mousePress(w, button, Qt.KeyboardModifier.NoModifier, a.toPoint())
     QTest.mouseMove(w, ((a + b) / 2).toPoint())
     QTest.mouseMove(w, b.toPoint())
-    QTest.mouseRelease(w, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, b.toPoint())
+    QTest.mouseRelease(w, button, Qt.KeyboardModifier.NoModifier, b.toPoint())
     w.grab()
 
 
-def test_drag_high_end_of_x_axis_shrinks_the_range_and_undoes(widget):
+def test_left_drag_changes_the_range_keeping_the_low_end_and_undoes(widget):
     w = widget
     r = w._result.plot_rect
     before = w.sample.scale("FSC-A").to_dict()
     y = r.bottom() + 12
-    grab = QPointF(r.left() + 0.9 * r.width(), y)
-    value = w.sample.scale("FSC-A").inverse_scalar(0.9)
-    _drag(w, grab, QPointF(r.right() - 2, y))  # pull the value grabbed at 90 % to the end of the axis
-    after = w.sample.scale("FSC-A")
-    assert after.kind == "linear" and after.min == before["min"] and after.max < before["max"]
-    assert after.forward_scalar(value) == pytest.approx((r.right() - 2 - r.left()) / r.width(), abs=0.02)
+    for start in (0.3, 0.8):  # the same behaviour wherever the drag starts
+        grab = QPointF(r.left() + start * r.width(), y)
+        value = w.sample.scale("FSC-A").inverse_scalar(start)
+        drop = QPointF(r.left() + (start + 0.15) * r.width(), y)
+        _drag(w, grab, drop)
+        after = w.sample.scale("FSC-A")
+        assert after.kind == "linear" and after.min == before["min"]
+        assert after.forward_scalar(value) == pytest.approx(start + 0.15, abs=0.02)  # the grabbed value followed the mouse
+    assert w.sample.scale("FSC-A").max < before["max"]  # dragging towards the top zoomed in
     assert w.controller.can_undo and w.controller.workspace.modified
+    w.controller.undo()
     w.controller.undo()
     assert w.sample.scale("FSC-A").to_dict() == before
 
 
-def test_drag_middle_pans_and_y_axis_low_end(widget):
+def test_right_drag_moves_the_whole_range(widget):
     w = widget
     r = w._result.plot_rect
-    span = w.sample.scale("FSC-A").max - w.sample.scale("FSC-A").min
-    _drag(w, QPointF(r.center().x(), r.bottom() + 12), QPointF(r.center().x() + 80, r.bottom() + 12))
-    panned = w.sample.scale("FSC-A")
-    assert panned.max - panned.min == pytest.approx(span) and panned.min < 0
-    ysc = w.sample.scale("SSC-A").to_dict()
-    _drag(w, QPointF(r.left() - 20, r.bottom() - 0.1 * r.height()), QPointF(r.left() - 20, r.bottom() - 0.3 * r.height()))
-    new = w.sample.scale("SSC-A")
-    assert new.max == ysc["max"] and new.min < ysc["min"]
+    sc = w.sample.scale("FSC-A")
+    span = sc.max - sc.min
+    _drag(w, QPointF(r.left() + 0.2 * r.width(), r.bottom() + 12), QPointF(r.left() + 0.4 * r.width(), r.bottom() + 12), Qt.MouseButton.RightButton)
+    moved = w.sample.scale("FSC-A")
+    assert moved.max - moved.min == pytest.approx(span) and moved.min < 0
+    ysc = w.sample.scale("SSC-A")
+    yspan = ysc.max - ysc.min
+    _drag(w, QPointF(r.left() - 20, r.bottom() - 0.5 * r.height()), QPointF(r.left() - 20, r.bottom() - 0.3 * r.height()), Qt.MouseButton.RightButton)
+    ynew = w.sample.scale("SSC-A")
+    assert ynew.max - ynew.min == pytest.approx(yspan) and ynew.min > ysc.min  # moved up: the range slides to higher values
+
+
+def test_right_click_without_drag_still_opens_the_menu(widget):
+    got = []
+    widget.contextMenuRequested.connect(lambda pop, pos: got.append(pop))
+    r = widget._result.plot_rect
+    p = QPoint(int(r.center().x()), int(r.bottom() + 12))
+    QTest.mousePress(widget, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, p)
+    QTest.mouseRelease(widget, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, p)
+    assert got == [None]
+
+
+def test_right_drag_on_a_logicle_axis_shows_more_negatives(widget):
+    w = widget
+    w.graph.x = "Comp-PE-A" if "Comp-PE-A" in w.sample.parameter_names() else w.sample.parameter_names()[3]
+    w.invalidate()
+    w.grab()
+    sc = w.sample.scale(w.graph.x)
+    if sc.kind != "logicle":
+        pytest.skip("parameter is not logicle in this test set")
+    r = w._result.plot_rect
+    _drag(w, QPointF(r.left() + 0.2 * r.width(), r.bottom() + 12), QPointF(r.left() + 0.35 * r.width(), r.bottom() + 12), Qt.MouseButton.RightButton)
+    new = w.sample.scale(w.graph.x)
+    assert new.T == sc.T and new.A > sc.A
+
+
+def test_refocus_puts_dragged_axes_back(widget):
+    w = widget
+    r = w._result.plot_rect
+    x0, y0 = w.sample.scale("FSC-A").to_dict(), w.sample.scale("SSC-A").to_dict()
+    assert not w.axes_changed()
+    _drag(w, QPointF(r.left() + 0.5 * r.width(), r.bottom() + 12), QPointF(r.left() + 0.8 * r.width(), r.bottom() + 12))
+    _drag(w, QPointF(r.left() + 0.5 * r.width(), r.bottom() + 12), QPointF(r.left() + 0.9 * r.width(), r.bottom() + 12))  # a second drag
+    _drag(w, QPointF(r.left() - 20, r.center().y()), QPointF(r.left() - 20, r.top() + 20), Qt.MouseButton.RightButton)
+    w.view = (0.1, 0.6, 0.1, 0.6)
+    assert w.axes_changed() and w.sample.scale("FSC-A").to_dict() != x0
+    w.refocus()
+    assert w.sample.scale("FSC-A").to_dict() == x0 and w.sample.scale("SSC-A").to_dict() == y0  # back past every drag
+    assert w.view == (0.0, 1.0, 0.0, 1.0) and not w.axes_changed() and "axis_home" not in w.graph.options
+    w.controller.undo()
+    assert w.sample.scale("FSC-A").to_dict() != x0  # refocus itself is one undo step
+
+
+def test_transform_dialog_choice_becomes_the_new_home(widget):
+    w = widget
+    r = w._result.plot_rect
+    _drag(w, QPointF(r.left() + 0.5 * r.width(), r.bottom() + 12), QPointF(r.left() + 0.8 * r.width(), r.bottom() + 12))
+    assert w.axes_changed()
+    w.forget_axis_home(["FSC-A"])
+    assert not w.axes_changed()
+
+
+def test_graph_window_refocus_button(testset):
+    from flowdesk.core.serialization import load_workspace
+    from flowdesk.ui.controller import WorkspaceController
+    from flowdesk.ui.graph_window import GraphWindow
+
+    c = WorkspaceController(load_workspace(testset / "FlowDesk testset.fdw"))
+    s = c.workspace.samples[0]
+    pop = s.root
+    pop.graph.x, pop.graph.y = "FSC-A", "SSC-A"
+    gw = GraphWindow(c, s, pop)
+    gw.resize(700, 600)
+    gw.show()
+    gw.plot.grab()
+    assert not gw.refocus_button.isEnabled()
+    r = gw.plot._result.plot_rect
+    _drag(gw.plot, QPointF(r.left() + 0.5 * r.width(), r.bottom() + 12), QPointF(r.left() + 0.8 * r.width(), r.bottom() + 12))
+    assert gw.refocus_button.isEnabled()
+    gw.refocus_button.click()
+    assert not gw.refocus_button.isEnabled()
+    c.workspace.modified = False
+    gw.close()
 
 
 def test_axis_strip_hit_rules(widget):
@@ -185,3 +258,29 @@ def test_legend_settings_reach_the_render_options(testset):
     assert o.legend_pos == [0.1, 0.7] and o.legend_font_size == 12.0 and o.legend_title == "T" and o.legend_labels == {"a": "b"}
     assert o.legend_show_samples is False
     assert RenderOptions.from_prefs({"legend_title": "global"}).legend_title == ""  # per graph only, never a global preference
+
+
+def test_plot_menu_opens_on_release_and_not_after_a_drag(widget, monkeypatch):
+    w = widget
+    got = []
+    w.contextMenuRequested.connect(lambda pop, pos: got.append(pop))
+    c = w._result.plot_rect.center().toPoint()
+    QTest.mousePress(w, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, c)
+    assert got == []  # nothing on press
+    QTest.mouseRelease(w, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, c)
+    assert got == [None]
+    QTest.mousePress(w, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, c)
+    QTest.mouseMove(w, c + QPoint(40, 30))
+    QTest.mouseRelease(w, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, c + QPoint(40, 30))
+    assert got == [None]  # dragged: no menu
+    other = w.controller.workspace.samples[1]
+    w.overlays = [(other, other.root)]
+    w.invalidate()
+    w.grab()
+    legend = []
+    monkeypatch.setattr(w, "_legend_menu", lambda row, pos: legend.append(row))
+    lp = w._result.legend_rows[1].center().toPoint()
+    QTest.mousePress(w, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, lp)
+    assert legend == []
+    QTest.mouseRelease(w, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, lp)
+    assert legend == [1]

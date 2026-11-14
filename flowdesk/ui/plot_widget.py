@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QColorDialog, QInputDialog, QMenu, QMessageBox, QW
 
 from ..core.gates import EllipseGate, PolygonGate, RectangleGate, gate_from_dict, make_quadrant_gates
 from ..core.model import Group, Population, Sample
-from ..core.transforms import drag_edge, rescale
+from ..core.transforms import rescale, scale_from_dict
 from .dialogs import GateNameDialog
 from .renderer import GateShape, RenderOptions, RenderResult, draw_gates, render_plot
 from .style import PLOT_FONT_DPI
@@ -67,6 +67,7 @@ class PlotWidget(QWidget):
     zoomChanged = Signal()
     renameRequested = Signal(object)  # Population (double-clicked gate label)
     axisEditRequested = Signal(str)  # "x" / "y": double-click on an axis opens the transform dialog
+    axesChanged = Signal()  # an axis range was dragged or refocused (the window enables its refocus button)
 
     def __init__(self, controller, sample: Sample, population: Population, parent=None):
         super().__init__(parent)
@@ -89,6 +90,7 @@ class PlotWidget(QWidget):
         self._rubber: QRectF | None = None
         self._axis_drag: dict | None = None
         self._legend_drag: dict | None = None
+        self._right_press: dict | None = None
         self._mouse = QPointF()
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -394,16 +396,14 @@ class PlotWidget(QWidget):
         self._mouse = pos
         if self._result is None or self._result.error:
             return
-        if event.button() == Qt.MouseButton.RightButton:
-            row = self._legend_hit(pos)
-            if row is not None:
-                self._legend_menu(row, event.globalPosition().toPoint())
+        if event.button() == Qt.MouseButton.RightButton and self.tool == "pointer" and self._hit(pos) is None:
+            axis = self._axis_hit(pos)
+            if axis is not None:
+                self._start_axis_drag(axis, pos, "move", event.globalPosition().toPoint())
                 return
-            hit = self._hit(pos) if self.tool == "pointer" else None
-            pop = hit[0].population if hit else None
-            if pop is not None:
-                self.set_selected(pop)
-            self.contextMenuRequested.emit(pop, event.globalPosition().toPoint())
+        if event.button() == Qt.MouseButton.RightButton:
+            # the menu opens when the button is released without dragging (see mouseReleaseEvent)
+            self._right_press = {"pos": pos, "global": event.globalPosition().toPoint()}
             return
         if event.button() != Qt.MouseButton.LeftButton:
             return
@@ -415,7 +415,7 @@ class PlotWidget(QWidget):
                 return
             axis = self._axis_hit(pos)
             if axis is not None:
-                self._start_axis_drag(axis, pos)
+                self._start_axis_drag(axis, pos, "range")
                 return
         if self.tool == "pointer":
             hit = self._hit(pos)
@@ -495,11 +495,19 @@ class PlotWidget(QWidget):
                 self.setCursor(Qt.CursorShape.OpenHandCursor if hit[1] == "body" else Qt.CursorShape.PointingHandCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
         pos = event.position()
-        if self._axis_drag is not None:
+        if self._axis_drag is not None and event.button() == self._axis_drag["button"]:
+            drag = self._axis_drag
             self._finish_axis_drag()
+            if not drag["moved"] and drag["mode"] == "move":
+                self.contextMenuRequested.emit(None, drag["global"])  # a right click without a drag: the usual menu
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            press, self._right_press = self._right_press, None
+            if press is not None and _dist(pos, press["pos"]) <= 4:
+                self._open_context_menu(press["pos"], event.globalPosition().toPoint())
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
             return
         if self._legend_drag is not None:
             drag, self._legend_drag = self._legend_drag, None
@@ -575,6 +583,19 @@ class PlotWidget(QWidget):
         self.statusText.emit("")
         super().leaveEvent(event)
 
+    def _open_context_menu(self, pos: QPointF, global_pos):
+        if self._result is None or self._result.error:
+            return
+        row = self._legend_hit(pos)
+        if row is not None:
+            self._legend_menu(row, global_pos)
+            return
+        hit = self._hit(pos) if self.tool == "pointer" else None
+        pop = hit[0].population if hit else None
+        if pop is not None:
+            self.set_selected(pop)
+        self.contextMenuRequested.emit(pop, global_pos)
+
     # ------------------------------------------------------- axis dragging
     def _axis_hit(self, pos: QPointF) -> str | None:
         """"x" / "y" when `pos` is on the tick labels below / left of the plot (a histogram's count axis is not draggable)."""
@@ -597,16 +618,24 @@ class PlotWidget(QWidget):
         vis = (r.bottom() - pos.y()) / max(r.height(), 1.0)
         return view[2] + vis * (view[3] - view[2]), vis
 
-    def _start_axis_drag(self, axis: str, pos: QPointF):
+    def _start_axis_drag(self, axis: str, pos: QPointF, mode: str, global_pos=None):
+        """mode "range" (left button): the grabbed value follows the mouse and the low end stays, so dragging towards the
+        top zooms in and towards the origin zooms out. mode "move" (right button): the whole range slides with the mouse
+        (logicle / arcsinh axes show more or less of their negative side)."""
         res = self._result
         param = res.x if axis == "x" else res.y
         scale = self.sample.scale(param).copy()
-        drag = {"axis": axis, "param": param, "scale": scale, "rect": QRectF(res.plot_rect), "view": tuple(res.view), "moved": False, "start": pos}
-        full, vis = self._axis_frac(drag, pos)
-        drag["edge"] = drag_edge(scale, vis)
+        drag = {"axis": axis, "param": param, "scale": scale, "rect": QRectF(res.plot_rect), "view": tuple(res.view), "moved": False,
+                "start": pos, "mode": mode, "global": global_pos,
+                "button": Qt.MouseButton.LeftButton if mode == "range" else Qt.MouseButton.RightButton}
+        full, _vis = self._axis_frac(drag, pos)
         drag["value"] = float(scale.inverse_scalar(min(max(full, 0.0), 1.0)))
+        if mode == "range":
+            drag["edge"] = "max"
+        else:
+            drag["edge"] = "pan" if scale.kind in ("linear", "log") else "min"
         self._axis_drag = drag
-        self.setCursor(self._axis_cursor(axis, drag["edge"], pressed=True))
+        self.setCursor(self._axis_cursor(axis, mode, pressed=True))
 
     def _move_axis_drag(self, pos: QPointF):
         drag = self._axis_drag
@@ -615,11 +644,14 @@ class PlotWidget(QWidget):
                 return
             drag["moved"] = True
             self.controller.begin_change("change axis range")
+            home = dict(self.graph.options.get("axis_home") or {})
+            home.setdefault(drag["param"], drag["scale"].to_dict())  # what refocus goes back to
+            self.graph.options["axis_home"] = home
         full, _vis = self._axis_frac(drag, pos)
         new = rescale(drag["scale"], drag["edge"], drag["value"], full)
         drag["new"] = new
         self.sample.set_scale(drag["param"], new)
-        self.statusText.emit(f"{drag['param']}: {new.describe()}  (double-click the axis for exact values)")
+        self.statusText.emit(f"{drag['param']}: {new.describe()}  ·  refocus (bottom left) restores the axes")
         self.invalidate()
 
     def _finish_axis_drag(self):
@@ -628,12 +660,50 @@ class PlotWidget(QWidget):
             self.controller.mark_modified()
             self.controller.scalesChanged.emit(self.sample.id)
             self.controller.gatingChanged.emit(self.sample.id)
-        self.setCursor(self._axis_cursor(drag["axis"], drag["edge"]))
+            self.axesChanged.emit()
+        self.setCursor(self._axis_cursor(drag["axis"], "range"))
+
+    # ------------------------------------------------------------- refocus
+    def axes_changed(self) -> bool:
+        """True when an axis of this plot was dragged (or zoomed) away from where it started."""
+        home = self.graph.options.get("axis_home") or {}
+        return any(p in home for p in (self.graph.x, self.graph.y) if p) or tuple(self.view) != (0.0, 1.0, 0.0, 1.0)
+
+    def refocus(self):
+        """Put the axes back: the ranges they had before they were dragged, and no zoom. One undo step."""
+        home = dict(self.graph.options.get("axis_home") or {})
+        params = [p for p in (self.graph.x, self.graph.y) if p and p in home]
+        if params:
+            self.controller.begin_change("refocus axes")
+            for p in params:
+                self.sample.set_scale(p, scale_from_dict(home.pop(p)))
+            if home:
+                self.graph.options["axis_home"] = home
+            else:
+                self.graph.options.pop("axis_home", None)
+            self.controller.mark_modified()
+            self.controller.scalesChanged.emit(self.sample.id)
+            self.controller.gatingChanged.emit(self.sample.id)
+        if tuple(self.view) != (0.0, 1.0, 0.0, 1.0):
+            self.view = (0.0, 1.0, 0.0, 1.0)
+            self.zoomChanged.emit()
+        self.invalidate()
+        self.axesChanged.emit()
+
+    def forget_axis_home(self, params):
+        """The user set these scales explicitly (transform dialog): refocus no longer goes back past that."""
+        home = dict(self.graph.options.get("axis_home") or {})
+        if any(home.pop(p, None) is not None for p in params):
+            if home:
+                self.graph.options["axis_home"] = home
+            else:
+                self.graph.options.pop("axis_home", None)
+            self.axesChanged.emit()
 
     @staticmethod
-    def _axis_cursor(axis: str, edge: str, pressed: bool = False):
-        if edge == "pan":
-            return Qt.CursorShape.ClosedHandCursor if pressed else Qt.CursorShape.OpenHandCursor
+    def _axis_cursor(axis: str, mode: str, pressed: bool = False):
+        if mode == "move":
+            return Qt.CursorShape.ClosedHandCursor
         return Qt.CursorShape.SizeHorCursor if axis == "x" else Qt.CursorShape.SizeVerCursor
 
     def _hover_cursor(self, pos: QPointF):
@@ -644,14 +714,8 @@ class PlotWidget(QWidget):
         if axis is None:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
-        res = self._result
-        param = res.x if axis == "x" else res.y
-        r = res.plot_rect
-        vis = (pos.x() - r.left()) / max(r.width(), 1.0) if axis == "x" else (r.bottom() - pos.y()) / max(r.height(), 1.0)
-        edge = drag_edge(self.sample.scale(param), vis)
-        self.setCursor(self._axis_cursor(axis, edge))
-        what = {"min": "the low end", "max": "the high end", "pan": "the whole range"}[edge]
-        self.statusText.emit(f"Drag to move {what} of the {axis} axis · double-click for the transform dialog")
+        self.setCursor(self._axis_cursor(axis, "range"))
+        self.statusText.emit(f"{axis} axis: left-drag changes the range · right-drag moves it · double-click: transform dialog")
 
     # -------------------------------------------------------------- legend
     def _legend_hit(self, pos: QPointF) -> int | None:
@@ -766,7 +830,7 @@ class PlotWidget(QWidget):
                 self.zoom_by(1.25)
                 return
             if key == Qt.Key.Key_0:
-                self.reset_zoom()
+                self.refocus()
                 return
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             if self._poly:

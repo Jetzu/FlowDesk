@@ -502,16 +502,6 @@ def _bisect(fn, lo: float, hi: float, iters: int = 60) -> float:
     return 0.5 * (lo + hi)
 
 
-def drag_edge(scale: Scale, frac: float) -> str:
-    """Which part of an axis a drag that starts at display fraction `frac` changes: the low end ("min"), the high end
-    ("max") or, in the middle of a linear or log axis, both together ("pan")."""
-    if frac < 1.0 / 3.0:
-        return "min"
-    if frac > 2.0 / 3.0 or scale.kind not in ("linear", "log"):
-        return "max"
-    return "pan"
-
-
 def rescale(scale: Scale, edge: str, value: float, frac: float) -> Scale:
     """A copy of `scale` changed so that the data value `value` (the one grabbed on the axis) lands at display fraction
     `frac`. edge "max" keeps the low end and moves the top, "min" keeps the top and moves the low end, "pan" shifts the

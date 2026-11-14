@@ -202,6 +202,8 @@ class GraphWindow(QMainWindow):
         self.plot.zoomChanged.connect(self._sync_axes_ui)
         self.plot.renameRequested.connect(self._rename)
         self.plot.axisEditRequested.connect(self._customize_axis)
+        self.plot.axesChanged.connect(self._sync_refocus)
+        self.plot.zoomChanged.connect(self._sync_refocus)
 
         self._build_toolbar()
         self._build_central()
@@ -427,6 +429,12 @@ class GraphWindow(QMainWindow):
         fl.addWidget(self.plot)
         pcol.addWidget(frame, 1)
         xrow = QHBoxLayout()
+        self.refocus_button = QToolButton()
+        self.refocus_button.setObjectName("transformButton")
+        self.refocus_button.setIcon(icon("refocus"))
+        self.refocus_button.setToolTip("Refocus: put the axis ranges back to where they were before dragging, and undo any zoom (0)")
+        self.refocus_button.clicked.connect(self.plot.refocus)
+        xrow.addWidget(self.refocus_button)
         xrow.addStretch(1)
         self.x_button = AxisButton(vertical=False)
         self.x_button.setMenu(QMenu(self.x_button))
@@ -499,9 +507,15 @@ class GraphWindow(QMainWindow):
         self.plot_type.setCurrentIndex(max(0, idx))
         self.plot_type.blockSignals(False)
         self.y_transform.setEnabled(g.y is not None)
+        self._sync_refocus()
         self.statusBar().showMessage(self._event_summary(), 4000)
         if getattr(self, "_stats_axes", None) != (g.x, g.y):
             self._refresh_stats()
+
+    def _sync_refocus(self):
+        button = getattr(self, "refocus_button", None)
+        if button is not None:
+            button.setEnabled(self.plot.axes_changed())
 
     def _event_summary(self) -> str:
         pop = self.population
@@ -566,6 +580,7 @@ class GraphWindow(QMainWindow):
             params = [n for n in self.sample.parameter_names() if self.sample.scale(n).kind != "linear" or n == param]
         for p in params:
             self.controller.set_scale(samples, p, scale)
+        self.plot.forget_axis_home(params)
         self.plot.invalidate()
 
     def _on_selection(self, pop):
@@ -877,9 +892,11 @@ class GraphWindow(QMainWindow):
         act.triggered.connect(self._copy_image)
         menu.addAction(self.save_plot_action)
         menu.addAction(self.print_action)
-        if self.plot.view != (0.0, 1.0, 0.0, 1.0):
-            act = menu.addAction("Reset zoom")
-            act.triggered.connect(self.plot.reset_zoom)
+        if self.plot.axes_changed():
+            menu.addSeparator()
+            act = menu.addAction(icon("refocus"), "Refocus Axes")
+            act.setShortcut("0")
+            act.triggered.connect(self.plot.refocus)
         menu.exec(global_pos)
 
     def _rename(self, pop: Population):

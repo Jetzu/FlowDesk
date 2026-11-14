@@ -588,6 +588,22 @@ def _draw(name: str, p: QPainter, s: float):
         p.drawLine(QPointF(cx + r.width() * 0.22, r.top() + r.height() * 0.3), QPointF(cx + r.width() * 0.22, cy))
         p.setBrush(YELLOW)
         p.drawRoundedRect(QRectF(r.left() + r.width() * 0.15, cy - 1, r.width() * 0.7, r.height() * 0.5), 2, 2)
+    elif name == "refocus":
+        # a viewfinder: four corner brackets around a centred target
+        lw = max(1.3, s * 0.075)
+        p.setPen(QPen(INK, lw, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        k = r.width() * 0.3
+        for (x, y, dx, dy) in ((r.left(), r.top(), 1, 1), (r.right(), r.top(), -1, 1), (r.left(), r.bottom(), 1, -1), (r.right(), r.bottom(), -1, -1)):
+            path = QPainterPath(QPointF(x + dx * k, y))
+            path.lineTo(QPointF(x, y))
+            path.lineTo(QPointF(x, y + dy * k))
+            p.drawPath(path)
+        p.setPen(QPen(BLUE, lw))
+        p.drawEllipse(QPointF(cx, cy), r.width() * 0.2, r.height() * 0.2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(BLUE)
+        p.drawEllipse(QPointF(cx, cy), max(1.0, r.width() * 0.07), max(1.0, r.height() * 0.07))
     elif name in ("agent", "agent-connect"):
         _draw_agent_bubble(p, r, s, small=(name == "agent-connect"))
         if name == "agent-connect":

@@ -35,8 +35,8 @@ single-stain controls; the ones marked *synthetic* use generated test data (DNA-
 
 Rectangle, polygon, ellipse, quadrant, range, bisector and freehand gates, drawn on pseudocolor, dot, contour, zebra,
 density or histogram plots, with the same tools, order and letter shortcuts as FlowJo. Axes are linear, logicle
-(biexponential), logarithmic or arcsinh, with the `T` dialog for width basis and decades. Drag an axis's tick labels to stretch either end or pan the range
-(double-click for the `T` dialog), and drag the overlay legend anywhere; right-click it to rename entries, change
+(biexponential), logarithmic or arcsinh, with the `T` dialog for width basis and decades. Left-drag an axis's tick labels to change its range, right-drag to move it, and refocus
+(bottom left, or `0`) to put it back; double-click an axis for the `T` dialog, and drag the overlay legend anywhere; right-click it to rename entries, change
 colours, font size and title.
 
 <p align="center"><img src="docs/walkthrough/07_quadrants.png" width="640" alt="Quadrant gate on CD4 versus CD8"></p>
