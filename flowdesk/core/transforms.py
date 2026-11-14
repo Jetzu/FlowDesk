@@ -482,3 +482,88 @@ def default_scale_for_channel(
     if upper.endswith("-W") or upper.endswith("WIDTH"):
         return LinearScale(0.0, top)
     return default_fluorescence_scale(top, transform, width_basis)
+
+
+# ------------------------------------------------------------ dragging an axis
+def _bisect(fn, lo: float, hi: float, iters: int = 60) -> float:
+    """Root of a monotone fn on [lo, hi]; the nearer end when there is none."""
+    flo, fhi = fn(lo), fn(hi)
+    if flo == 0:
+        return lo
+    if fhi == 0 or (flo > 0) == (fhi > 0):
+        return lo if abs(flo) < abs(fhi) else hi
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        fm = fn(mid)
+        if (fm > 0) == (flo > 0):
+            lo, flo = mid, fm
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def drag_edge(scale: Scale, frac: float) -> str:
+    """Which part of an axis a drag that starts at display fraction `frac` changes: the low end ("min"), the high end
+    ("max") or, in the middle of a linear or log axis, both together ("pan")."""
+    if frac < 1.0 / 3.0:
+        return "min"
+    if frac > 2.0 / 3.0 or scale.kind not in ("linear", "log"):
+        return "max"
+    return "pan"
+
+
+def rescale(scale: Scale, edge: str, value: float, frac: float) -> Scale:
+    """A copy of `scale` changed so that the data value `value` (the one grabbed on the axis) lands at display fraction
+    `frac`. edge "max" keeps the low end and moves the top, "min" keeps the top and moves the low end, "pan" shifts the
+    range (linear and log). Logicle and arcsinh scales change their top (T) or their extra negative decades (A), so the
+    shape of the transform stays what the user chose."""
+    f = min(max(float(frac), 0.02), 0.98)
+    v = float(value)
+    if isinstance(scale, LinearScale):
+        lo, hi = scale.min, scale.max
+        if edge == "pan":
+            span = hi - lo
+            lo = v - f * span
+            return LinearScale(lo, lo + span)
+        if edge == "max":
+            if v <= lo:
+                return scale.copy()
+            return LinearScale(lo, lo + (v - lo) / f)
+        if v >= hi:
+            return scale.copy()
+        return LinearScale((v - f * hi) / (1.0 - f), hi)
+    if isinstance(scale, LogScale):
+        if v <= 0:
+            return scale.copy()
+        lv, llo, lhi = math.log10(v), math.log10(scale.min), math.log10(scale.max)
+        if edge == "pan":
+            span = lhi - llo
+            llo = lv - f * span
+            return LogScale(10 ** llo, 10 ** (llo + span))
+        if edge == "max":
+            if lv <= llo:
+                return scale.copy()
+            return LogScale(scale.min, 10 ** (llo + (lv - llo) / f))
+        if lv >= lhi:
+            return scale.copy()
+        return LogScale(10 ** ((lv - f * lhi) / (1.0 - f)), scale.max)
+    if isinstance(scale, LogicleScale):
+        T, W, M, A = scale.T, scale.W, scale.M, scale.A
+        if edge == "min":
+            amax = max(0.0, M - 2 * W)
+            a = _bisect(lambda a: LogicleScale(T, W, M, a).forward_scalar(v) - f, 0.0, amax, iters=40)
+            return LogicleScale(T, W, M, a)
+        if v <= 0:
+            return scale.copy()
+        lt = _bisect(lambda lt: LogicleScale(10 ** lt, W, M, A).forward_scalar(v) - f, math.log10(max(v, 1.0)) - 0.01, math.log10(T) + 4, iters=50)
+        return LogicleScale(10 ** lt, W, M, A)
+    if isinstance(scale, ArcsinhScale):
+        T, M, A = scale.T, scale.M, scale.A
+        if edge == "min":
+            a = _bisect(lambda a: ArcsinhScale(T, M, a).forward_scalar(v) - f, 0.0, M, iters=40)
+            return ArcsinhScale(T, M, a)
+        if v <= 0:
+            return scale.copy()
+        lt = _bisect(lambda lt: ArcsinhScale(10 ** lt, M, A).forward_scalar(v) - f, math.log10(max(v, 1.0)) - 4, math.log10(T) + 4, iters=50)
+        return ArcsinhScale(10 ** lt, M, A)
+    return scale.copy()

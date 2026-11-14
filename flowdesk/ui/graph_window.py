@@ -201,6 +201,7 @@ class GraphWindow(QMainWindow):
         self.plot.contextMenuRequested.connect(self._context_menu)
         self.plot.zoomChanged.connect(self._sync_axes_ui)
         self.plot.renameRequested.connect(self._rename)
+        self.plot.axisEditRequested.connect(self._customize_axis)
 
         self._build_toolbar()
         self._build_central()

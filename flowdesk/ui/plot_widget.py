@@ -6,10 +6,11 @@ import math
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QCursor, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import QMessageBox, QWidget
+from PySide6.QtWidgets import QColorDialog, QInputDialog, QMenu, QMessageBox, QWidget
 
 from ..core.gates import EllipseGate, PolygonGate, RectangleGate, gate_from_dict, make_quadrant_gates
 from ..core.model import Group, Population, Sample
+from ..core.transforms import drag_edge, rescale
 from .dialogs import GateNameDialog
 from .renderer import GateShape, RenderOptions, RenderResult, draw_gates, render_plot
 from .style import PLOT_FONT_DPI
@@ -17,6 +18,7 @@ from .style import PLOT_FONT_DPI
 TOOLS = ("pointer", "rect", "polygon", "ellipse", "quadrant", "range", "bisector", "freehand", "zoom")
 HANDLE = 4.0
 HIT = 6.0
+AXIS_STRIP = 40.0  # px below / left of the plot where dragging changes the axis range
 
 
 def _dist(a: QPointF, b: QPointF) -> float:
@@ -64,6 +66,7 @@ class PlotWidget(QWidget):
     contextMenuRequested = Signal(object, object)  # Population | None, QPoint (global)
     zoomChanged = Signal()
     renameRequested = Signal(object)  # Population (double-clicked gate label)
+    axisEditRequested = Signal(str)  # "x" / "y": double-click on an axis opens the transform dialog
 
     def __init__(self, controller, sample: Sample, population: Population, parent=None):
         super().__init__(parent)
@@ -84,6 +87,8 @@ class PlotWidget(QWidget):
         self._poly: list[QPointF] = []
         self._free: list[QPointF] = []
         self._rubber: QRectF | None = None
+        self._axis_drag: dict | None = None
+        self._legend_drag: dict | None = None
         self._mouse = QPointF()
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -390,6 +395,10 @@ class PlotWidget(QWidget):
         if self._result is None or self._result.error:
             return
         if event.button() == Qt.MouseButton.RightButton:
+            row = self._legend_hit(pos)
+            if row is not None:
+                self._legend_menu(row, event.globalPosition().toPoint())
+                return
             hit = self._hit(pos) if self.tool == "pointer" else None
             pop = hit[0].population if hit else None
             if pop is not None:
@@ -399,6 +408,15 @@ class PlotWidget(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         inside = self._result.plot_rect.contains(pos)
+        if self.tool == "pointer" and self._hit(pos) is None:
+            if self._legend_hit(pos) is not None:
+                self._legend_drag = {"start": pos, "rect": QRectF(self._result.legend_rect), "moved": False}
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return
+            axis = self._axis_hit(pos)
+            if axis is not None:
+                self._start_axis_drag(axis, pos)
+                return
         if self.tool == "pointer":
             hit = self._hit(pos)
             if hit is None:
@@ -435,6 +453,12 @@ class PlotWidget(QWidget):
         res = self._result
         if res is None or res.error:
             return
+        if self._axis_drag is not None:
+            self._move_axis_drag(pos)
+            return
+        if self._legend_drag is not None:
+            self._move_legend_drag(pos)
+            return
         if self._drag is not None:
             if not self._drag["moved"]:
                 if _dist(pos, self._drag["start"]) < 2:
@@ -464,7 +488,7 @@ class PlotWidget(QWidget):
         if self.tool == "pointer":
             hit = self._hit(pos)
             if hit is None:
-                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self._hover_cursor(pos)
             elif hit[1].startswith("handle") or hit[1] == "quad":
                 self.setCursor(Qt.CursorShape.SizeAllCursor if hit[1] == "quad" else Qt.CursorShape.CrossCursor)
             else:
@@ -474,6 +498,16 @@ class PlotWidget(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         pos = event.position()
+        if self._axis_drag is not None:
+            self._finish_axis_drag()
+            return
+        if self._legend_drag is not None:
+            drag, self._legend_drag = self._legend_drag, None
+            if drag["moved"]:
+                self.controller.mark_modified()
+                self.graphChanged.emit()
+            self._hover_cursor(pos)
+            return
         if self._drag is not None:
             drag = self._drag
             self._drag = None
@@ -522,6 +556,14 @@ class PlotWidget(QWidget):
             return
         hit = self._hit(pos)
         if hit is None:
+            row = self._legend_hit(pos)
+            if row is not None and row >= 0:
+                self._rename_legend_entry(row)
+                return
+            axis = self._axis_hit(pos)
+            if axis is not None:
+                self._axis_drag = None
+                self.axisEditRequested.emit(axis)
             return
         self._drag = None
         if hit[1] == "label":
@@ -532,6 +574,178 @@ class PlotWidget(QWidget):
     def leaveEvent(self, event):
         self.statusText.emit("")
         super().leaveEvent(event)
+
+    # ------------------------------------------------------- axis dragging
+    def _axis_hit(self, pos: QPointF) -> str | None:
+        """"x" / "y" when `pos` is on the tick labels below / left of the plot (a histogram's count axis is not draggable)."""
+        res = self._result
+        if res is None or res.error or res.x_scale is None:
+            return None
+        r = res.plot_rect
+        if r.left() - 4 <= pos.x() <= r.right() + 4 and r.bottom() < pos.y() <= r.bottom() + AXIS_STRIP:
+            return "x"
+        if res.y and res.y_scale is not None and not res.histogram and r.top() - 4 <= pos.y() <= r.bottom() + 4 and r.left() - AXIS_STRIP * 1.6 <= pos.x() < r.left():
+            return "y"
+        return None
+
+    def _axis_frac(self, drag: dict, pos: QPointF) -> tuple[float, float]:
+        """(fraction of the full scale, fraction of the visible axis) of `pos`, measured on the plot as it was when the drag began."""
+        r, view = drag["rect"], drag["view"]
+        if drag["axis"] == "x":
+            vis = (pos.x() - r.left()) / max(r.width(), 1.0)
+            return view[0] + vis * (view[1] - view[0]), vis
+        vis = (r.bottom() - pos.y()) / max(r.height(), 1.0)
+        return view[2] + vis * (view[3] - view[2]), vis
+
+    def _start_axis_drag(self, axis: str, pos: QPointF):
+        res = self._result
+        param = res.x if axis == "x" else res.y
+        scale = self.sample.scale(param).copy()
+        drag = {"axis": axis, "param": param, "scale": scale, "rect": QRectF(res.plot_rect), "view": tuple(res.view), "moved": False, "start": pos}
+        full, vis = self._axis_frac(drag, pos)
+        drag["edge"] = drag_edge(scale, vis)
+        drag["value"] = float(scale.inverse_scalar(min(max(full, 0.0), 1.0)))
+        self._axis_drag = drag
+        self.setCursor(self._axis_cursor(axis, drag["edge"], pressed=True))
+
+    def _move_axis_drag(self, pos: QPointF):
+        drag = self._axis_drag
+        if not drag["moved"]:
+            if _dist(pos, drag["start"]) < 3:
+                return
+            drag["moved"] = True
+            self.controller.begin_change("change axis range")
+        full, _vis = self._axis_frac(drag, pos)
+        new = rescale(drag["scale"], drag["edge"], drag["value"], full)
+        drag["new"] = new
+        self.sample.set_scale(drag["param"], new)
+        self.statusText.emit(f"{drag['param']}: {new.describe()}  (double-click the axis for exact values)")
+        self.invalidate()
+
+    def _finish_axis_drag(self):
+        drag, self._axis_drag = self._axis_drag, None
+        if drag["moved"] and drag.get("new") is not None:
+            self.controller.mark_modified()
+            self.controller.scalesChanged.emit(self.sample.id)
+            self.controller.gatingChanged.emit(self.sample.id)
+        self.setCursor(self._axis_cursor(drag["axis"], drag["edge"]))
+
+    @staticmethod
+    def _axis_cursor(axis: str, edge: str, pressed: bool = False):
+        if edge == "pan":
+            return Qt.CursorShape.ClosedHandCursor if pressed else Qt.CursorShape.OpenHandCursor
+        return Qt.CursorShape.SizeHorCursor if axis == "x" else Qt.CursorShape.SizeVerCursor
+
+    def _hover_cursor(self, pos: QPointF):
+        if self._legend_hit(pos) is not None:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
+        axis = self._axis_hit(pos)
+        if axis is None:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        res = self._result
+        param = res.x if axis == "x" else res.y
+        r = res.plot_rect
+        vis = (pos.x() - r.left()) / max(r.width(), 1.0) if axis == "x" else (r.bottom() - pos.y()) / max(r.height(), 1.0)
+        edge = drag_edge(self.sample.scale(param), vis)
+        self.setCursor(self._axis_cursor(axis, edge))
+        what = {"min": "the low end", "max": "the high end", "pan": "the whole range"}[edge]
+        self.statusText.emit(f"Drag to move {what} of the {axis} axis · double-click for the transform dialog")
+
+    # -------------------------------------------------------------- legend
+    def _legend_hit(self, pos: QPointF) -> int | None:
+        """None outside the legend; else the entry row under `pos` (-1 = the title or the frame)."""
+        res = self._result
+        if res is None or res.legend_rect is None or not res.legend_rect.contains(pos):
+            return None
+        for i, row in enumerate(res.legend_rows):
+            if row.contains(pos):
+                return i
+        return -1
+
+    def _move_legend_drag(self, pos: QPointF):
+        drag = self._legend_drag
+        if not drag["moved"]:
+            if _dist(pos, drag["start"]) < 3:
+                return
+            drag["moved"] = True
+            self.controller.begin_change("move legend")
+        r = self._result.plot_rect
+        top_left = drag["rect"].topLeft() + (pos - drag["start"])
+        fx = (top_left.x() - r.left()) / max(r.width(), 1.0)
+        fy = (top_left.y() - r.top()) / max(r.height(), 1.0)
+        self.graph.options["legend_pos"] = [round(min(max(fx, 0.0), 1.0), 4), round(min(max(fy, 0.0), 1.0), 4)]
+        self.invalidate()
+
+    def _set_legend_option(self, key: str, value, label: str = "edit legend"):
+        self.controller.begin_change(label)
+        if value is None:
+            self.graph.options.pop(key, None)
+        else:
+            self.graph.options[key] = value
+        self.controller.mark_modified()
+        self.graphChanged.emit()
+        self.invalidate()
+
+    def _rename_legend_entry(self, row: int):
+        res = self._result
+        if not (0 <= row < len(res.legend_keys)):
+            return
+        key = res.legend_keys[row]
+        text, ok = QInputDialog.getText(self, "Legend entry", f"Label for {key}:", text=res.legend_entries[row][0])
+        if not ok:
+            return
+        labels = dict(self.graph.options.get("legend_labels") or {})
+        if text.strip() and text.strip() != key:
+            labels[key] = text.strip()
+        else:
+            labels.pop(key, None)
+        self._set_legend_option("legend_labels", labels or None, "rename legend entry")
+
+    def _recolor_legend_entry(self, row: int):
+        if row < 1:
+            return
+        opts = self.options()
+        colours = list(opts.overlay_colors)
+        k = (row - 1) % len(colours)
+        colour = QColorDialog.getColor(QColor(colours[k]), self, "Overlay colour")
+        if colour.isValid():
+            colours[k] = colour.name()
+            self._set_legend_option("overlay_colors", colours, "change overlay colour")
+
+    def _legend_menu(self, row: int, global_pos):
+        opts = self.options()
+        menu = QMenu(self)
+        if row >= 0:
+            menu.addAction("Rename Entry…", lambda: self._rename_legend_entry(row))
+            if row >= 1:
+                menu.addAction("Entry Colour…", lambda: self._recolor_legend_entry(row))
+            menu.addSeparator()
+        act = menu.addAction("Show Sample Names")
+        act.setCheckable(True)
+        act.setChecked(bool(opts.legend_show_samples))
+        act.toggled.connect(lambda on: self._set_legend_option("legend_show_samples", bool(on)))
+
+        def ask_title():
+            text, ok = QInputDialog.getText(self, "Legend title", "Title (empty for none):", text=opts.legend_title or "")
+            if ok:
+                self._set_legend_option("legend_title", text.strip() or None)
+
+        menu.addAction("Title…", ask_title)
+        sizes = menu.addMenu("Font Size")
+        current = float(opts.legend_font_size or 0)
+        for size in (0, 7, 8, 9, 10, 11, 12, 14, 16, 18):
+            a = sizes.addAction("Automatic" if size == 0 else f"{size} pt")
+            a.setCheckable(True)
+            a.setChecked(abs(current - size) < 1e-6)
+            a.triggered.connect(lambda _=False, v=size: self._set_legend_option("legend_font_size", float(v) if v else None))
+        menu.addSeparator()
+        menu.addAction("Reset Position", lambda: self._set_legend_option("legend_pos", None, "move legend"))
+        if opts.legend_labels:
+            menu.addAction("Reset Labels", lambda: self._set_legend_option("legend_labels", None))
+        menu.addAction("Hide Legend", lambda: self._set_legend_option("show_legend", False))
+        menu.exec(global_pos)
 
     # ----------------------------------------------------------- keyboard
     def keyPressEvent(self, event: QKeyEvent):

@@ -255,19 +255,33 @@ def _draw(name: str, p: QPainter, s: float):
         p.setBrush(PAPER)
         p.drawEllipse(QPointF(cx, cy), r.width() * 0.18, r.width() * 0.18)
     elif name in ("undo", "redo"):
-        p.setPen(_pen(INK, 2.2))
+        # a curved arrow: the head points left (undo) and the tail sweeps right and down; redo is its mirror image
+        p.save()
+        if name == "redo":
+            p.translate(s, 0)
+            p.scale(-1, 1)
+        x0, y0, w, h = r.left(), r.top(), r.width(), r.height()
+
+        def pt(fx, fy):
+            return QPointF(x0 + fx * w, y0 + fy * h)
+
+        lw = max(1.5, s * 0.095)
+        pen = QPen(BLUE, lw, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        rect = QRectF(r.left() + 3, r.top() + 4, r.width() - 6, r.height() - 4)
-        if name == "undo":
-            p.drawArc(rect, 20 * 16, 250 * 16)
-            tip = QPointF(rect.left() + 1, rect.center().y() + 1)
-            p.setBrush(INK)
-            p.drawPolygon(QPolygonF([tip, QPointF(tip.x() + 6, tip.y() - 6), QPointF(tip.x() + 7, tip.y() + 2)]))
-        else:
-            p.drawArc(rect, -90 * 16, 250 * 16)
-            tip = QPointF(rect.right() - 1, rect.center().y() + 1)
-            p.setBrush(INK)
-            p.drawPolygon(QPolygonF([tip, QPointF(tip.x() - 6, tip.y() - 6), QPointF(tip.x() - 7, tip.y() + 2)]))
+        shaft = QPainterPath(pt(0.3, 0.36))
+        shaft.lineTo(pt(0.56, 0.36))
+        shaft.cubicTo(pt(0.86, 0.36), pt(1.0, 0.56), pt(0.94, 0.74))
+        shaft.cubicTo(pt(0.9, 0.86), pt(0.78, 0.92), pt(0.62, 0.92))
+        p.drawPath(shaft)
+        head = QPainterPath(pt(0.02, 0.36))
+        head.lineTo(pt(0.36, 0.1))
+        head.lineTo(pt(0.36, 0.62))
+        head.closeSubpath()
+        p.setPen(QPen(BLUE, max(1.0, s * 0.04), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(BLUE)
+        p.drawPath(head)
+        p.restore()
     elif name == "copy":
         _page(p, QRectF(r.left(), r.top(), r.width() - 6, r.height() - 6))
         _page(p, QRectF(r.left() + 6, r.top() + 6, r.width() - 6, r.height() - 6))

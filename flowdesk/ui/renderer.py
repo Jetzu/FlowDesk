@@ -87,6 +87,14 @@ class RenderOptions:
     # 96 matches what the layout editor assumes; graph windows use 72 (1 pt = 1 px).
     font_dpi: float = 96.0
     show_legend: bool = True  # legend box when overlays are drawn
+    # legend layout, kept in the graph's options so it survives and reaches layouts: top-left corner in plot fractions
+    # (None = top right), font size in points (0 = the number font), a title, labels renamed by the user (original
+    # label -> text) and whether labels carry the sample name
+    legend_pos: tuple | None = None
+    legend_font_size: float = 0.0
+    legend_title: str = ""
+    legend_labels: dict = field(default_factory=dict)
+    legend_show_samples: bool = True
     histogram_offset: bool = False  # stack overlaid histograms with a vertical offset
     histogram_line_width: float = 1.2
 
@@ -94,7 +102,7 @@ class RenderOptions:
     def from_prefs(cls, prefs, graph: GraphSettings | None = None, **overrides) -> "RenderOptions":
         values = {}
         for f in cls.__dataclass_fields__:
-            if f in ("title", "overlay_colors", "view", "font_dpi"):
+            if f in ("title", "overlay_colors", "view", "font_dpi") or f.startswith("legend_"):
                 continue
             try:
                 v = prefs.get(f) if hasattr(prefs, "get") else None
@@ -149,6 +157,8 @@ class RenderResult:
     view: tuple = (0.0, 1.0, 0.0, 1.0)
     legend_rect: QRectF | None = None  # overlay legend box (image pixels), when drawn
     legend_entries: list = field(default_factory=list)  # [(label, colour name)]
+    legend_keys: list = field(default_factory=list)  # original label of each entry (key of RenderOptions.legend_labels)
+    legend_rows: list = field(default_factory=list)  # QRectF of each entry's row (image pixels)
 
     # ---- coordinate helpers (image pixels <-> display fractions)
     def to_pixel(self, fx: float, fy: float) -> QPointF:
@@ -419,44 +429,71 @@ def _paint_plot(painter: QPainter, image: QImage, sample, population, graph, wid
         draw_gates(painter, result, population, sample, options, selected)
     # ---- overlay legend
     if overlays and options.show_legend:
-        entries = [(f"{sample.name} / {population.display_name}", options.histogram_line if histogram else "#7a7f87")]
-        for k, (osample, opop) in enumerate(overlays):
-            label = f"{osample.name} / {opop.display_name}"
-            absent = [n for n in (x, y) if n and not has_parameter(osample, n)]
+        series = [(sample, population, options.histogram_line if histogram else "#7a7f87")]
+        series += [(osample, opop, options.overlay_colors[k % len(options.overlay_colors)]) for k, (osample, opop) in enumerate(overlays)]
+        keys, entries = [], []
+        custom = options.legend_labels or {}
+        for ssample, spop, colour in series:
+            key = f"{ssample.name} / {spop.display_name}"
+            label = key if options.legend_show_samples else spop.display_name
+            absent = [n for n in (x, y) if n and not has_parameter(ssample, n)]
             if absent:
                 label += f" (no {' / '.join(absent)})"
-            entries.append((label, options.overlay_colors[k % len(options.overlay_colors)]))
+            keys.append(key)
+            entries.append((str(custom.get(key, label)), colour))
         result.legend_entries = entries
-        result.legend_rect = _draw_legend(painter, plot_rect, entries, number_font)
+        result.legend_keys = keys
+        font = plot_font(options.legend_font_size, options) if options.legend_font_size and options.legend_font_size > 0 else number_font
+        result.legend_rect, result.legend_rows = _draw_legend(painter, plot_rect, entries, font, options.legend_pos, options.legend_title)
     return result
 
 
-def _draw_legend(painter: QPainter, plot: QRectF, entries: list[tuple[str, str]], font: QFont) -> QRectF:
-    """Colour swatch + label per series, boxed in the top-right plot corner."""
+def _draw_legend(painter: QPainter, plot: QRectF, entries: list[tuple[str, str]], font: QFont, pos: tuple | None = None,
+                 title: str = "") -> tuple[QRectF, list[QRectF]]:
+    """Colour swatch + label per series in a box: in the top-right plot corner, or with its top-left corner at `pos`
+    (fractions of the plot rectangle), always kept inside the plot. Returns the box and each entry's row."""
     fm = QFontMetricsF(font)
     sw = max(8.0, fm.height() * 0.7)
     pad = 4.0
     avail = max(40.0, plot.width() * 0.62 - sw - 3 * pad)
     labels = [fm.elidedText(t, Qt.TextElideMode.ElideMiddle, avail) for t, _ in entries]
-    text_w = max((fm.horizontalAdvance(t) for t in labels), default=0.0)
     row_h = fm.height()
+    title_font = QFont(font)
+    title_font.setBold(True)
+    tfm = QFontMetricsF(title_font)
+    title = fm.elidedText(title, Qt.TextElideMode.ElideRight, avail + sw + pad) if title else ""
+    text_w = max([fm.horizontalAdvance(t) for t in labels] + [tfm.horizontalAdvance(title) - sw - pad if title else 0.0])
+    title_h = tfm.height() if title else 0.0
     w = pad * 3 + sw + text_w
-    h = pad * 2 + row_h * len(entries)
-    box = QRectF(plot.right() - w - 4, plot.top() + 4, w, h)
+    h = pad * 2 + title_h + row_h * len(entries)
+    if pos is not None and len(pos) == 2:
+        left = plot.left() + float(pos[0]) * plot.width()
+        top = plot.top() + float(pos[1]) * plot.height()
+    else:
+        left, top = plot.right() - w - 4, plot.top() + 4
+    left = min(max(left, plot.left() + 1), plot.right() - w - 1)
+    top = min(max(top, plot.top() + 1), plot.bottom() - h - 1)
+    box = QRectF(left, top, w, h)
     painter.save()
     painter.setPen(QPen(QColor("#9aa0a6"), 0.8))
     painter.setBrush(QColor(255, 255, 255, 225))
     painter.drawRoundedRect(box, 2.5, 2.5)
+    if title:
+        painter.setFont(title_font)
+        painter.setPen(QColor("#000000"))
+        painter.drawText(QRectF(box.left() + pad, box.top() + pad, w - 2 * pad, title_h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title)
     painter.setFont(font)
+    rows = []
     for i, (label, (_, colour)) in enumerate(zip(labels, entries)):
-        y = box.top() + pad + i * row_h
+        y = box.top() + pad + title_h + i * row_h
         painter.setPen(QPen(QColor(colour).darker(115), 0.8))
         painter.setBrush(QColor(colour))
         painter.drawRect(QRectF(box.left() + pad, y + (row_h - sw) / 2, sw, sw))
         painter.setPen(QColor("#000000"))
         painter.drawText(QRectF(box.left() + 2 * pad + sw, y, text_w + 2, row_h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+        rows.append(QRectF(box.left(), y, w, row_h))
     painter.restore()
-    return box
+    return box, rows
 
 
 def _draw_message(painter: QPainter, rect: QRectF, text: str, font: QFont):
