@@ -391,10 +391,16 @@ def _draw(name: str, p: QPainter, s: float):
         path.cubicTo(r.left() + 9, r.bottom() - 7, r.left() + 7, cy + 4, r.left() + 5, cy)
         p.drawPath(path)
     elif name == "pointer":
-        p.setPen(_pen(INK, 1.4))
-        p.setBrush(PAPER)
-        poly = QPolygonF([QPointF(r.left() + 4, r.top() + 2), QPointF(r.left() + 4, r.bottom() - 4), QPointF(r.left() + 8, r.bottom() - 8), QPointF(r.left() + 11, r.bottom()), QPointF(r.left() + 14, r.bottom() - 2), QPointF(r.left() + 11, r.bottom() - 9), QPointF(r.right() - 3, r.bottom() - 9)])
-        p.drawPolygon(poly)
+        # the classic arrow pointer, scaled to the canvas: solid with rounded corners
+        x0, y0, w, h = r.left(), r.top(), r.width(), r.height()
+        pts = [(0.24, 0.02), (0.24, 0.86), (0.43, 0.68), (0.57, 0.98), (0.71, 0.91), (0.57, 0.62), (0.82, 0.62)]
+        path = QPainterPath(QPointF(x0 + pts[0][0] * w, y0 + pts[0][1] * h))
+        for fx, fy in pts[1:]:
+            path.lineTo(QPointF(x0 + fx * w, y0 + fy * h))
+        path.closeSubpath()
+        p.setPen(QPen(INK, max(1.0, s * 0.07), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(INK)
+        p.drawPath(path)
     elif name == "zoom":
         p.setPen(_pen(INK, 2.0))
         p.setBrush(QColor("#e4ecfa"))
