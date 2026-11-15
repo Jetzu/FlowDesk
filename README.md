@@ -40,7 +40,7 @@ density or histogram plots, with the same tools, order and letter shortcuts as F
 colours, font size and title.
 
 <p align="center"><img src="docs/walkthrough/07_quadrants.png" width="640" alt="Quadrant gate on CD4 versus CD8"></p>
-<p align="center"><img src="docs/plot_types.png" width="820" alt="Pseudocolor, dot, contour, zebra, density and histogram plots"></p>
+<p align="center"><img src="docs/images/plot_types.png" width="820" alt="Pseudocolor, dot, contour, zebra, density and histogram plots"></p>
 
 ### Groups and the workspace
 

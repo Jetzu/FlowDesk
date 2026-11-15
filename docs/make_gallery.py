@@ -165,6 +165,77 @@ def shot_layout(data: Path) -> None:
         close_window(win)
 
 
+def shot_plot_types(data: Path) -> None:
+    """Eight plots of one sample in a 2 x 4 grid: the gating path and every plot type, rendered as a graph window draws them."""
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    from flowdesk.core.model import GraphSettings
+    from flowdesk.ui.renderer import RenderOptions, render_plot
+
+    win = new_window()
+    try:
+        win._open_path(str(data / "19-Aug-2025.wsp"))
+        pump()
+        from flowdesk.agent.ops import Ops
+
+        s0 = win.controller.workspace.samples[0]
+        lymph, singles, cd4 = (find_population(s0, n) for n in ("Lymphocytes", "Single Cells", "CD4+"))
+        if None in (lymph, singles, cd4):
+            raise RuntimeError("the workspace lacks Lymphocytes, Single Cells or CD4+")
+        # gates for the picture only (nothing is saved): a CD8+ ellipse that reaches past the axis (drawn up to the axis),
+        # an open-ended CD62L+ range on CD4+ and a CD45RO / CD62L quadrant
+        ops = Ops(win.controller, None, win)
+        parent = cd4.parent
+        par = parent.path if hasattr(parent, "path") else ""
+        cdx, cdy = cd4.gate.dims[0], cd4.gate.dims[1]
+        old = parent.child_by_name("CD8+")
+        if old is not None:
+            parent.children.remove(old)
+        ops.call("create_gate", {"name": "CD8+", "shape": "ellipse", "x": cdx, "y": cdy, "sample": s0.id, "parent": par,
+                                 "center": [-20, 19000], "a_end": [700, 19000], "b_end": [-20, 33000]})
+        ops.call("create_gate", {"name": "CD62L+", "shape": "range", "x": "R1-A", "sample": s0.id, "parent": cd4.path if hasattr(cd4, "path") else "",
+                                 "x_range": [800, None]})
+        from flowdesk.core.gates import make_quadrant_gates
+
+        for child in [c for c in cd4.children if c.name != "CD62L+"]:
+            cd4.children.remove(child)  # the workspace's memory subsets would crowd the quadrant panel
+        for name, gate in make_quadrant_gates("V2-A", "R1-A", 1000.0, 800.0):
+            win.controller.add_population(cd4, Population(name.split(":")[0], gate), None)
+        cd62l = find_population(s0, "CD62L+")
+        quad = find_population(s0, "Q1")
+        cx, cy = cd4.gate.dims[0], cd4.gate.dims[1]
+        qx, qy = quad.gate.dims[0], quad.gate.dims[1]
+        panels = [
+            (s0.root, lymph.gate.dims[0], lymph.gate.dims[1], "pseudocolor"),
+            (lymph, singles.gate.dims[0], singles.gate.dims[1], "dot"),
+            (cd4.parent, cx, cy, "pseudocolor"),
+            (cd4.parent, cx, cy, "contour"),
+            (cd4.parent, cx, cy, "zebra"),
+            (cd4.parent, cx, cy, "density"),
+            (cd62l.parent, cd62l.gate.dims[0], None, "histogram"),
+            (quad.parent, qx, qy, "pseudocolor"),
+        ]
+        w, h, dpr, cols = 340, 320, 2.0, 4
+        rows = (len(panels) + cols - 1) // cols
+        sheet = QImage(int(w * cols * dpr), int(h * rows * dpr), QImage.Format.Format_ARGB32_Premultiplied)
+        sheet.setDevicePixelRatio(dpr)
+        sheet.fill(QColor("#ffffff"))
+        painter = QPainter(sheet)
+        for i, (pop, x, y, ptype) in enumerate(panels):
+            graph = GraphSettings(x, y, ptype)
+            opts = RenderOptions.from_prefs(win.controller.preferences, graph, font_dpi=72.0, freq_decimals=1)
+            res = render_plot(s0, pop, graph, w, h, opts, dpr=dpr)
+            painter.drawImage(QRectF((i % cols) * w, (i // cols) * h, w, h), res.image)
+        painter.end()
+        OUT.mkdir(parents=True, exist_ok=True)
+        path = OUT / "plot_types.png"
+        sheet.save(str(path))
+        print(f"  wrote {path.relative_to(ROOT)}")
+    finally:
+        close_window(win)
+
+
 def shot_tsne_and_flowsom(data: Path) -> None:
     from flowdesk.ui import tools_analysis as T
 
@@ -311,6 +382,7 @@ def shot_plate(tmp: Path) -> None:
 SHOTS = {
     "workspace": ("data", shot_workspace),
     "layout": ("data", shot_layout),
+    "plot_types": ("data", shot_plot_types),
     "tsne": ("data", shot_tsne_and_flowsom),
     "compensation": ("controls", shot_compensation),
     "cell_cycle": ("tmp", shot_cell_cycle),
