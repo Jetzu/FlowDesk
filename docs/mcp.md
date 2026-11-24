@@ -38,7 +38,9 @@ If no FlowDesk is running the server starts one. `FLOWDESK_AUTOLAUNCH=0` switche
 
 **Tools ▸ Agent ▸ Agent Chat** (Ctrl+Shift+A) docks a chat panel that runs your installed Claude Code or Codex CLI against
 this window. Providers whose CLI is not installed are greyed out; model and effort are chosen with `/model` or the button at
-the bottom right. Slash commands: `/model`, `/clear`, `/claude`, `/codex`, `/skills`, `/theme`, `/stop`, `/help`. The panel is light inside
+the bottom right (the menus are read from the CLIs' own model caches, so new models appear without a FlowDesk update; Claude models
+are offered by alias, i.e. the newest model of each family, and a saved model that was superseded is switched to its current
+equivalent on the next run). Slash commands: `/model`, `/clear`, `/claude`, `/codex`, `/skills`, `/theme`, `/stop`, `/help`. The panel is light inside
 FlowDesk; `/theme dark` (or the Theme entry in the model menu) switches to the dark terminal look, `/theme auto` follows the app. Enter sends,
 Shift+Enter inserts a newline, Esc interrupts.
 

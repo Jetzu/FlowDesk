@@ -159,8 +159,19 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
     SHIFT = _enum(Qt, "KeyboardModifier", "ShiftModifier")
     mono = "Menlo, 'SF Mono', Consolas, 'DejaVu Sans Mono', monospace"
     labels = getattr(agentcli, "BACKEND_LABELS", {"claude": "Claude Code", "codex": "Codex"})
-    model_choices = getattr(agentcli, "MODEL_CHOICES", {"claude": [("", "default")], "codex": [("", "default")]})
-    effort_choices = getattr(agentcli, "EFFORT_CHOICES", {"claude": [""], "codex": [""]})
+
+    def model_choices_for(b):
+        """Current model menu (read from the CLIs' model caches by agentcli, so new models appear by themselves)."""
+        fn = getattr(agentcli, "model_choices", None)
+        if callable(fn):
+            return fn(b)
+        return getattr(agentcli, "MODEL_CHOICES", {}).get(b, [("", "default")])
+
+    def effort_choices_for(b, model=None):
+        fn = getattr(agentcli, "effort_choices", None)
+        if callable(fn):
+            return fn(b, model)
+        return getattr(agentcli, "EFFORT_CHOICES", {}).get(b, [""])
 
     class Relay(QtCore.QObject):
         event = Signal(str, str)
@@ -349,13 +360,19 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
                 sel_model = st["model"] if b == self.backend else (agentcli.backend_settings(b)["model"] if agentcli else "")
                 sel_effort = st["effort"] if b == self.backend else (agentcli.backend_settings(b)["effort"] if agentcli else "")
                 m_menu = sub.addMenu("Model")
-                for value, label in model_choices.get(b, []):
+                choices = list(model_choices_for(b))
+                if sel_model and sel_model not in [v for v, _ in choices]:
+                    choices.append((sel_model, sel_model))
+                for value, label in choices:
                     act = m_menu.addAction(("● " if value == sel_model else "   ") + label)
                     act.triggered.connect(lambda _=False, b=b, v=value: self._choose(b, model=v))
                 act = m_menu.addAction("   other… (type /model <name>)")
                 act.setEnabled(False)
                 e_menu = sub.addMenu("Effort")
-                for value in effort_choices.get(b, [""]):
+                efforts = list(effort_choices_for(b, sel_model or ""))
+                if sel_effort and sel_effort not in efforts:
+                    efforts.append(sel_effort)
+                for value in efforts:
                     act = e_menu.addAction(("● " if value == sel_effort else "   ") + (value or "default"))
                     act.triggered.connect(lambda _=False, b=b, v=value: self._choose(b, effort=v))
                 if b != self.backend:
@@ -539,7 +556,7 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
                     for ptok in parts:
                         if ptok in ("claude", "codex"):
                             backend = ptok
-                        elif ptok in effort_choices.get(backend, []) and ptok:
+                        elif ptok and ptok in effort_choices_for(backend):
                             effort = ptok
                         elif ptok in ("default", "none"):
                             model = ""
@@ -621,6 +638,8 @@ def make_chat_widget(QtWidgets, QtCore, QtGui, *, app, pid, start_run, sessions,
                 self.add_tool_result(payload)
             elif kind == "error":
                 self.add_note("! " + payload, P["RED"])
+            elif kind == "note":
+                self.add_note(payload)
             elif kind == "stats":
                 try:
                     self._last_stats = json.loads(payload)

@@ -276,6 +276,31 @@ def test_build_argv_for_both_backends():
     assert c[:2] == ["/x/codex", "exec"] and "--json" in c and "flowdesk" in c[-1].lower()
     r = agentcli.build_argv("codex", "/x/codex", "again", "flowdesk", 42, session_id="T9")
     assert r[:3] == ["/x/codex", "exec", "resume"] and r[-1] == "again"
+    # --approve-for-me exists on `codex exec` only; follow-up turns (`exec resume`) failed with it
+    for argv in (c, r):
+        assert "--approve-for-me" not in argv and 'approvals_reviewer="auto_review"' in argv
+
+
+def test_model_menus_follow_the_cli_caches(tmp_path, monkeypatch):
+    cat = tmp_path / "claude" / "cache" / "model-catalog"
+    cat.mkdir(parents=True)
+    (cat / "org-cc.json").write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+        "models": [{"id": "claude-sonnet-9", "name": "Sonnet 9", "section": "main", "runtime": {"family": "sonnet"}}],
+        "provider_alias_targets": {"sonnet": {"default": "claude-sonnet-9"}}}}}))
+    (tmp_path / "codex").mkdir()
+    (tmp_path / "codex" / "models_cache.json").write_text(json.dumps({"models": [
+        {"slug": "gpt-new", "visibility": "list", "priority": 1}, {"slug": "gpt-secret", "visibility": "hide"}]}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("FLOWDESK_AGENT_SETTINGS", str(tmp_path / "settings.json"))
+    agentcli._catalog_memo.clear()
+    assert agentcli.model_choices("claude") == [("", "default"), ("sonnet", "sonnet · Sonnet 9")]
+    assert [v for v, _ in agentcli.model_choices("codex")] == ["", "gpt-new"]
+    # a saved model that is gone is replaced (and remembered) when the next run starts
+    agentcli.set_backend_settings("codex", model="gpt-5-codex")
+    run = agentcli.AgentRun("codex", "hi", "flowdesk", 1, lambda k, p: None, exe="/x/codex")
+    assert run.model == "" and run.notes and agentcli.backend_settings("codex")["model"] == ""
+    agentcli._catalog_memo.clear()
 
 
 def test_stream_parsers_claude_and_codex():
@@ -311,6 +336,8 @@ def test_agent_run_pins_the_pid_and_streams(tmp_path, monkeypatch):
     if os.name != "posix":
         pytest.skip("shell script stand-in")
     events = []
+    monkeypatch.setenv("FLOWDESK_AGENT_SETTINGS", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     run = agentcli.AgentRun("claude", "hi", "flowdesk", 4242, lambda k, p: events.append((k, p)), exe=str(fake))
     run.start().wait(20)
     assert run.session_id == "S" and run.final_text == "pid=4242"

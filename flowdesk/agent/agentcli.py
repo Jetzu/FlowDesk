@@ -10,6 +10,7 @@ Events delivered to the callback as (kind, payload):
     ("text", str)            complete assistant message
     ("tool", str)            tool call: "<server>/<tool> <json args>"
     ("tool_result", str)     tool result text (truncated)
+    ("note", str)            remark for the user (e.g. a saved model replaced by its current equivalent)
     ("stats", dict)          cost/usage at the end of a turn
     ("done", str)            final answer (also delivered as text)
     ("error", str)
@@ -19,11 +20,12 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 BACKENDS = ("claude", "codex")
 
@@ -134,15 +136,256 @@ def available_backends() -> List[str]:
 
 
 BACKEND_LABELS = {"claude": "Claude Code", "codex": "Codex"}
-# Model choices offered in the UI (free text is always allowed via /model <name>)
-MODEL_CHOICES = {
-    "claude": [("", "default"), ("fable", "fable"), ("opus", "opus"), ("sonnet", "sonnet"), ("haiku", "haiku")],
-    "codex": [("", "default (config.toml)"), ("gpt-5-codex", "gpt-5-codex"), ("gpt-5", "gpt-5"), ("o3", "o3"), ("gpt-6-sol", "gpt-6-sol")],
+# ---------------------------------------------------------------------------
+# model catalog (follows new model releases without code changes)
+# ---------------------------------------------------------------------------
+# The model / effort menus are read from the caches the CLIs keep for their own /model pickers and refresh by
+# themselves:
+#   Claude Code: <CLAUDE_CONFIG_DIR or ~/.claude>/cache/model-catalog/*-cc.json
+#   Codex:       <CODEX_HOME or ~/.codex>/models_cache.json   (+ the default model from config.toml)
+# Claude models are offered by family alias (opus, sonnet, ...), which Claude Code resolves to the newest model of
+# that family, so a saved choice keeps following new releases.  Without a cache the built-in lists below are used.
+CLAUDE_ALIASES = ("fable", "opus", "sonnet", "haiku")  # fallback; the cache lists the aliases it knows
+MODEL_CHOICES = {  # fallback when the CLI has not written its model cache yet
+    "claude": [("", "default")] + [(a, a) for a in CLAUDE_ALIASES],
+    "codex": [("", "default (config.toml)")],
 }
-EFFORT_CHOICES = {
+EFFORT_CHOICES = {  # fallback, see effort_choices()
     "claude": ["", "low", "medium", "high", "xhigh", "max"],
     "codex": ["", "minimal", "low", "medium", "high", "xhigh"],
 }
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+_catalog_memo: dict = {}
+
+
+def _claude_config_dir() -> str:
+    return os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join("~", ".claude"))
+
+
+def _codex_home() -> str:
+    return os.path.expanduser(os.environ.get("CODEX_HOME") or os.path.join("~", ".codex"))
+
+
+def _json_file(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _sorted_efforts(levels) -> List[str]:
+    seen = list(dict.fromkeys(str(e) for e in levels if e))
+    return [e for e in _EFFORT_ORDER if e in seen] + [e for e in seen if e not in _EFFORT_ORDER]
+
+
+def _read_claude_catalog(files: List[str]) -> Tuple[List[dict], Dict[str, str]]:
+    best, best_t = None, -1.0
+    for p in files:
+        d = _json_file(p)
+        if not isinstance(d, dict) or not p.endswith("-cc.json"):
+            continue
+        try:
+            t = float(d.get("fetchedAt") or 0)
+        except (TypeError, ValueError):
+            t = 0.0
+        if t > best_t:
+            best, best_t = d, t
+    if best is None:
+        return [], {}
+    masked = _json_file(os.path.join(_claude_config_dir(), "cache", "model-catalog", "masked-ids.json"))
+    masked = set(masked.get("ids") or []) if isinstance(masked, dict) else set()
+    try:
+        config = best["catalog"]["config"]
+        models = config["models"]
+    except (KeyError, TypeError):
+        return [], {}
+    aliases = {}
+    targets = config.get("provider_alias_targets") if isinstance(config, dict) else None
+    for alias, t in (targets.items() if isinstance(targets, dict) else []):
+        if isinstance(t, dict) and t.get("default"):
+            aliases[str(alias)] = str(t["default"])
+    out = []
+    for m in models if isinstance(models, list) else []:
+        if not isinstance(m, dict) or not m.get("id") or m["id"] in masked:
+            continue
+        rt = m.get("runtime") if isinstance(m.get("runtime"), dict) else {}
+        out.append({"id": str(m["id"]), "name": str(m.get("name") or m["id"]),
+                    "listed": str(m.get("section") or "main") == "main",
+                    "family": str(rt.get("family") or "").lower(),
+                    "efforts": _sorted_efforts(rt.get("effort_levels") or []),
+                    "default_effort": str(rt.get("default_effort") or "")})
+    return out, aliases
+
+
+def _read_codex_catalog(files: List[str]) -> List[dict]:
+    d = _json_file(files[0]) if files else None
+    models = d.get("models") if isinstance(d, dict) else None
+    out = []
+    for m in models if isinstance(models, list) else []:
+        if not isinstance(m, dict) or not m.get("slug"):
+            continue
+        levels = [r.get("effort") for r in m.get("supported_reasoning_levels") or [] if isinstance(r, dict)]
+        prio = m.get("priority")
+        out.append({"id": str(m["slug"]), "name": str(m.get("display_name") or m["slug"]),
+                    "listed": m.get("visibility", "list") == "list", "family": "",
+                    "priority": prio if isinstance(prio, (int, float)) else 1e9,
+                    "efforts": _sorted_efforts(levels), "default_effort": str(m.get("default_reasoning_level") or "")})
+    out.sort(key=lambda m: m["priority"])
+    return out, {}
+
+
+def model_catalog(backend: str) -> List[dict]:
+    """Models the installed CLI offers, newest/most relevant first ([] when its cache is missing).  Each entry:
+    {"id", "name", "family", "listed", "efforts", "default_effort"}.  Re-read whenever the cache file changes."""
+    if backend == "claude":
+        files = sorted(glob.glob(os.path.join(_claude_config_dir(), "cache", "model-catalog", "*.json")))
+    else:
+        files = [os.path.join(_codex_home(), "models_cache.json")]
+    stamp = []
+    for p in files:
+        try:
+            stamp.append((p, os.path.getmtime(p)))
+        except OSError:
+            pass
+    stamp = tuple(stamp)
+    hit = _catalog_memo.get(backend)
+    if not (hit and hit[0] == stamp):
+        try:
+            cat, aliases = (_read_claude_catalog(files) if backend == "claude"
+                            else _read_codex_catalog([p for p, _ in stamp]))
+        except Exception:
+            cat, aliases = [], {}
+        hit = _catalog_memo[backend] = (stamp, cat, aliases)
+    return hit[1]
+
+
+def model_aliases(backend: str) -> Dict[str, str]:
+    """Claude Code's aliases and the model each currently points to ({} for Codex or without a cache)."""
+    model_catalog(backend)
+    hit = _catalog_memo.get(backend)
+    return dict(hit[2]) if hit else {}
+
+
+def _codex_config_value(key: str) -> str:
+    """A top-level string value of Codex's config.toml ("" when unset)."""
+    try:
+        with open(os.path.join(_codex_home(), "config.toml"), encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("["):
+                    break
+                m = re.match(r'%s\s*=\s*["\']([^"\']*)["\']' % re.escape(key), s)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def model_choices(backend: str) -> List[Tuple[str, str]]:
+    """(value, label) pairs for the model menu; value "" = the CLI's own default.  Any other name still works."""
+    cat = model_catalog(backend)
+    if backend == "claude":
+        if not cat:
+            return list(MODEL_CHOICES["claude"])
+        by_target = {}
+        for alias, target in model_aliases(backend).items():
+            by_target.setdefault(target, alias)
+        out = [("", "default")]
+        for m in cat:
+            if not m["listed"]:
+                continue  # older models: still accepted by name (/model <id>)
+            alias = by_target.get(m["id"])
+            out.append((alias, "%s · %s" % (alias, m["name"])) if alias else (m["id"], m["name"]))
+        return out
+    cfg = _codex_config_value("model")
+    out = [("", "default (%s)" % cfg if cfg else "default (config.toml)")]
+    listed = [(m["id"], m["id"]) for m in cat if m["listed"]]
+    if not listed and cfg:
+        listed = [(cfg, cfg)]
+    return out + listed
+
+
+def _catalog_entry(backend: str, model: str) -> Optional[dict]:
+    cat = model_catalog(backend)
+    model = (model or "").strip()
+    if not cat:
+        return None
+    if not model:
+        if backend != "codex":
+            return None
+        model = _codex_config_value("model")
+    base = model.split("[")[0]
+    if backend == "claude":
+        base = model_aliases(backend).get(base, base)
+    return next((m for m in cat if m["id"] == base), None)
+
+
+def effort_choices(backend: str, model: Optional[str] = None) -> List[str]:
+    """Effort levels ("" = default first): those of ``model`` when the catalog knows it, else the union over every
+    model of the backend (or the built-in list when there is no catalog)."""
+    if model is not None:
+        m = _catalog_entry(backend, model)
+        if m and m["efforts"]:
+            return [""] + m["efforts"]
+    levels = _sorted_efforts(e for m in model_catalog(backend) for e in m["efforts"])
+    return [""] + levels if levels else list(EFFORT_CHOICES[backend])
+
+
+def resolve_model(backend: str, model: str) -> Tuple[str, str]:
+    """(model to run, note).  A saved model the CLI no longer offers in its menu is replaced by one that works: a
+    superseded Claude model by its family alias (= the newest model of that family), an unknown Codex model by
+    Codex's default."""
+    model = (model or "").strip()
+    cat = model_catalog(backend)
+    if not model or not cat:
+        return model, ""
+    base = model.split("[")[0]
+    ids = {m["id"] for m in cat}
+    if backend == "claude":
+        aliases = model_aliases(backend) or {a: "" for a in CLAUDE_ALIASES}
+        if base in aliases or base in {m["id"] for m in cat if m["listed"]}:
+            return model, ""
+        entry = next((m for m in cat if m["id"] == base), None)
+        fam = entry["family"] if entry and entry["family"] else next(
+            (a for a in aliases if base.startswith("claude-%s-" % a)), "")
+        if fam in aliases:
+            new = fam + model[len(base):]  # keeps a context suffix such as [1m]
+            return new, "%s has been superseded; using %s (the newest %s model)" % (model, new, fam)
+        return model, ""
+    if base in ids or _codex_config_value("model_provider") not in ("", "openai"):
+        return model, ""
+    return "", "%s is not in Codex's model list; using Codex's default model" % model
+
+
+def resolve_effort(backend: str, model: str, effort: str) -> Tuple[str, str]:
+    """(effort to run, note): an effort the chosen model does not support falls back to the model's default."""
+    effort = (effort or "").strip()
+    m = _catalog_entry(backend, model)
+    if not effort or not m or not m["efforts"] or effort in m["efforts"]:
+        return effort, ""
+    return "", "%s does not support effort %s; using its default" % (m["name"], effort)
+
+
+def catalog_snapshot() -> dict:
+    """Menus for a panel: model options (value, label), effort levels per backend and per offered model."""
+    out: dict = {"model_options": {}, "model_choices": {}, "effort_choices": {}, "model_efforts": {}}
+    for b in BACKENDS:
+        opts = model_choices(b)
+        out["model_options"][b] = [list(o) for o in opts]
+        out["model_choices"][b] = [o[0] for o in opts]
+        out["effort_choices"][b] = effort_choices(b)
+        out["model_efforts"][b] = {o[0]: effort_choices(b, o[0]) for o in opts}
+    return out
+
+
+# Codex's --approve-for-me as config overrides: the flag exists on `codex exec` but not on `codex exec resume`, so
+# follow-up turns failed with "unexpected argument"; -c works on both.
+CODEX_APPROVAL_ARGS = ["-c", 'approvals_reviewer="auto_review"', "-c", 'approval_policy="on-request"',
+                       "-c", 'sandbox_mode="workspace-write"']
+
+
 _SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".flowdesk", "agent_settings.json")
 
 
@@ -246,7 +489,7 @@ def build_argv(backend: str, exe: str, prompt: str, app: str, pid: int, session_
         return argv
     if backend == "codex":
         full_prompt = prompt if session_id else "%s\n\nUser request: %s" % (context, prompt)
-        opts = ["--json", "--approve-for-me", "--skip-git-repo-check"]
+        opts = ["--json"] + CODEX_APPROVAL_ARGS + ["--skip-git-repo-check"]
         if model:
             opts += ["-m", model]
         if effort:
@@ -378,6 +621,20 @@ class AgentRun:
         st = backend_settings(backend)
         self.model = st["model"] if model is None else model
         self.effort = st["effort"] if effort is None else effort
+        # a saved model/effort the CLI no longer offers -> the current equivalent (and remember it)
+        self.notes: List[str] = []
+        healed_model, note = resolve_model(backend, self.model)
+        if note:
+            self.notes.append(note)
+            if model is None:
+                set_backend_settings(backend, model=healed_model)
+        self.model = healed_model
+        healed_effort, note = resolve_effort(backend, self.model, self.effort)
+        if note:
+            self.notes.append(note)
+            if effort is None:
+                set_backend_settings(backend, effort=healed_effort)
+        self.effort = healed_effort
         self.argv = build_argv(backend, self.exe, prompt, app, pid, session_id, allow_shell, self.model, self.effort)
         self.app, self.pid, self.callback, self.cwd = app, pid, callback, cwd
         self.env = clean_env()
@@ -433,6 +690,8 @@ class AgentRun:
             self._emit("error", "could not start %s: %s" % (self.exe, e))
             self._emit("done", "")
             return
+        for note in self.notes:
+            self._emit("note", note)
         parser = _parse_claude if self.backend == "claude" else _parse_codex
         err_lines = []
 
